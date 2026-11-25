@@ -10,6 +10,11 @@
 //!  - **缓存有上限**：key 数到 MAX_ICON_KEYS 就不再取新的，免得长
 //!    会话里纹理无限涨；取失败的 key 也记下来（None），不反复重试。
 //!  - **全程判空判错**：FFI 任何一步失败都回退色块，绝不 panic。
+//!  - **图标三规（v0.1.7 用户钉死）**：文件夹 = 系统文件夹图标、
+//!    文件 = 对应类型图标、快捷方式 = 目标软件的 ico。前两条由
+//!    key_for 的分流天然满足；第三条补强：`path:` 的 .lnk 直接
+//!    SHGetFileInfo 取图失败时，走 IShellLink COM 解析目标路径与
+//!    图标位置、再对目标取图（见 fetch_lnk_target_icon）。
 //!
 //! 非 Windows：没有系统图标这回事，texture() 恒返回 None，全行回退
 //! 色块——与 v0.1.4 及以前完全一致。
@@ -202,10 +207,212 @@ mod win {
             return Some(px);
         }
         if key.starts_with("path:") && !use_attrs {
+            // v0.1.7 图标三规兜底：.lnk 直接取图失败 → IShellLink
+            // 解析目标 / 图标位置后对目标取图（目标软件自己的 ico），
+            // 成功同样计 loaded（worker 回传 Some 即计数）。
+            if path_str.to_lowercase().ends_with(".lnk") {
+                if let Some(px) = fetch_lnk_target_icon(&path_str) {
+                    return Some(px);
+                }
+            }
             // 真实路径取图失败 → 按属性问法重试（通用图标兜底）
             return fetch_once(&path_str, FILE_ATTRIBUTE_NORMAL, true);
         }
         None
+    }
+
+    /// IShellLink / IPersistFile 的 vtbl 布局（windows-sys 0.52 只给
+    /// 接口指针类型、不给 vtbl，这里按 shobjidl.h 的方法顺序手写；
+    /// 只声明要用的槽，其余槽用指针占位，布局与真实 vtbl 一致）。
+    #[repr(C)]
+    struct IShellLinkWVtbl {
+        query_interface: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *const windows_sys::core::GUID,
+            *mut *mut std::ffi::c_void,
+        ) -> i32,
+        add_ref: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+        release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+        get_path: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *mut u16,
+            i32,
+            *mut std::ffi::c_void,
+            u32,
+        ) -> i32,
+        _get_id_list: *const std::ffi::c_void,
+        _set_id_list: *const std::ffi::c_void,
+        _get_description: *const std::ffi::c_void,
+        _set_description: *const std::ffi::c_void,
+        _get_working_directory: *const std::ffi::c_void,
+        _set_working_directory: *const std::ffi::c_void,
+        _get_arguments: *const std::ffi::c_void,
+        _set_arguments: *const std::ffi::c_void,
+        _get_hotkey: *const std::ffi::c_void,
+        _set_hotkey: *const std::ffi::c_void,
+        _get_show_cmd: *const std::ffi::c_void,
+        _set_show_cmd: *const std::ffi::c_void,
+        get_icon_location: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *mut u16,
+            i32,
+            *mut i32,
+        ) -> i32,
+        _set_icon_location: *const std::ffi::c_void,
+        _set_relative_path: *const std::ffi::c_void,
+        _resolve: *const std::ffi::c_void,
+        _set_path: *const std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IPersistFileVtbl {
+        query_interface: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *const windows_sys::core::GUID,
+            *mut *mut std::ffi::c_void,
+        ) -> i32,
+        add_ref: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+        release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+        _get_class_id: *const std::ffi::c_void,
+        _is_dirty: *const std::ffi::c_void,
+        load: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *const u16,
+            u32,
+        ) -> i32,
+        _save: *const std::ffi::c_void,
+        _save_completed: *const std::ffi::c_void,
+        _get_cur_file: *const std::ffi::c_void,
+    }
+
+    /// .lnk 兜底取图（v0.1.7 图标三规）：IShellLink 解析出目标路径
+    /// 与图标位置后，对图标位置（快捷方式自带 ico 时就是它）或目标
+    /// 本体走 fetch_once 真实路径取图——拿到的是目标软件自己的图标。
+    /// 任何一步失败返回 None，外层再走通用图标兜底。
+    fn fetch_lnk_target_icon(lnk_path: &str) -> Option<Pixels> {
+        let (target, icon_loc) = unsafe { resolve_lnk(lnk_path) }?;
+        if !icon_loc.is_empty() {
+            if let Some(px) = fetch_once(&icon_loc, 0, false) {
+                return Some(px);
+            }
+        }
+        if !target.is_empty() && target != icon_loc {
+            if let Some(px) = fetch_once(&target, 0, false) {
+                return Some(px);
+            }
+        }
+        None
+    }
+
+    /// 用 COM 解析 .lnk：CoCreateInstance(ShellLink) → QI 出
+    /// IPersistFile → Load(.lnk) → GetPath + GetIconLocation。
+    /// 返回 (目标路径, 图标位置路径)，任一可为空串；整体失败 None。
+    /// 所有接口指针在返回前 Release。
+    unsafe fn resolve_lnk(lnk_path: &str) -> Option<(String, String)> {
+        use std::ffi::{c_void, OsStr};
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::core::GUID;
+        use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+
+        const CLSID_SHELLLINK: GUID = GUID {
+            data1: 0x0002_1401,
+            data2: 0,
+            data3: 0,
+            data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+        };
+        const IID_ISHELLLINKW: GUID = GUID {
+            data1: 0x0002_14F9,
+            data2: 0,
+            data3: 0,
+            data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+        };
+        const IID_IPERSISTFILE: GUID = GUID {
+            data1: 0x0000_010B,
+            data2: 0,
+            data3: 0,
+            data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+        };
+        const MAX_PATH_LEN: usize = 1024;
+
+        let mut link: *mut c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_SHELLLINK,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_ISHELLLINKW,
+            &mut link,
+        );
+        if hr != 0 || link.is_null() {
+            return None;
+        }
+        // 主体放闭包里执行，保证每条退出路径都 Release
+        let work = |link: *mut c_void| -> Option<(String, String)> {
+            let link_vt = *(link as *const *const IShellLinkWVtbl);
+            let mut pf: *mut c_void = std::ptr::null_mut();
+            let hr = ((*link_vt).query_interface)(
+                link,
+                &IID_IPERSISTFILE,
+                &mut pf,
+            );
+            if hr != 0 || pf.is_null() {
+                return None;
+            }
+            let result = (|| {
+                let pf_vt = *(pf as *const *const IPersistFileVtbl);
+                let wide: Vec<u16> = OsStr::new(lnk_path)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                // IPersistFile::Load(path, STGM_READ=0)
+                if ((*pf_vt).load)(pf, wide.as_ptr(), 0) != 0 {
+                    return None;
+                }
+                let mut target_buf = vec![0u16; MAX_PATH_LEN];
+                let hr = ((*link_vt).get_path)(
+                    link,
+                    target_buf.as_mut_ptr(),
+                    MAX_PATH_LEN as i32,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                let target = if hr == 0 {
+                    wide_to_string(&target_buf)
+                } else {
+                    String::new()
+                };
+                let mut icon_buf = vec![0u16; MAX_PATH_LEN];
+                let mut icon_index: i32 = 0;
+                let hr = ((*link_vt).get_icon_location)(
+                    link,
+                    icon_buf.as_mut_ptr(),
+                    MAX_PATH_LEN as i32,
+                    &mut icon_index,
+                );
+                let icon_loc = if hr == 0 {
+                    wide_to_string(&icon_buf)
+                } else {
+                    String::new()
+                };
+                if target.is_empty() && icon_loc.is_empty() {
+                    None
+                } else {
+                    Some((target, icon_loc))
+                }
+            })();
+            let pf_vt = *(pf as *const *const IPersistFileVtbl);
+            ((*pf_vt).release)(pf);
+            result
+        };
+        let result = work(link);
+        let link_vt = *(link as *const *const IShellLinkWVtbl);
+        ((*link_vt).release)(link);
+        result
+    }
+
+    /// NUL 结尾的 UTF-16 缓冲 → String（截到第一个 NUL 为止）。
+    fn wide_to_string(buf: &[u16]) -> String {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
     }
 
     /// 单次 SHGetFileInfoW 问图：给定路径/属性/问法，成功返回 RGBA。
