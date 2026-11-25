@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shunseek-core",
+    "crates/shunseek-bench",
+    "crates/shunseek-app",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

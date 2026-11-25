@@ -1,0 +1,36 @@
+=== ShunSeek Bench (Rust) ===
+条目数: 2000000   线程数: 4   OS: linux
+合成数据: 1932 ms
+建索引:   2146 ms   条目: 2000002
+索引内存: 133.2 MB（精确值：全部数组+池的实际字节数）
+驻留目录数: 1102001
+查询 "报告": 首次 552.1 ms, 平均 9.6 ms, 返回 100 条
+    · 报告2018.md  [文档]  E:\Projects10\资料15\报告2018.md
+    · 报告2019.md  [文档]  C:\Archive2\报告2019.md
+    · 报告2021.md  [文档]  E:\Projects9\Downloads11\娱乐7\项目5\报告2021.md
+查询 "合同": 首次 5.3 ms, 平均 5.4 ms, 返回 100 条
+    · 合同2023.md  [文档]  E:\Archive7\工作8\合同2023.md
+    · 合同2020.md  [文档]  C:\学习3\合同2020.md
+    · 合同2026.md  [文档]  D:\Pictures15\Documents12\工作1\Pictures6\合同2026.md
+查询 "report": 首次 59.0 ms, 平均 30.9 ms, 返回 100 条
+    · report_0.cs  [代码]  C:\Projects17\Downloads19\report_0.cs
+    · report_8.py  [代码]  C:\工作11\report_8.py
+    · report_2.js  [代码]  C:\Documents5\学习2\Documents4\工作18\report_2.js
+查询 "wzry": 首次 11.8 ms, 平均 21.7 ms, 返回 100 条
+    · 王者荣耀  [应用]  E:\Documents5\Archive3\项目14\Downloads3\王者荣耀
+    · 王者荣耀  [应用]  C:\项目11\资料6\工作7\王者荣耀
+    · 王者荣耀  [应用]  D:\Downloads2\王者荣耀
+查询 "mp4 [视频]": 首次 74.7 ms, 平均 30.9 ms, 返回 100 条
+    · 备份_录像5.mp4  [视频]  C:\项目12\备份_录像5.mp4
+    · 合同_录像8.mp4  [视频]  D:\Documents18\Archive6\学习17\合同_录像8.mp4
+    · 报告_录像9.mp4  [视频]  E:\项目1\资料4\资料16\报告_录像9.mp4
+查询 "2024": 首次 85.1 ms, 平均 72.6 ms, 返回 100 条
+    · 娱乐_2024  [文件夹]  E:\Pictures18\Projects8\Archive3\Pictures13\娱乐_2024
+    · 资料_2024  [文件夹]  C:\Downloads7\资料7\Documents8\资料_2024
+    · 娱乐_2024  [文件夹]  E:\娱乐13\娱乐_2024
+落盘: 289 ms（文件 139621448 字节）
+mmap 加载: 488 µs   条目: 2000002
+查询 "wzry": 首次 15.8 ms, 平均 24.1 ms, 返回 100 条
+    · 王者荣耀  [应用]  E:\Documents5\Archive3\项目14\Downloads3\王者荣耀
+    · 王者荣耀  [应用]  C:\项目11\资料6\工作7\王者荣耀
+    · 王者荣耀  [应用]  D:\Downloads2\王者荣耀

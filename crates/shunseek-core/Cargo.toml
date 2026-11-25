@@ -1,0 +1,12 @@
+[package]
+name = "shunseek-core"
+version = "0.1.0"
+edition = "2021"
+description = "瞬觅 ShunSeek 搜索引擎核心（Rust 版）：紧凑平坦索引 + 并行扫描 + 拼音首字母 + NTFS MFT/USN 数据源"
+
+[dependencies]
+memchr = "2"
+memmap2 = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
