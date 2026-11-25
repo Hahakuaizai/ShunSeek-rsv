@@ -40,6 +40,10 @@ pub enum TrayAction {
     /// 菜单「立即刷新索引」（v0.1.8）：请增量监视立即 flush 一次
     ///（有 USN 监视时合并待处理变更；无监视时等效手动重建）。
     RefreshIndex,
+    /// 菜单「以管理员身份重启」（v0.1.9，对齐原版）：UI 侧以
+    /// runas 拉起同一 exe（带 --from-restart 衔接单实例互斥），
+    /// 成功后本进程立即退出；UAC 取消则保持现状并给状态提示。
+    AdminRestart,
     /// 菜单「设置」：显示主窗口并打开设置窗口。
     OpenSettings,
     /// 菜单「关于瞬觅」。
@@ -51,6 +55,10 @@ pub enum TrayAction {
 /// 建托盘时 App 传入的初始状态（重建项置灰按真实状态起步）。
 pub struct TrayInit {
     pub rebuilding: bool,
+    /// 数据目录（首次运行气泡的 flag 文件 tray-hint-shown 落这里）。
+    pub data_dir: std::path::PathBuf,
+    /// 当前生效热键的显示文案（气泡正文里提示用，如 "Ctrl+Alt+Space"）。
+    pub hotkey_label: String,
 }
 
 pub struct Tray {
@@ -135,6 +143,7 @@ mod win {
     const ID_ABOUT: usize = 4;
     const ID_EXIT: usize = 5;
     const ID_REFRESH: usize = 6;
+    const ID_ADMIN: usize = 7;
 
     /// 托盘线程与 UI 的共享状态：动作队列 + 唤醒用的 Context + 重建标志。
     struct TrayShared {
@@ -185,10 +194,12 @@ mod win {
             let hwnd = Arc::new(AtomicIsize::new(0));
             let hwnd_thread = hwnd.clone();
             let rebuilding_thread = rebuilding.clone();
+            let data_dir = init.data_dir.clone();
+            let hotkey_label = init.hotkey_label.clone();
             let spawned = std::thread::Builder::new()
                 .name("shunseek-tray".into())
                 .spawn(move || {
-                    tray_thread_main(hwnd_thread, rebuilding_thread);
+                    tray_thread_main(hwnd_thread, rebuilding_thread, data_dir, hotkey_label);
                 });
             match spawned {
                 Ok(_) => Some(WinTray { hwnd, rebuilding }),
@@ -220,7 +231,12 @@ mod win {
 
     /// 托盘线程主体：建消息窗口 → 加图标 → 消息循环。
     /// 任何一步失败就结束线程（无托盘可用，但应用本体照常运行）。
-    fn tray_thread_main(hwnd_out: Arc<AtomicIsize>, _rebuilding: Arc<AtomicBool>) {
+    fn tray_thread_main(
+        hwnd_out: Arc<AtomicIsize>,
+        _rebuilding: Arc<AtomicBool>,
+        data_dir: std::path::PathBuf,
+        hotkey_label: String,
+    ) {
         use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, RegisterClassW,
@@ -274,6 +290,9 @@ mod win {
             }
             // 版本 4 语义：右键 WM_CONTEXTMENU、左键 NIN_SELECT，坐标可靠
             notify_icon_version4(hwnd);
+            // 首次运行气泡（v0.1.9，对齐原版）：只弹一次，flag
+            // 文件记状态；文案带当前热键，免得用户找不到入口。
+            maybe_show_balloon(hwnd, &data_dir, &hotkey_label);
 
             let mut msg: MSG = std::mem::zeroed();
             loop {
@@ -325,6 +344,49 @@ mod win {
 
     unsafe fn notify_icon_delete(hwnd: HWND) {
         notify_icon(hwnd, NIM_DELETE, 0);
+    }
+
+    /// 首次运行气泡（v0.1.9，对齐原版 TrayIconManager）：数据
+    /// 目录里没有 tray-hint-shown 才弹，弹完写 flag，之后永不
+    /// 再扰。气泡走 NIM_MODIFY + NIF_INFO，5 秒自动收起。
+    unsafe fn maybe_show_balloon(
+        hwnd: HWND,
+        data_dir: &std::path::Path,
+        hotkey_label: &str,
+    ) {
+        use windows_sys::Win32::UI::Shell::{
+            Shell_NotifyIconW, NOTIFYICONDATAW, NIF_INFO,
+        };
+        const NIM_MODIFY: u32 = 1;
+        const NIIF_INFO: u32 = 1;
+        let flag = data_dir.join("tray-hint-shown");
+        if flag.exists() {
+            return;
+        }
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uID = 1;
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = NIIF_INFO;
+        data.Anonymous.uTimeout = 5000;
+        let title = "瞬觅已在托盘";
+        for (i, u) in title.encode_utf16().enumerate() {
+            if i < data.szInfoTitle.len() - 1 {
+                data.szInfoTitle[i] = u;
+            }
+        }
+        let body = format!(
+            "Win11 可能把它收进了 ^ 折叠区，拖出来固定一下就好。{hotkey_label} 呼出搜索。"
+        );
+        for (i, u) in body.encode_utf16().enumerate() {
+            if i < data.szInfo.len() - 1 {
+                data.szInfo[i] = u;
+            }
+        }
+        if Shell_NotifyIconW(NIM_MODIFY, &data) != 0 {
+            let _ = std::fs::write(&flag, b"");
+        }
     }
 
     /// assets/icon-64.rgba（64×64 原始 RGBA）→ HICON：
@@ -447,6 +509,7 @@ mod win {
         AppendMenuW(menu, MF_STRING, ID_SHOW, wide("打开瞬觅").as_ptr());
         AppendMenuW(menu, rebuild_flags, ID_REBUILD, wide(rebuild_text).as_ptr());
         AppendMenuW(menu, MF_STRING, ID_REFRESH, wide("立即刷新索引").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_ADMIN, wide("以管理员身份重启").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("设置").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_ABOUT, wide(&about_text).as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -477,6 +540,7 @@ mod win {
                 }
             }
             ID_REFRESH => push_action(TrayAction::RefreshIndex),
+            ID_ADMIN => push_action(TrayAction::AdminRestart),
             ID_SETTINGS => push_action(TrayAction::OpenSettings),
             ID_ABOUT => push_action(TrayAction::About),
             ID_EXIT => {

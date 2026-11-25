@@ -12,8 +12,15 @@
 //!    + USEFILEATTRIBUTES，只问类型图标，不打开文件本体）；文件夹共用
 //!    一个 "folder"；只有 .exe / .lnk / 应用条目按完整路径取真图标
 //!    （每个程序各异，且 .lnk 经 Shell 解析会拿到目标的图标）。
+//!  - **取图链（v0.1.9 对齐原版 IconCache）**：`path:` 类 key 依次走
+//!    ① IShellItemImageFactory 按路径取 64px 本项图标 → ② SHGetFileInfoW
+//!    真实路径大图标 → ③ .lnk 目标解析取图 → ④ USEFILEATTRIBUTES
+//!    通用图标兜底。
+//!  - **失败重试（v0.1.9 对齐原版）**：失败不焊死——计数 <3 次时
+//!    下次查询可重发请求（防启动瞬间 Shell 忙导致永久灰块），满
+//!    3 次才缓存空结果。
 //!  - **缓存有上限**：key 数到 MAX_ICON_KEYS 就不再取新的，免得长
-//!    会话里纹理无限涨；取失败的 key 也记下来（None），不反复重试。
+//!    会话里纹理无限涨（64px RGBA 一张 16KB，1024 个约 16MB 封顶）。
 //!  - **全程判空判错**：FFI 任何一步失败都回退色块，绝不 panic。
 //!  - **图标三规（v0.1.7 用户钉死）**：文件夹 = 系统文件夹图标、
 //!    文件 = 对应类型图标、快捷方式 = 目标软件的 ico。前两条由
@@ -30,8 +37,9 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use shunseek_core::Category;
 
-/// 图标缓存上限（个 key）：一屏结果最多牵涉百来个 key，256 足够。
-const MAX_ICON_KEYS: usize = 256;
+/// 图标缓存上限（个 key）：v0.1.9 由 256 提到 1024（64px 图源
+/// 一张 16KB，封顶约 16MB），长会话里少出现「超限后新 key 不取图」。
+const MAX_ICON_KEYS: usize = 1024;
 /// 图标在结果行内的绘制边长（原版行图标 24×24，占位盘 IconPlate 同尺寸）。
 pub const ICON_SIZE: f32 = 24.0;
 
@@ -61,6 +69,9 @@ pub struct IconCache {
     /// 已发过请求的 key（防重复发）。非 Windows 下无人用，属预期闲置。
     #[allow(dead_code)]
     requested: HashSet<String>,
+    /// 取失败次数（v0.1.9 重试用）：<3 次不焊死空结果，允许下次
+    /// 查询重发；满 3 次才把 None 写进 textures 定格。
+    attempts: HashMap<String, u8>,
     tx: Option<Sender<String>>,
     rx: Option<Receiver<(String, Option<Pixels>)>>,
     /// 可观测性计数（v0.1.6）：收割结果时累计，设置窗口「索引」区展示
@@ -75,6 +86,7 @@ impl IconCache {
         IconCache {
             textures: HashMap::new(),
             requested: HashSet::new(),
+            attempts: HashMap::new(),
             tx,
             rx,
             loaded_count: 0,
@@ -101,6 +113,22 @@ impl IconCache {
                 match &px {
                     Some(_) => self.loaded_count += 1,
                     None => self.failed_count += 1,
+                }
+                if px.is_none() {
+                    // 失败重试（v0.1.9）：满 3 次才定格空结果；
+                    // 未满则撤掉在途标记，下次查询可重发（防
+                    // Shell 忙一瞬导致永久灰块，对齐原版）。
+                    let n = {
+                        let e = self.attempts.entry(k.clone()).or_insert(0);
+                        *e += 1;
+                        *e
+                    };
+                    if n >= 3 {
+                        self.textures.insert(k, None);
+                    } else {
+                        self.requested.remove(&k);
+                    }
+                    continue;
                 }
                 let handle = px.map(|(w, h, rgba)| {
                     let img = egui::ColorImage::from_rgba_unmultiplied(
@@ -189,42 +217,116 @@ mod win {
     }
 
     /// 按 key 取系统图标并转成 RGBA。任何一步失败都返回 None。
-    /// v0.1.6：`path:` 类 key 首次按真实路径取失败时，再带
-    /// SHGFI_USEFILEATTRIBUTES 按文件属性重试一次（不解析 .lnk 目标、
-    /// 不落盘打开文件），至少拿到该扩展名的通用图标而不是回退色块。
+    /// `path:` 类 key 的取图链（v0.1.9 对齐原版 IconCache）：
+    /// ① IShellItemImageFactory 按路径取 64px 本项图标 →
+    /// ② SHGetFileInfoW 真实路径大图标 → ③ .lnk 目标解析取图
+    /// （v0.1.7 图标三规）→ ④ USEFILEATTRIBUTES 通用图标兜底。
+    /// 其余 key（folder / file / 扩展名）只问类型图标、不落盘。
     fn fetch(key: &str) -> Option<Pixels> {
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
-        // (要问的路径, 文件属性, 是否走 USEFILEATTRIBUTES 不落盘)
-        let (path_str, attrs, use_attrs): (String, u32, bool) =
-            if key == "folder" {
-                ("folder".to_string(), FILE_ATTRIBUTE_DIRECTORY, true)
-            } else if key == "file" {
-                ("file".to_string(), FILE_ATTRIBUTE_NORMAL, true)
-            } else if let Some(p) = key.strip_prefix("path:") {
-                (p.to_string(), 0, false)
-            } else {
-                // ".docx" 之类的扩展名 key：拼个假文件名问类型图标
-                (format!("file{key}"), FILE_ATTRIBUTE_NORMAL, true)
-            };
-
-        if let Some(px) = fetch_once(&path_str, attrs, use_attrs) {
-            return Some(px);
+        if key == "folder" {
+            return fetch_once("folder", FILE_ATTRIBUTE_DIRECTORY, true);
         }
-        if key.starts_with("path:") && !use_attrs {
-            // v0.1.7 图标三规兜底：.lnk 直接取图失败 → IShellLink
-            // 解析目标 / 图标位置后对目标取图（目标软件自己的 ico），
-            // 成功同样计 loaded（worker 回传 Some 即计数）。
-            if path_str.to_lowercase().ends_with(".lnk") {
-                if let Some(px) = fetch_lnk_target_icon(&path_str) {
+        if key == "file" {
+            return fetch_once("file", FILE_ATTRIBUTE_NORMAL, true);
+        }
+        if let Some(p) = key.strip_prefix("path:") {
+            if let Some(px) = fetch_factory(p) {
+                return Some(px);
+            }
+            if let Some(px) = fetch_once(p, 0, false) {
+                return Some(px);
+            }
+            if p.to_lowercase().ends_with(".lnk") {
+                if let Some(px) = fetch_lnk_target_icon(p) {
                     return Some(px);
                 }
             }
-            // 真实路径取图失败 → 按属性问法重试（通用图标兜底）
-            return fetch_once(&path_str, FILE_ATTRIBUTE_NORMAL, true);
+            return fetch_once(p, FILE_ATTRIBUTE_NORMAL, true);
         }
-        None
+        // ".docx" 之类的扩展名 key：拼个假文件名问类型图标
+        fetch_once(&format!("file{key}"), FILE_ATTRIBUTE_NORMAL, true)
+    }
+
+    /// IShellItemImageFactory 的 vtbl 布局（windows-sys 0.52 同样
+    /// 只给指针类型；方法顺序按 shobjidl.h：QI/AddRef/Release 后
+    /// 就是 GetImage）。
+    #[repr(C)]
+    struct IShellItemImageFactoryVtbl {
+        query_interface: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *const windows_sys::core::GUID,
+            *mut *mut std::ffi::c_void,
+        ) -> i32,
+        add_ref: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+        release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+        get_image: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            windows_sys::Win32::Foundation::SIZE,
+            u32,
+            *mut isize,
+        ) -> i32,
+    }
+
+    /// 图标链首层（v0.1.9）：SHCreateItemFromParsingName 直接要
+    /// IShellItemImageFactory，GetImage 取 64×64 本项图标
+    /// （SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK：只要图标本体、
+    /// 允许给大图）。返回的 HBITMAP 用完 DeleteObject，接口
+    /// Release。
+    fn fetch_factory(path_str: &str) -> Option<Pixels> {
+        use std::ffi::{c_void, OsStr};
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::core::GUID;
+        use windows_sys::Win32::Foundation::SIZE;
+        use windows_sys::Win32::Graphics::Gdi::DeleteObject;
+        use windows_sys::Win32::UI::Shell::SHCreateItemFromParsingName;
+
+        const IID_SHELL_ITEM_IMAGE_FACTORY: GUID = GUID {
+            data1: 0xBCC1_8B79,
+            data2: 0xBA16,
+            data3: 0x442F,
+            data4: [0x80, 0xC4, 0x8A, 0x59, 0xC3, 0x0C, 0x46, 0x3B],
+        };
+        const SIIGBF_BIGGERSIZEOK: u32 = 0x1;
+        const SIIGBF_ICONONLY: u32 = 0x4;
+
+        let wide: Vec<u16> = OsStr::new(path_str)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut factory: *mut c_void = std::ptr::null_mut();
+            let hr = SHCreateItemFromParsingName(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                &IID_SHELL_ITEM_IMAGE_FACTORY,
+                &mut factory,
+            );
+            if hr != 0 || factory.is_null() {
+                return None;
+            }
+            let result = (|| {
+                let vt = *(factory as *const *const IShellItemImageFactoryVtbl);
+                let mut hbm: isize = 0;
+                let hr = ((*vt).get_image)(
+                    factory,
+                    SIZE { cx: 64, cy: 64 },
+                    SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+                    &mut hbm,
+                );
+                if hr != 0 || hbm == 0 {
+                    return None;
+                }
+                let px = hbitmap_to_rgba(hbm);
+                DeleteObject(hbm);
+                px
+            })();
+            let vt = *(factory as *const *const IShellItemImageFactoryVtbl);
+            ((*vt).release)(factory);
+            result
+        }
     }
 
     /// IShellLink / IPersistFile 的 vtbl 布局（windows-sys 0.52 只给
@@ -457,84 +559,93 @@ mod win {
         px
     }
 
-    /// HICON → (宽, 高, RGBA)：GetIconInfo 拿颜色位图，GetDIBits 按
-    /// 32bpp 自上而下读 BGRA，再转成 RGBA。位图句柄用完 DeleteObject。
+    /// HICON → (宽, 高, RGBA)：GetIconInfo 拿颜色位图后走
+    /// hbitmap_to_rgba；位图句柄用完 DeleteObject。
     unsafe fn hicon_to_rgba(
         hicon: windows_sys::Win32::UI::WindowsAndMessaging::HICON,
     ) -> Option<Pixels> {
-        use std::ffi::c_void;
-        use windows_sys::Win32::Graphics::Gdi::{
-            DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
-            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-        };
+        use windows_sys::Win32::Graphics::Gdi::DeleteObject;
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
 
         let mut ii: ICONINFO = std::mem::zeroed();
         if GetIconInfo(hicon, &mut ii) == 0 {
             return None;
         }
-        let result = (|| {
-            if ii.hbmColor == 0 {
-                return None;
-            }
-            let mut bm: BITMAP = std::mem::zeroed();
-            let got = GetObjectW(
-                ii.hbmColor,
-                std::mem::size_of::<BITMAP>() as i32,
-                &mut bm as *mut BITMAP as *mut c_void,
-            );
-            if got == 0 {
-                return None;
-            }
-            let (w, h) = (bm.bmWidth, bm.bmHeight);
-            if w <= 0 || h <= 0 || w > 256 || h > 256 {
-                return None;
-            }
-            let mut bmi: BITMAPINFO = std::mem::zeroed();
-            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            bmi.bmiHeader.biWidth = w;
-            bmi.bmiHeader.biHeight = -h; // 负高 = 自上而下，省一次翻转
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB;
-            let mut buf = vec![0u8; (w * h * 4) as usize];
-            let hdc = GetDC(0);
-            if hdc == 0 {
-                return None;
-            }
-            let lines = GetDIBits(
-                hdc,
-                ii.hbmColor,
-                0,
-                h as u32,
-                buf.as_mut_ptr() as *mut c_void,
-                &mut bmi,
-                DIB_RGB_COLORS,
-            );
-            ReleaseDC(0, hdc);
-            if lines == 0 {
-                return None;
-            }
-            // BGRA → RGBA
-            for px in buf.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-            // 老图标没有 alpha 通道（全像素 alpha=0）：整体置不透明，
-            // 否则整张图会因 alpha=0 而完全透明、什么都看不见。
-            if buf.iter().skip(3).step_by(4).all(|&a| a == 0) {
-                for px in buf.chunks_exact_mut(4) {
-                    px[3] = 255;
-                }
-            }
-            Some((w as u32, h as u32, buf))
-        })();
+        let px = if ii.hbmColor != 0 {
+            hbitmap_to_rgba(ii.hbmColor)
+        } else {
+            None
+        };
         if ii.hbmColor != 0 {
             DeleteObject(ii.hbmColor);
         }
         if ii.hbmMask != 0 {
             DeleteObject(ii.hbmMask);
         }
-        result
+        px
+    }
+
+    /// HBITMAP → (宽, 高, RGBA)：GetObjectW 验尺寸，GetDIBits 按
+    /// 32bpp 自上而下读 BGRA，再转成 RGBA。只读不删（句柄归
+    /// 调用方）。HICON 路径与 IShellItemImageFactory 路径共用。
+    unsafe fn hbitmap_to_rgba(
+        hbm: windows_sys::Win32::Graphics::Gdi::HBITMAP,
+    ) -> Option<Pixels> {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Graphics::Gdi::{
+            GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
+            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        let mut bm: BITMAP = std::mem::zeroed();
+        let got = GetObjectW(
+            hbm,
+            std::mem::size_of::<BITMAP>() as i32,
+            &mut bm as *mut BITMAP as *mut c_void,
+        );
+        if got == 0 {
+            return None;
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        if w <= 0 || h <= 0 || w > 256 || h > 256 {
+            return None;
+        }
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h; // 负高 = 自上而下，省一次翻转
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let hdc = GetDC(0);
+        if hdc == 0 {
+            return None;
+        }
+        let lines = GetDIBits(
+            hdc,
+            hbm,
+            0,
+            h as u32,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(0, hdc);
+        if lines == 0 {
+            return None;
+        }
+        // BGRA → RGBA
+        for px in buf.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        // 老图标没有 alpha 通道（全像素 alpha=0）：整体置不透明，
+        // 否则整张图会因 alpha=0 而完全透明、什么都看不见。
+        if buf.iter().skip(3).step_by(4).all(|&a| a == 0) {
+            for px in buf.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        }
+        Some((w as u32, h as u32, buf))
     }
 }
 

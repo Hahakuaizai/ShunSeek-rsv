@@ -53,12 +53,17 @@ impl RawEntry {
 pub(crate) const MAGIC: &[u8; 8] = b"SSKIDX01";
 /// v2（v0.1.8）：尾部追加全拼池两区段（full_off, full_pool），旧
 /// 区段下标不变；v1 缓存文件版本校验不过会自动重建（同原版口径）。
-const VERSION: u32 = 2;
+/// v3（v0.1.9）：缓存信任字段（对齐原版 IndexCache）——header
+/// 偏移 20 存 built_unix（建表时刻，秒），尾部追加 scope 区段
+/// （作用域串，如 "C:,D: · MFT 直读全盘"）；加载端据此判定
+/// scope 是否还对得上、缓存是否超过 24h。v2 文件版本校验不过
+/// 自动重建。
+const VERSION: u32 = 3;
 /// header 大小（字节），区段从此偏移开始，按 8 字节对齐排布。
 const HEADER_SIZE: usize = 256;
 /// 区段数：dirs_off, dirs_pool, name_off, name_pool, init_off, init_pool,
-/// dir_ids, cats, refs, full_off, full_pool
-const SECTIONS: usize = 11;
+/// dir_ids, cats, refs, full_off, full_pool, scope_pool
+const SECTIONS: usize = 12;
 
 #[derive(Clone, Copy, Default)]
 struct Section {
@@ -250,7 +255,21 @@ impl IndexStore {
     // ---- 落盘 / 加载 ----
 
     /// 把索引写成与内存布局一致的二进制文件（save 后可用 load_mmap 秒开）。
+    /// 无信任字段的兼容入口（scope 空串、built 0），等价旧行为。
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
+        self.save_with_meta(path, "", 0)
+    }
+
+    /// 带缓存信任字段的保存（v0.1.9）：scope = 作用域串（模式 +
+    /// 卷列表），built_unix = 建表时刻（Unix 秒）。加载端用
+    /// read_cache_meta 读回判定可信度（见 IndexService 对齐口径：
+    /// scope 对不上不用、超过 24h 先用后重扫）。
+    pub fn save_with_meta(
+        &self,
+        path: &Path,
+        scope: &str,
+        built_unix: u64,
+    ) -> io::Result<()> {
         use std::io::{Seek, Write};
         let sections_data: [&[u8]; SECTIONS] = [
             u32_bytes(self.dirs_off()),
@@ -264,6 +283,7 @@ impl IndexStore {
             u64_bytes(self.refs()),
             u32_bytes(self.full_off()),
             self.full_pool(),
+            scope.as_bytes(),
         ];
         let mut sections = [Section::default(); SECTIONS];
         let mut cursor = HEADER_SIZE;
@@ -280,6 +300,7 @@ impl IndexStore {
         header[8..12].copy_from_slice(&VERSION.to_le_bytes());
         header[12..16].copy_from_slice(&self.count.to_le_bytes());
         header[16..20].copy_from_slice(&self.dir_count.to_le_bytes());
+        header[20..28].copy_from_slice(&built_unix.to_le_bytes());
         for (i, s) in sections.iter().enumerate() {
             let base = 32 + i * 16;
             header[base..base + 8].copy_from_slice(&s.off.to_le_bytes());
@@ -338,6 +359,30 @@ impl IndexStore {
             dir_count,
             backing: Backing::Mapped(MappedData { mmap, sections }),
         })
+    }
+
+    /// 只读缓存信任字段（v0.1.9）：返回 (scope, built_unix)。
+    /// 文件不存在 / 魔数版本不对 / 区段越界都返回 Err，调用方
+    /// 按「无可信缓存」处理（不用或重建）。
+    pub fn read_cache_meta(path: &Path) -> io::Result<(String, u64)> {
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        if mmap.len() < HEADER_SIZE || &mmap[0..8] != MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "不是 ShunSeek 索引文件"));
+        }
+        let rd32 = |o: usize| u32::from_le_bytes(mmap[o..o + 4].try_into().unwrap());
+        let rd64 = |o: usize| u64::from_le_bytes(mmap[o..o + 8].try_into().unwrap());
+        if rd32(8) != VERSION {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "索引版本不匹配"));
+        }
+        let built_unix = rd64(20);
+        let base = 32 + 11 * 16; // scope_pool 是第 12 区段（下标 11）
+        let (off, len) = (rd64(base) as usize, rd64(base + 8) as usize);
+        if off + len > mmap.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（scope 越界）"));
+        }
+        let scope = String::from_utf8_lossy(&mmap[off..off + len]).into_owned();
+        Ok((scope, built_unix))
     }
 }
 

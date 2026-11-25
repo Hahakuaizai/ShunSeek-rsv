@@ -46,6 +46,7 @@ mod autostart;
 mod demo;
 mod hotkey;
 mod icons;
+mod names;
 mod opener;
 mod tray;
 
@@ -789,9 +790,12 @@ fn spawn_rebuild(dir: PathBuf, tx: Sender<IndexMsg>) {
                         "重建线程异常".to_string(),
                     ),
                 };
-                // 缓存尽力存 index.bin（save_to 自带 tmp+rename 原子
+                // 缓存尽力存 index.bin（save 自带 tmp+rename 原子
                 // 换入）：失败只丢缓存（saved=false），store 本体照常直传。
-                let saved = store.save_to(&dir.join("index.bin")).is_ok();
+                // v0.1.9：带信任字段（scope + 建表时间）存。
+                let saved = store
+                    .save_with_meta(&dir.join("index.bin"), &current_scope(), now_unix())
+                    .is_ok();
                 let _ = tx.send(IndexMsg::Rebuilt {
                     store,
                     count,
@@ -836,7 +840,9 @@ fn send_index_stage_watch(
     let store = build_index(entries.to_vec(), roots);
     let count = store.count();
     let saved = if final_stage {
-        store.save_to(&dir.join("index.bin")).is_ok()
+        store
+            .save_with_meta(&dir.join("index.bin"), &current_scope(), now_unix())
+            .is_ok()
     } else {
         true
     };
@@ -964,6 +970,64 @@ fn drive_fs_name(drive: char) -> Option<String> {
         }
         let end = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
         Some(String::from_utf16_lossy(&fs[..end]))
+    }
+}
+
+/// 当前作用域串（v0.1.9 缓存信任字段，对齐原版 IndexService
+/// 的 scope 口径）：MFT 模式 = "C:,D: · MFT 直读全盘"，便携
+/// 模式 = "用户目录 · 便携模式"，未提权时附 "（未提权）"。
+/// 与 rebuild_windows 的分档判定同源（管理员 + NTFS 固定盘）；
+/// 缓存保存时写入、启动加载时比对，对不上即弃缓存。
+#[cfg(windows)]
+fn current_scope() -> String {
+    let mut ntfs: Vec<char> = Vec::new();
+    for drive in 'C'..='Z' {
+        if std::path::Path::new(&format!("{drive}:\\")).exists()
+            && drive_fs_name(drive)
+                .map(|fs| fs.eq_ignore_ascii_case("NTFS"))
+                .unwrap_or(false)
+        {
+            ntfs.push(drive);
+        }
+    }
+    let elevated = is_elevated();
+    let mut scope = if elevated && !ntfs.is_empty() {
+        let list: Vec<String> = ntfs.iter().map(|d| format!("{d}:")).collect();
+        format!("{} · MFT 直读全盘", list.join(","))
+    } else {
+        "用户目录 · 便携模式".to_string()
+    };
+    if !elevated {
+        scope += "（未提权）";
+    }
+    scope
+}
+
+/// 非 Windows（演示构建）的作用域串：恒定值，缓存自洽即可。
+#[cfg(not(windows))]
+fn current_scope() -> String {
+    "演示数据".to_string()
+}
+
+/// 当前 Unix 秒（缓存信任字段的建表时间用）。
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 任意 Unix 秒 → 本地 "HH:MM"（缓存状态文案用）。
+fn hhmm_of_unix(secs: u64) -> String {
+    #[cfg(windows)]
+    {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let full = win_time::to_local_string(t).unwrap_or_else(|| "--:--".to_string());
+        full.chars().skip(11).take(5).collect()
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60)
     }
 }
 
@@ -1533,6 +1597,9 @@ struct ShunSeekApp {
     fold_active: bool,
     /// 结果行真实系统图标缓存（Windows；非 Windows 恒空回退色块）。
     icons: icons::IconCache,
+    /// 显示名解析（v0.1.9 ShellNames 对齐）：文件夹本地化名 /
+    /// .lnk 显示名 / .exe 描述，渲染期后台解析、按路径缓存。
+    names: names::NameService,
     selected: usize,
     status: String,
     /// 状态栏警戒标志（空索引护栏）：true 时状态文字与圆点标红。
@@ -1625,6 +1692,44 @@ struct ShunSeekApp {
     filter_panel_rect: Option<egui::Rect>,
     /// 首页「＋ 添加」弹层是否打开（popup 锚在添加格上）。
     home_add_open: bool,
+    /// 窗口当前是否最小化（每帧与 viewport 上报同步，自绘最小化
+    /// 按钮按下时先行置位）。失焦隐藏与托盘 Toggle 都要看它：
+    /// 最小化 ≠ 隐藏，最小化时不许叠加 Visible(false)（v0.1.9）。
+    minimized: bool,
+    /// 最近一次 show() 的时刻：窗口真正重新获得焦点之前（或
+    /// 超时 5 秒），失焦隐藏不许触发——恢复链刚把窗口拉起来、
+    /// 焦点还在托盘/任务栏上时，was_focused 的残值会造成
+    /// true→false 跳变把窗口立刻又藏回去（v0.1.9 恢复宽限期，
+    /// 替代只靠 300ms 竞态门的旧做法）。
+    restore_since: Option<Instant>,
+    /// 搜索框上一帧的 Rect（整窗背景拖动的排除区：在搜索框里
+    /// 按下拖动要留给文本选择，不触发窗口拖动）。
+    search_rect: Option<egui::Rect>,
+    /// 呼出时给搜索框设全选（show() 置位，draw_search_box 消费）。
+    select_all_search: bool,
+    /// 搜索框 TextEdit 的 Id（绘制时记下，Ctrl+C 判定文本选区用）。
+    search_edit_id: Option<egui::Id>,
+    /// 自绘右键菜单状态（v0.1.9 菜单语言统一）：右键结果行 /
+    /// 宫格格子 / 首页磁贴时置位，update 在主面板之后统一
+    /// 绘制并执行动作。
+    ctx_menu: Option<CtxMenu>,
+}
+
+/// 自绘右键菜单的目标（下标以打开时为准；搜索一变菜单即关，
+/// 不会指到新结果上）。
+#[derive(Clone, Copy)]
+enum CtxTarget {
+    /// 搜索结果展示行（列表行 / 宫格格子共用展示下标）。
+    Result(usize),
+    /// 首页磁贴。
+    Home(usize),
+}
+
+/// 自绘右键菜单状态：右键点（绘制时再钳制进窗口）+ 目标。
+#[derive(Clone, Copy)]
+struct CtxMenu {
+    pos: egui::Pos2,
+    target: CtxTarget,
 }
 
 impl ShunSeekApp {
@@ -1635,17 +1740,45 @@ impl ShunSeekApp {
         let usage = UsageStore::load(Some(dir.join("usage.dat")));
 
         // 缓存索引秒开：有 index.bin 先 mmap 顶上，后台重建完再换新的。
-        // 旧版本（≤0.1.4）的缓存写在 index-next.bin，有就拿来顶上，
-        // 别让老用户升级后第一次启动白白冷启动。
+        // v0.1.9 缓存信任字段（对齐原版 IndexCache/IndexService）：
+        // 先读 meta（scope + 建表时间）——scope 与当前作用域对不上
+        // （如提权状态/盘符变了）→ 缓存不用、直接冷建；超过 24h →
+        // 先用着，状态标「（后台更新中）」（启动本来就会后台重建，
+        // 语义与原版「先用后重扫」一致，只是没有 15s 延迟）。
         let index_path = dir.join("index.bin");
-        let (store, status) = match IndexStore::load_mmap(&index_path)
-            .or_else(|_| IndexStore::load_mmap(&dir.join("index-next.bin")))
-        {
-            Ok(s) => {
-                let n = s.count();
-                (s, format!("{} 项", group_thousands(n)))
+        let meta = IndexStore::read_cache_meta(&index_path).ok();
+        let scope_ok = meta
+            .as_ref()
+            .map(|(s, _)| s == &current_scope())
+            .unwrap_or(false);
+        let (store, status) = if scope_ok {
+            match IndexStore::load_mmap(&index_path) {
+                Ok(s) => {
+                    let n = s.count();
+                    let built = meta.map(|(_, b)| b).unwrap_or(0);
+                    let stale = now_unix().saturating_sub(built) > 24 * 3600;
+                    let status = if stale {
+                        format!(
+                            "缓存索引 · {} · {} 条（后台更新中）",
+                            hhmm_of_unix(built),
+                            group_thousands(n)
+                        )
+                    } else {
+                        format!(
+                            "缓存索引 · {} · {} 条",
+                            hhmm_of_unix(built),
+                            group_thousands(n)
+                        )
+                    };
+                    (s, status)
+                }
+                Err(_) => (build_index(Vec::new(), None), "正在准备索引…".to_string()),
             }
-            Err(_) => (build_index(Vec::new(), None), "正在准备索引…".to_string()),
+        } else {
+            // 无 meta / scope 对不上：不用任何旧缓存（含历史的
+            // index-next.bin——它没有信任字段，拿来顶上会架空
+            // scope 判定），直接冷建，后台重建马上跟上。
+            (build_index(Vec::new(), None), "正在准备索引…".to_string())
         };
 
         let (search_tx, search_rx) = std::sync::mpsc::channel();
@@ -1702,6 +1835,7 @@ impl ShunSeekApp {
             expanded_groups: HashSet::new(),
             fold_active: false,
             icons: icons::IconCache::new(&cc.egui_ctx),
+            names: names::NameService::new(&cc.egui_ctx),
             selected: 0,
             status,
             status_alert: false,
@@ -1727,6 +1861,8 @@ impl ShunSeekApp {
                 tray::TrayInit {
                     // 启动时已有一轮重建在跑（上面 spawn_rebuild）
                     rebuilding: true,
+                    data_dir: dir.clone(),
+                    hotkey_label: settings.hotkey.display(),
                 },
             ),
             visible: !START_HIDDEN.load(Ordering::SeqCst),
@@ -1763,6 +1899,12 @@ impl ShunSeekApp {
             filter_dot_rect: None,
             filter_panel_rect: None,
             home_add_open: false,
+            minimized: false,
+            restore_since: None,
+            search_rect: None,
+            select_all_search: false,
+            search_edit_id: None,
+            ctx_menu: None,
         };
         app.pins = load_pins(&dir);
         app.rebuild_home_items();
@@ -1779,6 +1921,10 @@ impl ShunSeekApp {
     /// 空查询不再走 UsageStore 首页：首页 = 用户 pins，由 UI 侧
     /// home_items 绘制（usage 只用于搜索排序加分，见 core）。
     fn schedule_search(&mut self) {
+        // 搜索一变，右键菜单的下标目标即失效、添加菜单也失去
+        // 锚点语境，一律关掉（v0.1.9 自绘菜单的卫生习惯）
+        self.ctx_menu = None;
+        self.home_add_open = false;
         self.search_cancel.store(true, Ordering::SeqCst);
         let cancel = Arc::new(AtomicBool::new(false));
         self.search_cancel = cancel.clone();
@@ -1946,25 +2092,38 @@ impl ShunSeekApp {
     }
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
+        self.restore_since = None;
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
     }
 
     fn show(&mut self, ctx: &egui::Context) {
         self.visible = true;
+        self.minimized = false;
+        // 恢复命令三件套（v0.1.9）：只发 Visible(true) 解不了
+        // 最小化态——窗口还缩在任务栏里，而 Focus 对最小化窗口
+        // 无效，托盘/热键就永远唤不回（v0.1.8 真机实测的断链）。
+        // 先可见、再解除最小化、最后聚焦。
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
-        // 呼出时清空 + 聚焦搜索框（对 C# 版 ToggleShow 的 SelectAll 的等价体感）
-        if !self.query.is_empty() {
-            self.query.clear();
-        }
-        // 无论查询是否清空都重搜一次：空查询首页按使用频次排序，
-        // 刚打开过的条目计数 +1，呼出时要立刻反映到排序上。
+        // 恢复宽限期：真正拿到焦点之前，失焦隐藏不许触发
+        self.restore_since = Some(Instant::now());
+        // 呼出保留查询词 + 全选（v0.1.9 对齐原版 Show 的
+        // SelectAll 口径）：打字即覆盖、按方向键即改词，比旧版
+        // 「呼出即清空」更接近原版体感。全选在 draw_search_box
+        // 里随聚焦一起落地（select_all_search 标志）。
+        self.select_all_search = true;
+        // 保留查询也重搜一次：索引可能已增量更新；空查询时首页
+        // 按使用频次排序，刚打开过的条目计数 +1 要立刻反映。
         self.schedule_search();
         self.focus_search = true;
     }
 
     fn toggle(&mut self, ctx: &egui::Context) {
-        if self.visible {
+        // 最小化态算「没显示」：托盘左键要恢复它而不是再隐藏
+        // （v0.1.9——旧版 visible=true 就走 hide，最小化后点托盘
+        // 反而把窗口彻底藏没，是唤不回链上的另一环）。
+        if self.visible && !self.minimized {
             self.hide(ctx);
         } else {
             // 刚被失焦隐藏（<300ms）又收到 Toggle：多半是同一次托盘
@@ -2327,7 +2486,8 @@ impl ShunSeekApp {
         if self.pins.iter().any(|p| p.eq_ignore_ascii_case(path)) {
             return;
         }
-        self.pins.push(path.to_string());
+        // 新固定插队首（对齐原版：最近固定的排最前）
+        self.pins.insert(0, path.to_string());
         self.save_pins();
         self.rebuild_home_items();
     }
@@ -2447,7 +2607,36 @@ impl ShunSeekApp {
 
     /// 原始按键事件处理（绕开 TextEdit 对方向键等的消费，保证在输入框
     /// 聚焦时 ↑↓ / Enter / Esc 也归我们管，同 C# 版 PreviewKeyDown）。
+    /// 当前选中条目的完整路径（Ctrl+C 复制用）：首页取磁贴项，
+    /// 搜索态取选中展示行（折叠组行无单一路径，返回 None）。
+    fn selected_path(&self) -> Option<String> {
+        if self.is_home() {
+            self.home_items.get(self.selected).map(|it| it.path.clone())
+        } else {
+            match self.display.get(self.selected) {
+                Some(DisplayRow::Single { row, .. }) => {
+                    self.rows.get(*row).map(|r| r.path.clone())
+                }
+                _ => None,
+            }
+        }
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // 自绘菜单开着时（v0.1.9）：Esc 只关菜单，不许穿透到
+        // 下面的 Esc 三段链（否则关菜单顺带清查询/藏窗口）；
+        // 右键菜单是模态的，其余键一律不处理（防菜单还开着时
+        // Enter 把选中行打开、方向键在菜单底下乱跑）。
+        if self.ctx_menu.is_some() || self.home_add_open {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.ctx_menu = None;
+                self.home_add_open = false;
+                return;
+            }
+            if self.ctx_menu.is_some() {
+                return;
+            }
+        }
         let events: Vec<egui::Event> = ctx.input(|i| i.raw.events.clone());
         for ev in &events {
             if let egui::Event::Key {
@@ -2469,6 +2658,28 @@ impl ShunSeekApp {
                             self.schedule_search();
                         } else {
                             self.hide(ctx);
+                        }
+                    }
+                    // Ctrl+C 复制（v0.1.9 对齐原版；优先级钉死）：
+                    // 搜索框里有选中文本 → 什么都不做，TextEdit 会
+                    // 在绘制时自己复制文本；无选中文本 → 复制当前
+                    // 选中条目的完整路径。事件不消费：两条路互斥
+                    // 靠选区判定，不靠拦截。
+                    Key::C
+                        if modifiers.ctrl
+                            && !modifiers.alt
+                            && !modifiers.shift =>
+                    {
+                        let has_text_selection = self
+                            .search_edit_id
+                            .and_then(|id| egui::TextEdit::load_state(ctx, id))
+                            .and_then(|st| st.cursor.char_range())
+                            .map(|r| r.primary.index != r.secondary.index)
+                            .unwrap_or(false);
+                        if !has_text_selection {
+                            if let Some(path) = self.selected_path() {
+                                ctx.copy_text(path);
+                            }
                         }
                     }
                     // PgUp/PgDn：三行/三排步进（v0.1.8）；Home/End
@@ -2882,13 +3093,36 @@ fn grad_color(top: Color32, mid: Color32, bottom: Color32, t: f32) -> Color32 {
     )
 }
 
-/// 竖向渐变背景（v0.1.6 改回单个 Mesh）：12 个横向分带拼成一张
-/// 三角网（13×2 顶点、24 个三角形、**1 个 Shape**），替代旧版每帧
-/// 100 条 rect_filled 色带。旧版弃 Mesh 是因为「顶点色被压暗」的
-/// 观察——后来证实灰幕真凶是 Frame 阴影（已删），Mesh 本身无罪。
+/// 渐变类 Mesh 的横向分带边界：上下圆角区（各 2×radius）内
+/// 步长 2px、内部粗分带。旧版 12 条均匀分带在圆角区是 45px
+/// 一条弦——弦与真圆弧之间留出一片没涂到的楔形，窗口圆角内、
+/// 渐变弦外无人绘制，真机合成出来就是四角的黑色楔形
+/// （v0.1.9 实测）。2px 步长时弦弧偏差 <0.05px，不可见。
+fn gradient_band_ys(rect: egui::Rect, radius: f32) -> Vec<f32> {
+    let top = rect.top();
+    let bottom = rect.bottom();
+    let h = (bottom - top).max(1.0);
+    let corner = (radius * 2.0).min(h * 0.25);
+    let coarse = ((h - corner * 2.0) / 6.0).max(8.0);
+    let mut ys = vec![top];
+    let mut y = top;
+    while y < bottom - 0.01 {
+        let dist_edge = (y - top).min(bottom - y);
+        let step = if dist_edge < corner { 2.0 } else { coarse };
+        y = (y + step).min(bottom);
+        ys.push(y);
+    }
+    ys
+}
+
+/// 竖向渐变背景（v0.1.6 改回单个 Mesh）：横向分带拼成一张
+/// 三角网（**1 个 Shape**），替代旧版每帧 100 条 rect_filled
+/// 色带。旧版弃 Mesh 是因为「顶点色被压暗」的观察——后来证实
+/// 灰幕真凶是 Frame 阴影（已删），Mesh 本身无罪。
 /// 顶点色按原版 InkFill 的对角方向 (0,0)→(0.45,1) 取 t：
 /// t = (0.45·nx + ny) / 1.45，左右顶点 t 不同即成对角渐变；
-/// 分带边界按圆角轮廓收边，四角不缺角不出界。
+/// 分带边界按圆角轮廓收边（步长见 gradient_band_ys），四角
+/// 不缺角不出界。
 fn paint_vertical_gradient(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -2897,10 +3131,9 @@ fn paint_vertical_gradient(
     mid: Color32,
     bottom: Color32,
 ) {
-    const BANDS: usize = 12;
+    let ys = gradient_band_ys(rect, radius);
     let mut mesh = egui::Mesh::default();
-    for i in 0..=BANDS {
-        let y = rect.top() + rect.height() * (i as f32 / BANDS as f32);
+    for &y in &ys {
         let inset = rounded_inset_at(rect, radius, y);
         let ny = (y - rect.top()) / rect.height().max(1.0);
         for (x, nx) in [
@@ -2914,7 +3147,7 @@ fn paint_vertical_gradient(
             );
         }
     }
-    for i in 0..BANDS {
+    for i in 0..ys.len() - 1 {
         let a = (i * 2) as u32;
         mesh.indices
             .extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
@@ -2924,15 +3157,17 @@ fn paint_vertical_gradient(
 
 /// 顶部光晕（原版 TopGlow）：窗口顶部 220px 的白色渐隐层，方向
 /// (0,0)→(0.2,1) 近似为竖向；峰值 alpha 由 palette 给（已折入原版
-/// 层 Opacity 0.5）。v0.1.6 起与渐变同法：单个 Mesh（6 分带），
-/// 替代旧版 18×4=72 个小矩形切片。
+/// 层 Opacity 0.5）。v0.1.6 起与渐变同法：单个 Mesh，替代旧版
+/// 18×4=72 个小矩形切片；分带与背景渐变共用 gradient_band_ys
+/// （顶部圆角区 2px 细步长，弦不许离开圆弧，v0.1.9）。
 fn paint_top_glow(painter: &egui::Painter, rect: egui::Rect, radius: f32, peak: u8) {
     const GLOW_H: f32 = 220.0;
-    const BANDS: usize = 6;
     let h = GLOW_H.min(rect.height());
+    let glow_rect =
+        egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), h));
+    let ys = gradient_band_ys(glow_rect, radius);
     let mut mesh = egui::Mesh::default();
-    for i in 0..=BANDS {
-        let y = rect.top() + h * (i as f32 / BANDS as f32);
+    for &y in &ys {
         // 只在圆角区（顶部 radius 范围内）需要收边
         let inset = if y - rect.top() < radius {
             rounded_inset_at(rect, radius, y)
@@ -2945,13 +3180,116 @@ fn paint_top_glow(painter: &egui::Painter, rect: egui::Rect, radius: f32, peak: 
         mesh.colored_vertex(egui::pos2(rect.left() + inset, y), color);
         mesh.colored_vertex(egui::pos2(rect.right() - inset, y), color);
     }
-    for i in 0..BANDS {
+    for i in 0..ys.len() - 1 {
         let a = (i * 2) as u32;
         mesh.indices
             .extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
     }
     painter.add(egui::Shape::mesh(mesh));
 }
+/// 菜单最小宽（v0.1.9 用户定的宽松尺度：宁可宽松，不许再出现
+/// 两行字贴脸挤在一个小灰盒里的样子；所有自绘弹出菜单共用）。
+const MENU_MIN_W: f32 = 200.0;
+/// 菜单条目行高。
+const MENU_ITEM_H: f32 = 34.0;
+/// 菜单条目之间的气口。
+const MENU_ITEM_GAP: f32 = 2.0;
+/// 菜单内边距（Frame inner margin，四边同值）。
+const MENU_PAD: f32 = 8.0;
+
+/// 应用菜单的 Frame（原版右键菜单令牌）：MenuFill 底 +
+/// MenuStroke 描边 + 圆角 10 + 柔和投影（与筛选面板同一套
+/// popup 参数）+ 内边距 8。首页添加菜单、自绘右键菜单共用，
+/// 不再出现 egui 默认灰盒子。
+fn menu_frame(pal: Palette) -> egui::Frame {
+    egui::Frame::none()
+        .fill(pal.popup_fill)
+        .stroke(Stroke::new(1.0_f32, pal.popup_stroke))
+        .rounding(Rounding::same(10.0))
+        .shadow(egui::epaint::Shadow {
+            offset: Vec2::new(0.0, 5.0),
+            blur: 22.0,
+            spread: 0.0,
+            color: pal.popup_shadow_color,
+        })
+        .inner_margin(egui::Margin::same(MENU_PAD))
+}
+
+/// 菜单条目（整行可点）：高 34、Sans 13、文字左内边距 12
+/// （即原版条目内边距 12,8 的横向值，纵向由行高居中实现），
+/// hover 整行 MenuHover 填充（chip_hover_fill)、圆角 6。
+/// enabled=false 时只画灰字不响应（非 Windows 的占位项）。
+/// 返回本帧是否被点击。
+fn menu_item(ui: &mut egui::Ui, pal: Palette, label: &str, enabled: bool) -> bool {
+    // 宽取「可用宽与菜单内容宽的较小者」：菜单里就是 184
+    // （200 - 两侧内边距 8×2）；放进更宽的面板（如范围面板）
+    // 也保持菜单条目宽度，不拉满。
+    let w = ui.available_width().min(MENU_MIN_W - MENU_PAD * 2.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(w, MENU_ITEM_H),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let painter = ui.painter_at(rect);
+    if enabled && resp.hovered() {
+        painter.rect_filled(rect, Rounding::same(6.0), pal.chip_hover_fill);
+    }
+    let color = if enabled { pal.name_text } else { pal.path_text };
+    painter.text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        color,
+    );
+    enabled && resp.clicked()
+}
+
+/// 菜单分隔线：上下各 4px 气口的发丝线，左右内缩 12 与条目
+/// 文字对齐。整段占高 9（4 + 1 + 4），与 menu_height 口径一致。
+fn menu_separator(ui: &mut egui::Ui, pal: Palette) {
+    ui.add_space(4.0);
+    let w = ui.available_width().min(MENU_MIN_W - MENU_PAD * 2.0);
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
+    ui.painter_at(rect).rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 12.0, rect.top()),
+            egui::pos2(rect.right() - 12.0, rect.bottom()),
+        ),
+        Rounding::ZERO,
+        pal.hairline,
+    );
+    ui.add_space(4.0);
+}
+
+/// 菜单总高估算（定位钳制用）：n 个条目 + s 条分隔线；条目间
+/// 气口按 n-1 个计（分隔线所在接缝的气口含在它的 9 里，估算
+/// 略偏大 2px，方向安全——宁可早一点改向上弹）。
+fn menu_height(n_items: usize, n_seps: usize) -> f32 {
+    MENU_PAD * 2.0
+        + n_items as f32 * MENU_ITEM_H
+        + n_items.saturating_sub(1) as f32 * MENU_ITEM_GAP
+        + n_seps as f32 * 9.0
+}
+
+/// 把菜单左上角钳制进窗口：右/下溢出时贴边收回（留 6px 边距），
+/// 左/上同样不许出界。
+fn clamp_menu_pos(pos: egui::Pos2, size: Vec2, screen: egui::Rect) -> egui::Pos2 {
+    let x = pos
+        .x
+        .min(screen.right() - size.x - 6.0)
+        .max(screen.left() + 6.0);
+    let y = pos
+        .y
+        .min(screen.bottom() - size.y - 6.0)
+        .max(screen.top() + 6.0);
+    egui::pos2(x, y)
+}
+
 /// 类型控件展开后的迷你 chip 顺序：全部 + 12 类（安装目录在旧
 /// chips 栏里被塞进「更多」，这里一并摆出，免得该类没法单独筛选）。
 const TYPE_CHIPS: &[Option<Category>] = &[
@@ -3086,19 +3424,259 @@ enum RowAction {
     Locate(usize),
     /// 展开/收起一个折叠组（display 下标 + 父目录路径）。
     Toggle(usize, String),
-    /// 右键菜单「添加到首页」（display 下标，处理方解析到结果行）。
-    Pin(usize),
 }
 
-/// 首页磁贴动作（下标是 home_items 下标）。
+/// 首页磁贴动作（下标是 home_items 下标）。「从首页移除」走
+/// 自绘右键菜单（draw_ctx_menu）直接执行，不经此枚举。
 enum HomeAction {
     Select(usize),
     Open(usize),
     Locate(usize),
-    Remove(usize),
 }
 
 impl ShunSeekApp {
+    /// 整窗拖动 + 边缘拉伸（v0.1.9）：无边框窗口在 Windows 上
+    /// with_resizable(true) 只改窗口样式、不提供边缘命中，拖动
+    /// 原本也只有书眉标题一小块——真机上等于拖不动、拉不了。
+    /// 这里在最底层（主面板之前创建、背景层）铺一块全窗
+    /// chrome 区。配套要求：主窗口各 ScrollArea 必须
+    /// drag_to_scroll(false)（首页 / 列表 / 宫格 / 筛选条），
+    /// 否则滚动区以更高层级的 Sense::drag 抢走空白区拖拽。
+    /// 1. 背景拖动区（Sense::click_and_drag 覆盖全窗）：上层
+    ///    控件（按钮 / 输入框 / 结果行）按创建顺序在
+    ///    其上、各自先消费；落到背景的拖动才 StartDrag。搜索
+    ///    框 Rect 内除外（按下点在框内留给文本选择）；双击
+    ///    背景切换最大化（与书眉双击同义）。
+    /// 2. 拉伸命中区（在背景之上、面板内容之下）：四边 8px、
+    ///    四角 12px，drag_started 发 ViewportCommand::
+    ///    BeginResize（egui 0.29 有此命令，egui-winit 落到
+    ///    winit 的 drag_resize_window，系统接管拉伸），光标
+    ///    按方向提示。原版拉伸边是 6px，这里取 8px 更易命中。
+    /// 最大化时整块不建（不拖不拉，原版同义）。
+    fn window_chrome(&mut self, ctx: &egui::Context) {
+        if self.maximized || !self.visible {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let search_rect = self.search_rect;
+        let mut start_drag = false;
+        let mut toggle_max = false;
+        let mut resize_dir: Option<egui::viewport::ResizeDirection> = None;
+        egui::Area::new(egui::Id::new("ss_window_chrome"))
+            .order(egui::Order::Background)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                // ---- 背景拖动区（最底层，先建） ----
+                let (_, bg) = ui
+                    .allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
+                if bg.double_clicked() {
+                    toggle_max = true;
+                } else if bg.drag_started() {
+                    let origin = ctx
+                        .input(|i| i.pointer.press_origin())
+                        .or_else(|| bg.interact_pointer_pos());
+                    let in_search = origin
+                        .zip(search_rect)
+                        .map(|(p, r)| r.contains(p))
+                        .unwrap_or(false);
+                    if !in_search {
+                        start_drag = true;
+                    }
+                }
+                // ---- 拉伸命中区（背景之上、内容之下） ----
+                const EDGE: f32 = 8.0;
+                const CORNER: f32 = 12.0;
+                let (l, t, r, b) = (
+                    screen.left(),
+                    screen.top(),
+                    screen.right(),
+                    screen.bottom(),
+                );
+                use egui::viewport::ResizeDirection as D;
+                let zones: [(egui::Rect, D, egui::CursorIcon); 8] = [
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(l + CORNER, t),
+                            egui::pos2(r - CORNER, t + EDGE),
+                        ),
+                        D::North,
+                        egui::CursorIcon::ResizeVertical,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(l + CORNER, b - EDGE),
+                            egui::pos2(r - CORNER, b),
+                        ),
+                        D::South,
+                        egui::CursorIcon::ResizeVertical,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(l, t + CORNER),
+                            egui::pos2(l + EDGE, b - CORNER),
+                        ),
+                        D::West,
+                        egui::CursorIcon::ResizeHorizontal,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(r - EDGE, t + CORNER),
+                            egui::pos2(r, b - CORNER),
+                        ),
+                        D::East,
+                        egui::CursorIcon::ResizeHorizontal,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(l, t),
+                            egui::pos2(l + CORNER, t + CORNER),
+                        ),
+                        D::NorthWest,
+                        egui::CursorIcon::ResizeNwSe,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(r - CORNER, t),
+                            egui::pos2(r, t + CORNER),
+                        ),
+                        D::NorthEast,
+                        egui::CursorIcon::ResizeNeSw,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(l, b - CORNER),
+                            egui::pos2(l + CORNER, b),
+                        ),
+                        D::SouthWest,
+                        egui::CursorIcon::ResizeNeSw,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(r - CORNER, b - CORNER),
+                            egui::pos2(r, b),
+                        ),
+                        D::SouthEast,
+                        egui::CursorIcon::ResizeNwSe,
+                    ),
+                ];
+                for (rect, dir, cursor) in zones {
+                    let resp = ui.interact(
+                        rect,
+                        ui.id().with(("ss_resize", dir as u8)),
+                        egui::Sense::drag(),
+                    );
+                    if resp.hovered() || resp.dragged() {
+                        ctx.set_cursor_icon(cursor);
+                    }
+                    if resp.drag_started() {
+                        resize_dir = Some(dir);
+                    }
+                }
+            });
+        if toggle_max {
+            self.maximized = true;
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
+        } else if let Some(dir) = resize_dir {
+            // 系统拖动 / 拉伸期间同样 arm 宽限期（焦点闪断防护，
+            // 与失焦块的 pointer_down 守卫双保险）
+            self.restore_since = Some(Instant::now());
+            ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
+        } else if start_drag {
+            self.restore_since = Some(Instant::now());
+            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+    }
+
+    /// 自绘右键菜单（v0.1.9）：结果行 / 宫格格子 / 首页磁贴
+    /// 共用，语言与尺度同 menu_frame / menu_item（宽 200、
+    /// 行高 34、条目内边距 12,8、字 13、菜单内边距 8、气口
+    /// 2），替代 egui 默认 context_menu 的紧凑灰菜单。由
+    /// update 在主面板之后调用：位置按右键点钳制进窗口，
+    /// 点外关闭（Esc 在 handle_keys 里拦截），动作执行后即关。
+    fn draw_ctx_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.ctx_menu else {
+            return;
+        };
+        let pal = self.theme.palette();
+        let screen = ctx.screen_rect();
+        let labels: [&str; 3] = match menu.target {
+            CtxTarget::Result(_) => ["打开", "打开所在文件夹", "添加到首页"],
+            CtxTarget::Home(_) => ["打开", "打开所在文件夹", "从首页移除"],
+        };
+        let size = Vec2::new(MENU_MIN_W, menu_height(3, 1));
+        let pos = clamp_menu_pos(menu.pos, size, screen);
+        let mut action: Option<&'static str> = None;
+        let area = egui::Area::new(egui::Id::new("ss_ctx_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                menu_frame(pal).show(ui, |ui| {
+                    if menu_item(ui, pal, labels[0], true) {
+                        action = Some(labels[0]);
+                    }
+                    ui.add_space(MENU_ITEM_GAP);
+                    if menu_item(ui, pal, labels[1], true) {
+                        action = Some(labels[1]);
+                    }
+                    menu_separator(ui, pal);
+                    if menu_item(ui, pal, labels[2], true) {
+                        action = Some(labels[2]);
+                    }
+                })
+            });
+        if action.is_none() {
+            // 点外关闭：本帧 primary 按下点落在菜单之外
+            let press = ctx.input(|i| {
+                if i.pointer.primary_pressed() {
+                    i.pointer
+                        .press_origin()
+                        .or_else(|| i.pointer.interact_pos())
+                } else {
+                    None
+                }
+            });
+            if let Some(p) = press {
+                if !area.response.rect.contains(p) {
+                    self.ctx_menu = None;
+                    return;
+                }
+            }
+        }
+        let Some(act) = action else {
+            return;
+        };
+        self.ctx_menu = None;
+        match (menu.target, act) {
+            (CtxTarget::Result(idx), "打开") => {
+                self.open_display_row(ctx, idx, false)
+            }
+            (CtxTarget::Result(idx), "打开所在文件夹") => {
+                self.selected = idx;
+                self.open_display_row(ctx, idx, true)
+            }
+            (CtxTarget::Result(idx), "添加到首页") => {
+                if let Some(DisplayRow::Single { row, .. }) =
+                    self.display.get(idx).cloned()
+                {
+                    if let Some(r) = self.rows.get(row) {
+                        let p = r.path.clone();
+                        self.add_pin(&p);
+                    }
+                }
+            }
+            (CtxTarget::Home(idx), "打开") => self.open_home_item(ctx, idx, false),
+            (CtxTarget::Home(idx), "打开所在文件夹") => {
+                self.open_home_item(ctx, idx, true)
+            }
+            (CtxTarget::Home(idx), "从首页移除") => {
+                if let Some(item) = self.home_items.get(idx).cloned() {
+                    self.remove_pin(&item.path);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// 搜索框（原版 SearchField）：Surface 填充 + EdgeLine 描边的
     /// 高 54、圆角 12 面板；左放大镜 16 号 TextLow；输入 Serif 17
     /// TextHi、占位 Serif 16 TextLow；聚焦时左侧 2px 朱砂焦点条
@@ -3182,6 +3760,9 @@ impl ShunSeekApp {
                     .on_hover_text("最小化")
                     .clicked()
                 {
+                    // 先行置位：viewport 上报回来之前，失焦隐藏与
+                    // 托盘 Toggle 就得知道窗口是最小化不是隐藏
+                    self.minimized = true;
                     ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                 }
                 ui.add_space(2.0);
@@ -3260,9 +3841,32 @@ impl ShunSeekApp {
                     .font(serif(17.0));
                 let out = edit.show(ui);
                 self.search_focused = out.response.has_focus();
+                self.search_edit_id = Some(out.response.id);
                 if self.focus_search {
                     out.response.request_focus();
                     self.focus_search = false;
+                    // 呼出全选（show() 置位）：把选区设为全文，
+                    // 下一帧 TextEdit 按此状态渲染
+                    if self.select_all_search {
+                        self.select_all_search = false;
+                        if let Some(mut state) =
+                            egui::TextEdit::load_state(ui.ctx(), out.response.id)
+                        {
+                            let len = self.query.chars().count();
+                            state.cursor.set_char_range(Some(
+                                egui::text_selection::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(len),
+                                ),
+                            ));
+                            egui::TextEdit::store_state(
+                                ui.ctx(),
+                                out.response.id,
+                                state,
+                            );
+                            ui.ctx().request_repaint();
+                        }
+                    }
                 }
                 if out.response.changed() {
                     self.schedule_search();
@@ -3281,6 +3885,9 @@ impl ShunSeekApp {
         // 焦点标记条：2px 朱砂竖条，左内缩 1、上下内缩 10，圆角 1；
         // 聚焦淡入 / 失焦淡出（animate 0.18s 近似原版 150/200ms）。
         let rect = frame_resp.response.rect;
+        // 整窗背景拖动的排除区（见 window_chrome）：在搜索框里
+        // 按下拖动留给文本选择，不触发窗口拖动
+        self.search_rect = Some(rect);
         let v = ui.ctx().animate_bool_with_time(
             ui.make_persistent_id("search_focus_bar"),
             self.search_focused,
@@ -3439,6 +4046,7 @@ impl ShunSeekApp {
             egui::ScrollArea::horizontal()
                 .id_salt("type_chips")
                 .auto_shrink([false, false])
+                .drag_to_scroll(false)
                 .scroll_bar_visibility(
                     egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                 )
@@ -3650,7 +4258,19 @@ impl ShunSeekApp {
                         ui.label(
                             RichText::new(path).size(11.5).color(pal.name_text),
                         );
-                        if ui.small_button("删除").clicked() {
+                        // 无框文字按钮（v0.1.9 菜单语言）：不再用
+                        // egui 默认 small_button 的灰钮
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("删除")
+                                        .size(11.5)
+                                        .color(pal.accent),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
                             remove = Some(i);
                         }
                     });
@@ -3659,9 +4279,11 @@ impl ShunSeekApp {
                     custom.remove(i);
                     changed = true;
                 }
+                // 「添加文件夹…」改菜单条目行（v0.1.9 菜单语言，
+                // 与自绘菜单同尺度），不再用默认灰按钮
                 #[cfg(windows)]
                 {
-                    if ui.button("添加文件夹…").clicked() {
+                    if menu_item(ui, pal, "添加文件夹…", true) {
                         if let Some(p) = rfd::FileDialog::new().pick_folder() {
                             let s = p.to_string_lossy().into_owned();
                             if !custom.contains(&s) {
@@ -3673,7 +4295,7 @@ impl ShunSeekApp {
                 }
                 #[cfg(not(windows))]
                 {
-                    ui.add_enabled(false, egui::Button::new("添加文件夹…"));
+                    menu_item(ui, pal, "添加文件夹…", false);
                 }
                 // 点外关闭判定用：记下本帧面板的实际 Rect（见 update）
                 panel_rect = Some(ui.min_rect());
@@ -3776,7 +4398,13 @@ impl ShunSeekApp {
         let mut action: Option<HomeAction> = None;
         let mut add_clicked = false;
         let mut add_resp: Option<egui::Response> = None;
-        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        // drag_to_scroll(false)：ScrollArea 默认会对整个视口
+        // 做 Sense::drag 交互（egui scroll_area.rs），会抢走
+        // 空白区的整窗拖动（v0.1.9 背景层在更低层级必输）。
+        // 桌面端滚轮滚动不受影响，拖拽滚动是触屏特性。
+        let mut scroll = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .drag_to_scroll(false);
         if self.scroll_to_selected {
             let offset =
                 ((self.selected / cols) as f32 * row_pitch - 120.0).max(0.0);
@@ -3846,47 +4474,74 @@ impl ShunSeekApp {
             }
         });
 
-        // 「＋ 添加」弹层：选文件 / 选文件夹（锚在添加格下方）
-        let popup_id = ui.make_persistent_id("home_add_popup");
+        // 「＋ 添加」菜单（v0.1.9 改自绘）：锚在添加格下方，
+        // 走应用菜单语言与宽松尺度（menu_frame / menu_item：
+        // 宽 200、行高 34、字 13），位置钳制在窗口内（下方
+        // 放不下改向上弹、右溢出贴边收回）——旧版 egui 默认
+        // popup 是灰按钮条，还会溢出到屏幕外。Esc 关闭在
+        // handle_keys 里统一拦截，点外关闭在本块末尾判定。
         if add_clicked {
             self.home_add_open = !self.home_add_open;
-        }
-        if self.home_add_open {
-            ui.memory_mut(|m| m.open_popup(popup_id));
         }
         #[allow(unused_mut)] // 只有 Windows 分支会改它们（rfd 对话框）
         let mut pick_file = false;
         #[allow(unused_mut)]
         let mut pick_folder = false;
-        if let Some(resp) = &add_resp {
-            egui::containers::popup::popup_below_widget(
-                ui,
-                popup_id,
-                resp,
-                egui::containers::popup::PopupCloseBehavior::CloseOnClickOutside,
-                |ui| {
-                    ui.set_min_width(150.0);
-                    #[cfg(windows)]
-                    {
-                        if ui.button("选择文件…").clicked() {
-                            pick_file = true;
-                            ui.close_menu();
-                        }
-                        if ui.button("选择文件夹…").clicked() {
-                            pick_folder = true;
-                            ui.close_menu();
+        if self.home_add_open {
+            match &add_resp {
+                Some(resp) => {
+                    let pal = self.theme.palette();
+                    let screen = ui.ctx().screen_rect();
+                    let anchor = resp.rect;
+                    let size = Vec2::new(MENU_MIN_W, menu_height(2, 0));
+                    let mut pos =
+                        egui::pos2(anchor.left(), anchor.bottom() + 4.0);
+                    if pos.y + size.y > screen.bottom() - 6.0 {
+                        // 靠下缘：向上弹
+                        pos.y = anchor.top() - size.y - 4.0;
+                    }
+                    pos = clamp_menu_pos(pos, size, screen);
+                    let area = egui::Area::new(
+                        ui.make_persistent_id("home_add_menu"),
+                    )
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos)
+                    .show(ui.ctx(), |ui| {
+                        menu_frame(pal).show(ui, |ui| {
+                            if menu_item(ui, pal, "选择文件…", cfg!(windows)) {
+                                pick_file = true;
+                            }
+                            ui.add_space(MENU_ITEM_GAP);
+                            if menu_item(ui, pal, "选择文件夹…", cfg!(windows))
+                            {
+                                pick_folder = true;
+                            }
+                        })
+                    });
+                    if pick_file || pick_folder {
+                        self.home_add_open = false;
+                    } else {
+                        // 点外关闭：按下点落在菜单与锚点之外
+                        let press = ui.ctx().input(|i| {
+                            if i.pointer.primary_pressed() {
+                                i.pointer
+                                    .press_origin()
+                                    .or_else(|| i.pointer.interact_pos())
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(p) = press {
+                            if !area.response.rect.contains(p)
+                                && !anchor.contains(p)
+                            {
+                                self.home_add_open = false;
+                            }
                         }
                     }
-                    #[cfg(not(windows))]
-                    {
-                        ui.add_enabled(false, egui::Button::new("选择文件…"));
-                        ui.add_enabled(false, egui::Button::new("选择文件夹…"));
-                    }
-                },
-            );
-        }
-        if self.home_add_open && !ui.memory(|m| m.is_popup_open(popup_id)) {
-            self.home_add_open = false;
+                }
+                None => self.home_add_open = false,
+            }
         }
         // 系统对话框会抢焦点：先置抑制位，对话框关后一帧的失焦不隐藏
         #[cfg(windows)]
@@ -3915,11 +4570,6 @@ impl ShunSeekApp {
             Some(HomeAction::Locate(idx)) => {
                 let ctx = ui.ctx().clone();
                 self.open_home_item(&ctx, idx, true);
-            }
-            Some(HomeAction::Remove(idx)) => {
-                if let Some(item) = self.home_items.get(idx).cloned() {
-                    self.remove_pin(&item.path);
-                }
             }
             None => {}
         }
@@ -4006,11 +4656,19 @@ impl ShunSeekApp {
         // 排版走 fonts().layout（与宫格格子同路径，已验证居中无偏
         // 移）；手拼 LayoutJob 设 halign=Center 时 galley 行偏移会
         // 让整段文字左移出格（v0.1.7 首版预览实测），不要再用。
-        let mut display = item.name.clone();
+        // 显示名（v0.1.9 ShellNames）：解析到替换名时磁贴用替换名
+        let tile_name = self
+            .names
+            .get(
+                &item.path,
+                matches!(item.category, Category::Folder | Category::InstallDir),
+            )
+            .unwrap_or_else(|| item.name.clone());
+        let mut display = tile_name.clone();
         let mut galley =
             ui.fonts(|f| f.layout(display.clone(), serif(12.5), pal.name_text, wrap_w));
         if galley.rows.len() > 2 {
-            let mut chars: Vec<char> = item.name.chars().collect();
+            let mut chars: Vec<char> = tile_name.chars().collect();
             while galley.rows.len() > 2 && !chars.is_empty() {
                 let cut = (chars.len() / 8).max(1);
                 chars.truncate(chars.len().saturating_sub(cut));
@@ -4038,28 +4696,24 @@ impl ShunSeekApp {
         } else if response.clicked() {
             act = Some(HomeAction::Select(idx));
         }
-        let mut menu_act = None;
-        response.context_menu(|ui| {
-            if ui.button("打开").clicked() {
-                menu_act = Some(HomeAction::Open(idx));
-                ui.close_menu();
+        // 右键菜单（v0.1.9 自绘，见 draw_ctx_menu）：这里只
+        // 登记打开状态，绘制与动作执行在 update 里统一做
+        if response.secondary_clicked() {
+            if let Some(p) = response.interact_pointer_pos() {
+                self.ctx_menu = Some(CtxMenu {
+                    pos: p,
+                    target: CtxTarget::Home(idx),
+                });
             }
-            if ui.button("打开所在文件夹").clicked() {
-                menu_act = Some(HomeAction::Locate(idx));
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("从首页移除").clicked() {
-                menu_act = Some(HomeAction::Remove(idx));
-                ui.close_menu();
-            }
-        });
-        menu_act.or(act)
+        }
+        act
     }
 
     fn draw_results_list(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<RowAction> = None;
-        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        let mut scroll = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .drag_to_scroll(false);
         if self.scroll_to_selected {
             let offset = (self.selected as f32 * ROW_H - 140.0).max(0.0);
             scroll = scroll.vertical_scroll_offset(offset);
@@ -4087,17 +4741,6 @@ impl ShunSeekApp {
                 self.selected = idx;
                 self.toggle_group(&dir);
             }
-            Some(RowAction::Pin(idx)) => {
-                self.selected = idx;
-                if let Some(DisplayRow::Single { row, .. }) =
-                    self.display.get(idx).cloned()
-                {
-                    if let Some(r) = self.rows.get(row) {
-                        let p = r.path.clone();
-                        self.add_pin(&p);
-                    }
-                }
-            }
             None => {}
         }
     }
@@ -4112,7 +4755,9 @@ impl ShunSeekApp {
         self.grid_cols = cols;
         let grid_rows = self.display.len().div_ceil(cols);
         let mut action: Option<RowAction> = None;
-        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        let mut scroll = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .drag_to_scroll(false);
         if self.scroll_to_selected {
             let offset = ((self.selected / cols) as f32 * GRID_CELL_H - 140.0).max(0.0);
             scroll = scroll.vertical_scroll_offset(offset);
@@ -4154,17 +4799,6 @@ impl ShunSeekApp {
             Some(RowAction::Toggle(idx, dir)) => {
                 self.selected = idx;
                 self.toggle_group(&dir);
-            }
-            Some(RowAction::Pin(idx)) => {
-                self.selected = idx;
-                if let Some(DisplayRow::Single { row, .. }) =
-                    self.display.get(idx).cloned()
-                {
-                    if let Some(r) = self.rows.get(row) {
-                        let p = r.path.clone();
-                        self.add_pin(&p);
-                    }
-                }
             }
             None => {}
         }
@@ -4257,10 +4891,18 @@ impl ShunSeekApp {
                         pal.accent,
                     );
                 }
-                // 名字：Serif 12，最多 2 行、超出省略、居中
+                // 名字：Serif 12，最多 2 行、超出省略、居中；
+                // 显示名解析到替换名时用替换名（v0.1.9 ShellNames）
+                let cell_name = self
+                    .names
+                    .get(
+                        &r.path,
+                        matches!(r.category, Category::Folder | Category::InstallDir),
+                    )
+                    .unwrap_or_else(|| r.name.clone());
                 let galley = ui.fonts(|f| {
                     f.layout(
-                        r.name.clone(),
+                        cell_name,
                         serif(12.0),
                         pal.name_text,
                         92.0,
@@ -4288,23 +4930,16 @@ impl ShunSeekApp {
                 } else if response.clicked() {
                     act = Some(RowAction::Select(idx));
                 }
-                let mut menu_act = None;
-                response.context_menu(|ui| {
-                    if ui.button("打开").clicked() {
-                        menu_act = Some(RowAction::Open(idx));
-                        ui.close_menu();
+                // 右键菜单（v0.1.9 自绘，见 draw_ctx_menu）
+                if response.secondary_clicked() {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        self.ctx_menu = Some(CtxMenu {
+                            pos: p,
+                            target: CtxTarget::Result(idx),
+                        });
                     }
-                    if ui.button("打开所在文件夹").clicked() {
-                        menu_act = Some(RowAction::Locate(idx));
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("添加到首页").clicked() {
-                        menu_act = Some(RowAction::Pin(idx));
-                        ui.close_menu();
-                    }
-                });
-                menu_act.or(act)
+                }
+                act
             }
             CellData::Group(key, label, count, expanded) => {
                 // 占位盘（组格没有单一真实图标可取）。图标总规
@@ -4500,10 +5135,19 @@ impl ShunSeekApp {
         let painter = painter.with_clip_rect(text_clip);
         let name_font = serif(14.0);
         let mut job = egui::text::LayoutJob::default();
-        let name = &row.name;
+        // 显示名（v0.1.9 ShellNames 对齐）：解析到替换名（文件夹
+        // 本地化名 / .lnk 显示名 / .exe 描述）就用它，并跳过高亮
+        // ——高亮区间是按索引名算的字节量，套到替换名上必错位。
+        let shell_name = self.names.get(
+            &row.path,
+            matches!(row.category, Category::Folder | Category::InstallDir),
+        );
+        let name: &str = shell_name.as_deref().unwrap_or(&row.name);
         // 高亮区间：match_start/match_len 都是字节量，切片前双双
         // 收敛到字符边界（core 语义钉死 + app 侧防御，见 search.rs）
-        let hl = if row.match_start != usize::MAX && row.match_len > 0 {
+        let hl = if shell_name.is_some() {
+            None
+        } else if row.match_start != usize::MAX && row.match_len > 0 {
             let s = floor_char_boundary(name, row.match_start);
             let e = floor_char_boundary(name, s + row.match_len);
             if s < e { Some((s, e)) } else { None }
@@ -4571,23 +5215,16 @@ impl ShunSeekApp {
         } else if response.clicked() {
             act = Some(RowAction::Select(display_idx));
         }
-        let mut menu_act = None;
-        response.context_menu(|ui| {
-            if ui.button("打开").clicked() {
-                menu_act = Some(RowAction::Open(display_idx));
-                ui.close_menu();
+        // 右键菜单（v0.1.9 自绘，见 draw_ctx_menu）
+        if response.secondary_clicked() {
+            if let Some(p) = response.interact_pointer_pos() {
+                self.ctx_menu = Some(CtxMenu {
+                    pos: p,
+                    target: CtxTarget::Result(display_idx),
+                });
             }
-            if ui.button("打开所在文件夹").clicked() {
-                menu_act = Some(RowAction::Locate(display_idx));
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("添加到首页").clicked() {
-                menu_act = Some(RowAction::Pin(display_idx));
-                ui.close_menu();
-            }
-        });
-        menu_act.or(act)
+        }
+        act
     }
     /// 折叠组行（原版 FoldRow）：FoldFill 底、圆角 9，内缩近似
     /// 原版 Margin 2,4,6,4；左侧小三角字形（9.5 级 TextLow）+
@@ -5367,9 +6004,12 @@ impl ShunSeekApp {
 
         // ---------- 数据 ----------
         settings_heading(ui, pal, "数据");
+        // 确认态走应用胶囊语言（v0.1.9）：确认 = 选中态胶囊
+        // （朱砂淡填充，表「已武装的危险动作」），取消 = 普通
+        // 胶囊；不再用 egui 默认灰按钮
         if self.usage_confirm {
             ui.horizontal(|ui| {
-                if ui.button("确认清除？").clicked() {
+                if glass_chip(ui, pal, "确认清除？", true).clicked() {
                     {
                         let mut u = lock_rec(&self.usage);
                         u.clear();
@@ -5379,11 +6019,11 @@ impl ShunSeekApp {
                     self.settings_note = "使用记录已清除，常用统计从零开始".to_string();
                     self.schedule_search();
                 }
-                if ui.button("取消").clicked() {
+                if glass_chip(ui, pal, "取消", false).clicked() {
                     self.usage_confirm = false;
                 }
             });
-        } else if ui.button("清除使用记录").clicked() {
+        } else if glass_chip(ui, pal, "清除使用记录", false).clicked() {
             self.usage_confirm = true;
         }
 
@@ -5661,7 +6301,9 @@ impl eframe::App for ShunSeekApp {
             match action {
                 tray::TrayAction::Toggle => self.toggle(ctx),
                 tray::TrayAction::Show => {
-                    if self.visible {
+                    // 最小化态也要走 show() 的三件套恢复，只发
+                    // Focus 对最小化窗口无效（v0.1.9）
+                    if self.visible && !self.minimized {
                         ctx.send_viewport_cmd(ViewportCommand::Focus);
                     } else {
                         self.show(ctx);
@@ -5678,17 +6320,32 @@ impl eframe::App for ShunSeekApp {
                     }
                 }
                 tray::TrayAction::OpenSettings => {
-                    if !self.visible {
+                    if !self.visible || self.minimized {
                         self.show(ctx);
                     }
                     self.open_settings();
                 }
                 tray::TrayAction::About => {
-                    if !self.visible {
+                    if !self.visible || self.minimized {
                         self.show(ctx);
                     }
                     // 版本信息临时显示在状态栏（下一次搜索完成会覆盖）
                     self.status = about_text();
+                }
+                tray::TrayAction::AdminRestart => {
+                    // 以管理员身份重启（v0.1.9）：runas 拉起同一
+                    // exe（带 --from-restart 让新进程等旧进程释放
+                    // 单实例互斥），成功 → 本进程立即退出；UAC
+                    // 取消 → 保持现状 + 状态栏说明。
+                    #[cfg(windows)]
+                    {
+                        if restart_elevated() {
+                            self.tray.shutdown();
+                            std::process::exit(0);
+                        } else {
+                            self.status = "管理员授权未完成，已取消重启".to_string();
+                        }
+                    }
                 }
                 tray::TrayAction::Exit => {
                     // 先撤托盘图标再关窗，防幽灵图标残留
@@ -5743,11 +6400,36 @@ impl eframe::App for ShunSeekApp {
         // 失焦自动隐藏（呼出式工具的标准行为，也是不再置顶后的
         // 配套）：主窗口焦点 true→false 跳变时隐藏到托盘。例外不
         // 隐藏：设置窗口开着时；筛选面板展开时（点外先收面板，
-        // 见上）；刚关掉系统文件对话框的一帧（suppress 标志）。
+        // 见上）；刚关掉系统文件对话框的一帧（suppress 标志）；
+        // 窗口最小化时（v0.1.9：点最小化必然伴随失焦，旧版在这里
+        // 叠加 Visible(false)，把真最小化吞成隐藏到托盘、任务栏
+        // 图标都消失——最小化就是最小化，留任务栏）；刚 show()
+        // 恢复的宽限期内（restore_since：窗口真正拿到焦点之前，
+        // was_focused 残值造成的跳变不许把刚恢复的窗口又藏回）。
+        if let Some(m) = ctx.input(|i| i.viewport().minimized) {
+            self.minimized = m;
+        }
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if focused {
+            // 真正拿到过焦点，恢复宽限期结束
+            self.restore_since = None;
+        } else if let Some(t) = self.restore_since {
+            // 兜底超时：恢复始终没等来焦点也别永久关掉失焦隐藏
+            if t.elapsed() > Duration::from_secs(5) {
+                self.restore_since = None;
+            }
+        }
+        // 指针还按在本窗上（正在拖窗 / 拉伸 / 拖选）时不许藏：
+        // 系统拖动期间 WM 会让焦点闪断（moveresize 接管），
+        // 若此时失焦隐藏触发，窗口当场消失、拖动自杀
+        // （Xvfb+openbox 实测复现）。「用户去别处了」的语义
+        // 前提是指针没按在我们身上。
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
         if self.visible && self.was_focused && !focused {
             if self.suppress_focus_hide {
                 self.suppress_focus_hide = false;
+            } else if self.minimized || self.restore_since.is_some() || pointer_down {
+                // 最小化 / 恢复宽限期 / 指针按压中：不隐藏（见上）
             } else if !self.settings_open && self.expanded_filter.is_none() {
                 self.focus_hide_at = Some(Instant::now());
                 self.hide(ctx);
@@ -5760,22 +6442,30 @@ impl eframe::App for ShunSeekApp {
             self.handle_keys(ctx);
         }
 
+        // 整窗拖动 + 边缘拉伸命中区（最底层，必须先于主面板
+        // 创建，见 window_chrome）
+        self.window_chrome(ctx);
+
         // 悬浮窗背景：原版 InkFill 三段渐变（单个 Mesh，见
         // paint_vertical_gradient）画在背景层，面板本身透明，
         // 靠 Frame 的 ShellStroke 描边定义外壳。取色全走 palette。
+        // 最大化时圆角归零（原版口径）：渐变 / 光晕 / 壳体描边
+        // 同用 shell_radius，圆角外一像素都不画（黑角根治的
+        // 另一半：Mesh 分带加密在 paint 函数里）。
         let pal = self.theme.palette();
         let bg_painter = ctx.layer_painter(egui::LayerId::background());
         let screen = ctx.screen_rect();
+        let shell_radius = if self.maximized { 0.0 } else { 12.0 };
         paint_vertical_gradient(
             &bg_painter,
             screen,
-            12.0,
+            shell_radius,
             pal.grad_top,
             pal.grad_mid,
             pal.grad_bottom,
         );
         // 顶部光晕（原版 TopGlow：顶部 220px 白色渐隐层，单个 Mesh）
-        paint_top_glow(&bg_painter, screen, 12.0, pal.top_highlight_peak);
+        paint_top_glow(&bg_painter, screen, shell_radius, pal.top_highlight_peak);
         // 注意：这里绝不能给 Frame 加 shadow。面板填充是透明的，egui 的
         // 阴影画在面板形状之后、内容之前，会整片透过透明面板压在渐变上
         // ——浅色下就是一层均匀的灰幕（v0.1.3 浅色「太灰」的真凶，深色下
@@ -5783,7 +6473,10 @@ impl eframe::App for ShunSeekApp {
         // 边缘靠双层描边定义。
         let panel_frame = egui::Frame::central_panel(&ctx.style())
             .fill(Color32::TRANSPARENT)
-            .rounding(Rounding::same(12.0))
+            .rounding(Rounding::same(shell_radius))
+            // 阴影显式 NONE（不靠默认值）：壳体不许有任何实色
+            // 垫底，圆角外保持真透明（v0.1.9 黑角根治）
+            .shadow(egui::epaint::Shadow::NONE)
             .stroke(Stroke::new(1.0_f32, pal.panel_stroke))
             // 内容 Margin 对齐原版：左 26 / 右 18（右侧少 8 给滚动条）
             .inner_margin(egui::Margin {
@@ -5826,6 +6519,9 @@ impl eframe::App for ShunSeekApp {
                 ui.add_space(6.0);
                 self.draw_status_bar(ui);
             });
+
+        // 自绘右键菜单（主面板之后、设置窗口之前）
+        self.draw_ctx_menu(ctx);
 
         // 设置窗口（独立 viewport）与悬停详情卡都画在主面板之后
         self.draw_settings_viewport(ctx);
@@ -5930,13 +6626,26 @@ fn single_instance_acquire() -> bool {
             return true;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let ev_name = wide("ShunSeekWakeEvent");
-            let eh = OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr());
-            if eh != 0 {
-                SetEvent(eh);
-                CloseHandle(eh);
+            // 管理员重启衔接（v0.1.9）：带 --from-restart 时旧
+            // 进程正在退出——等互斥被释放（旧进程死亡后等待
+            // 返回 OBJECT_0 / ABANDONED），等到就顶替为唯一
+            // 实例继续启动；等不到才按重复启动处理（唤醒老
+            // 窗口后自退）。
+            let mut replaced = false;
+            if std::env::args().any(|a| a == "--from-restart") {
+                use windows_sys::Win32::System::Threading::WaitForSingleObject;
+                let w = WaitForSingleObject(mh, 3000);
+                replaced = w == 0 || w == 0x80; // WAIT_OBJECT_0 / WAIT_ABANDONED
             }
-            return false;
+            if !replaced {
+                let ev_name = wide("ShunSeekWakeEvent");
+                let eh = OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr());
+                if eh != 0 {
+                    SetEvent(eh);
+                    CloseHandle(eh);
+                }
+                return false;
+            }
         }
         let ev_name = wide("ShunSeekWakeEvent");
         let eh = CreateEventW(std::ptr::null(), 1, 0, ev_name.as_ptr());
@@ -5945,6 +6654,45 @@ fn single_instance_acquire() -> bool {
         }
         true
     }
+}
+
+/// 以管理员身份重启的拉起动作（v0.1.9，对齐原版
+/// RestartElevated）：ShellExecuteW 动词 runas 起同一 exe，
+/// 透传原参数并加 --from-restart（新进程据此等本进程释放单
+/// 实例互斥，见 single_instance_acquire）。true = 已拉起
+/// （调用方随即退出）；false = UAC 取消或拉起失败。
+#[cfg(windows)]
+fn restart_elevated() -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    args.push("--from-restart".to_string());
+    let params = args.join(" ");
+    let wide = |s: &OsStr| -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let verb = wide(OsStr::new("runas"));
+    let file = wide(exe.as_os_str());
+    let params_w = wide(OsStr::new(&params));
+    let r = unsafe {
+        ShellExecuteW(
+            0,
+            verb.as_ptr(),
+            file.as_ptr(),
+            if params.is_empty() {
+                std::ptr::null()
+            } else {
+                params_w.as_ptr()
+            },
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        )
+    };
+    r as isize > 32
 }
 
 fn main() -> eframe::Result<()> {
