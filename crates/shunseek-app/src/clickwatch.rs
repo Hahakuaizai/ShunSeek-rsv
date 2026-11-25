@@ -1,9 +1,12 @@
 //! 全局点外隐藏（v0.1.10，照原版 .NET GlobalClickWatcher 的机制）：
 //! WH_MOUSE_LL 低级鼠标钩子装在专职线程上（带自己的消息泵——
 //! 低级钩子靠安装线程的消息队列投递），全局左/右/中键按下时，
-//! 落点不在主窗口与设置窗口矩形内 → 置位「点外」标志并
-//! request_repaint，UI 线程下一帧 hide()。点哪还是哪，钩子
-//! 从不吞点击（永远 CallNextHookEx 放行）。
+//! 落点不在主窗口/设置窗口/托盘图标矩形内 → 点外命中。
+//! v0.1.12 起命中即由钩子线程**当场**调 winvis::hide_from_hook()
+//! （ShowWindowAsync(SW_HIDE)）把主窗藏掉，不再置标志等 UI
+//! 下一帧 hide()——那段排队正是旧可见性链的唤醒依赖（见
+//! winvis 模块头）。点哪还是哪，钩子从不吞点击（永远
+//! CallNextHookEx 放行）。
 //!
 //! 为什么不用失焦事件（v0.1.6–v0.1.9 的老路）：egui 的
 //! viewport.focused 是 winit 焦点状态，点任务栏/托盘/开始菜单
@@ -15,8 +18,14 @@
 //!
 //! 钩子纪律（低级钩子超时会被系统静默摘除）：
 //!  - 回调里只做：读 MSLLHOOKSTRUCT 坐标 → 读几个原子量做
-//!    矩形包含判断 → 置位 + request_repaint。不分配、不加锁、
+//!    矩形包含判断 → 命中时至多一次 ShowWindowAsync（投递即
+//!    返回，专为非属主线程发起显示变更设计）。不分配、不加锁、
 //!    不做任何 I/O。
+//!  - 「点外」标志（outside_pending）退为降级兜底：只在命中
+//!    时 HWND 尚未存入（winvis 无从下手）才置位 + repaint，
+//!    由 UI 在帧首消费一次 hide()。正常路径不置标志——
+//!    v0.1.11 的「托盘呼出被陈旧标志同帧反杀」就此断根：
+//!    钩子能当场藏窗时，世上不存在能反杀呼出的陈旧标志。
 //!  - 矩形由 UI 线程每帧以「物理像素」发布（egui 的 outer_rect
 //!    是监控器空间的点坐标 × native_pixels_per_point 换算），
 //!    回调只读原子量，不回调 UI。
@@ -152,7 +161,9 @@ impl ClickWatch {
             .store(armed && main.is_some(), Ordering::SeqCst);
     }
 
-    /// 取走一次「点外点击」（取后清零）。UI 每帧调用。
+    /// 取走一次「点外点击」（取后清零）。UI 每帧调用；v0.1.12
+    /// 起正常路径钩子当场藏窗不置标志，这里只会拿到 HWND 未
+    /// 存入时攒下的降级兜底标志（见模块头）。
     pub fn take_outside(&self) -> bool {
         self.shared.outside_pending.swap(false, Ordering::SeqCst)
     }
@@ -188,7 +199,7 @@ mod platform {
         WM_MBUTTONDOWN, WM_RBUTTONDOWN,
     };
 
-    /// 低级鼠标钩子回调：只读坐标 + 原子判定 + 置位/唤醒，
+    /// 低级鼠标钩子回调：只读坐标 + 原子判定 + 命中当场隐藏，
     /// 然后无条件放行（见模块头纪律）。
     unsafe extern "system" fn hook_proc(
         code: i32,
@@ -201,8 +212,19 @@ mod platform {
                 if let Some(sh) = shared() {
                     let info = &*(lparam as *const MSLLHOOKSTRUCT);
                     if is_outside(sh, info.pt.x, info.pt.y) {
-                        sh.outside_pending.store(true, Ordering::SeqCst);
-                        sh.ctx.request_repaint();
+                        if crate::winvis::hwnd() != 0 {
+                            // 当场藏窗（v0.1.12）：窗口属主是 UI
+                            // 线程，用 Async 版投递即返回，钩子不
+                            // 等待、不阻塞；UI 事后在帧首 OS 同步
+                            // 里发现状态变化并补清理。
+                            crate::winvis::hide_from_hook();
+                        } else {
+                            // 降级兜底：HWND 还没存入（启动极早
+                            // 期），退回旧置标志路径，UI 帧首
+                            // 消费一次 hide()。
+                            sh.outside_pending.store(true, Ordering::SeqCst);
+                            sh.ctx.request_repaint();
+                        }
                     }
                 }
             }

@@ -6,10 +6,13 @@
 //!
 //! Windows：C# 版用 RegisterHotKey + 窗口消息钩子。egui/eframe 没有把
 //! WM_HOTKEY 暴露给应用，这里改用后台线程轮询 GetAsyncKeyState（user32 FFI）：
-//! 每 20ms 查一次修饰键与主键的物理状态，主键由松到按的边沿触发一次，
-//! 置位共享标志并 request_repaint 把 UI 线程唤醒来处理。组合存共享
-//! 原子值，设置里改完下一圈轮询即按新值生效。
-//! 代价：窗口隐藏时 UI 靠这个 repaint 唤醒，轮询本身开销可忽略。
+//! 每 30ms 查一次修饰键与主键的物理状态，主键由松到按的边沿触发一次。
+//! v0.1.12 起边沿触发时轮询线程**当场**调 winvis::toggle() 按 OS
+//! 状态直接切换主窗口可见性（ShowWindow），再置位共享标志 +
+//! request_repaint 让 UI 随后补呼出副作用——旧设计「置标志 →
+//! repaint 唤醒 UI → UI 再 toggle」在真机上六版全灭（隐藏态下
+//! UI 线程唤醒不可靠，见 winvis 模块头），可见性从此不经 UI。
+//! 组合存共享原子值，设置里改完下一圈轮询即按新值生效。
 //!
 //! 冲突检测（check）：两道——硬编码系统保留名单优先判（Alt+Space
 //! 这类可能注册成功，名单说了算），再用 RegisterHotKey 实测占用
@@ -361,7 +364,9 @@ impl Hotkey {
         self.combo.store(combo.pack(), Ordering::SeqCst);
     }
 
-    /// 取走一次触发（取后清零）。UI 在每帧 update 开头调用。
+    /// 取走一次触发（取后清零）。UI 在每帧 update 开头调用；
+    /// v0.1.12 起这只代表「刚发生过一次热键呼出/隐藏，UI 该补
+    /// 副作用了」——可见性切换已由轮询线程当场完成。
     pub fn take_fired(&self) -> bool {
         self.fired.swap(false, Ordering::SeqCst)
     }
@@ -401,6 +406,10 @@ mod platform {
                         && (!c.win || key_down(VK_LWIN) || key_down(VK_RWIN));
                     let down = key_down(c.vk as i32);
                     if down && !prev_main && mods_down {
+                        // 当场切换可见性（v0.1.12）：决策现读 OS
+                        // 状态在本线程完成，窗口显/藏与 UI 线程
+                        // 是否醒来无关；fired 标志只剩副作用用途。
+                        crate::winvis::toggle();
                         fired.store(true, Ordering::SeqCst);
                         ctx.request_repaint();
                     }

@@ -15,8 +15,13 @@
 //!    跑自己的 GetMessage 循环；右键菜单用 CreatePopupMenu/TrackPopupMenu
 //!    （TPM_RETURNCMD 同步返回所选项），全部在托盘线程内处理，不依赖
 //!    UI 线程的事件循环是否在转。
-//!  - 与 UI 通信只走既有 TrayAction 队列 + request_repaint（唤醒 UI 这条
-//!    已被热键线程在真机证明有效）。
+//!  - 与 UI 通信走 TrayAction 队列 + request_repaint，但**可见性
+//!    不走队列**（v0.1.12）：左键 Toggle、菜单「打开瞬觅/设置/
+//!    关于」的显示动作由托盘线程当场直接调 winvis（ShowWindow），
+//!    队列只负责让 UI 随后补副作用（重搜/全选/打开设置窗口/
+//!    写状态栏）。旧链「队列 → repaint 唤醒 UI → update() 发
+//!    ViewportCommand」在真机上六版全灭（v0.1.6–v0.1.11），病根
+//!    就是隐藏态下 UI 线程的唤醒不可靠，见 winvis 模块头。
 //!  - **退出独立于 UI 线程**：托盘线程收到「退出」时先自己 NIM_DELETE
 //!    撤图标，再入队 Exit + 唤醒，并起 2 秒看门狗线程——到时进程还活着
 //!    就 std::process::exit(0)。UI 侧关窗/看门狗逻辑保留作第二道保险。
@@ -508,6 +513,11 @@ mod win {
                 if event == WM_CONTEXTMENU {
                     show_tray_menu(hwnd);
                 } else if event == NIN_SELECT {
+                    // 左键切换：本线程当场按 OS 状态直接切换
+                    // 可见性（v0.1.12，winvis::toggle 现读
+                    // IsWindowVisible/IsIconic 决策），再入队让
+                    // UI 补副作用——窗口显/藏不依赖 UI 是否醒来。
+                    crate::winvis::toggle();
                     push_action(TrayAction::Toggle);
                 }
                 0
@@ -584,7 +594,15 @@ mod win {
         DestroyMenu(menu);
 
         match cmd as usize {
-            ID_SHOW => push_action(TrayAction::Show),
+            // 显示类动作（v0.1.12）：先由本线程直接 winvis::show()
+            // 把主窗呼出来，再入队让 UI 补副作用——可见性不经
+            // UI 队列。设置/关于同理（它们各自的 UI 工作——打开
+            // 设置 viewport / 写状态栏——仍在队列那头完成；主窗
+            // 已被 ShowWindow 显示，UI 帧有系统消息驱动必然跑到）。
+            ID_SHOW => {
+                crate::winvis::show();
+                push_action(TrayAction::Show);
+            }
             ID_REBUILD => {
                 if !rebuilding {
                     push_action(TrayAction::RebuildIndex);
@@ -592,8 +610,14 @@ mod win {
             }
             ID_REFRESH => push_action(TrayAction::RefreshIndex),
             ID_ADMIN => push_action(TrayAction::AdminRestart),
-            ID_SETTINGS => push_action(TrayAction::OpenSettings),
-            ID_ABOUT => push_action(TrayAction::About),
+            ID_SETTINGS => {
+                crate::winvis::show();
+                push_action(TrayAction::OpenSettings);
+            }
+            ID_ABOUT => {
+                crate::winvis::show();
+                push_action(TrayAction::About);
+            }
             ID_EXIT => {
                 // 退出独立于 UI 线程：先自撤图标，再入队 + 唤醒，
                 // 并起 2 秒看门狗——UI 若没能处理 Exit，进程也必退。

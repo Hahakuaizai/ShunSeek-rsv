@@ -2784,10 +2784,11 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shunseek-app"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "eframe",
  "egui",
+ "raw-window-handle",
  "rfd",
  "shunseek-core",
  "windows-sys 0.52.0",

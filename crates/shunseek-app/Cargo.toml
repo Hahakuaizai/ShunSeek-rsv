@@ -1,6 +1,6 @@
 [package]
 name = "shunseek-app"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "瞬觅 ShunSeek 界面（Rust 版，egui 重绘）：DeskBox 式小悬浮窗 + 全局热键 + 托盘"
 
@@ -27,6 +27,11 @@ winresource = "0.1"
 # （仅 Windows 引入，非 Windows 目标不编译此依赖、按钮置灰）。
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"
+# 主窗口 HWND 的来源（v0.1.12）：从 eframe CreationContext/Frame 的
+# HasWindowHandle 取 Win32 句柄存入 winvis 全局原子量，可见性整层
+# 改走 ShowWindow（见 src/winvis.rs）。版本与 eframe 0.29 依赖的
+# raw-window-handle 0.6 对齐，保证 trait 实例是同一个。
+raw-window-handle = "0.6"
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

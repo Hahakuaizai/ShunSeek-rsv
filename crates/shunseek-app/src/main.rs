@@ -43,6 +43,13 @@
 //!    （书眉/搜索框 46/54 → 36/44，用户裁决覆盖原版令牌）；筛选
 //!    面板 chips 化 + 左竖右横展开动画 + 全集归一化；内容层动画
 //!    一组；绿色版数据布局（exe 旁 data/）。逐项见 CHANGELOG。
+//!  - v0.1.12（可见性整层换原生）：v0.1.6–v0.1.11 六版真机唤回
+//!    全灭的统一病根是「隐藏时 UI 线程靠 repaint 唤醒再消费队列」
+//!    这条链不可靠。主窗口 HWND 启动即存入全局原子量（winvis.rs），
+//!    显示/隐藏/最小化/还原全部改走 ShowWindow 且由发起线程
+//!    （托盘/热键/钩子/单实例唤醒）当场执行，状态判定现读
+//!    IsWindowVisible/IsIconic；UI 侧 show()/hide() 收敛为同一组
+//!    Win32 调用的薄封装，repaint 只负责呼出后的副作用帧。
 
 #![cfg_attr(
     all(target_os = "windows", not(debug_assertions)),
@@ -57,6 +64,7 @@ mod icons;
 mod names;
 mod opener;
 mod tray;
+mod winvis;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -1806,6 +1814,10 @@ struct ShunSeekApp {
     index_rx: Receiver<IndexMsg>,
     hotkey: hotkey::Hotkey,
     tray: tray::Tray,
+    /// 窗口可见性的**影子缓存**（v0.1.12）：每帧由
+    /// sync_shadow_from_os 从 OS（IsWindowVisible/IsIconic）
+    /// 同步，只供绘制与点外武装判定读；任何可见性**决策**
+    /// 不许读它（决策在发起线程现读 winvis::state()）。
     visible: bool,
     allow_exit: bool,
     focus_search: bool,
@@ -1861,20 +1873,20 @@ struct ShunSeekApp {
     filter_panel_rect: Option<egui::Rect>,
     /// 首页「＋ 添加」弹层是否打开（弹层锚在添加格上）。
     home_add_open: bool,
-    /// 窗口当前是否最小化（每帧与 viewport 上报同步，自绘最小化
-    /// 按钮按下时先行置位）。托盘 Toggle/Show 的「已显示」判定
-    /// 要看它：最小化 ≠ 隐藏，最小化时不许叠加 Visible(false)。
+    /// 窗口最小化的**影子缓存**（v0.1.12）：每帧由
+    /// sync_shadow_from_os 从 OS（IsIconic）同步，自绘最小化
+    /// 按钮按下时先行置位只是预热。最小化 ≠ 隐藏；托盘/热键
+    /// 的还原决策在发起线程现读 winvis::state()，不读此缓存。
     minimized: bool,
     /// 全局点外隐藏（clickwatch 模块，WH_MOUSE_LL 钩子）：点在
-    /// 主窗/设置窗矩形之外 → hide()。v0.1.10 起隐藏只认几何
-    /// 判定，焦点事件完全退出这条链——v0.1.6–v0.1.9 的失焦隐藏
-    /// 及其补丁群（对话框抑制、恢复宽限期、指针守卫）整套拆除：
-    /// 那套机制在任务栏/托盘等系统外壳区域焦点语义混乱，真机
-    /// 表现为「点别处就消失且唤不回」。
+    /// 主窗/设置窗/托盘图标矩形之外 → 钩子线程当场
+    /// ShowWindowAsync(SW_HIDE)（v0.1.12；此前是置标志等 UI
+    /// 下一帧 hide()）。v0.1.10 起隐藏只认几何判定，焦点事件
+    /// 完全退出这条链——v0.1.6–v0.1.9 的失焦隐藏及其补丁群
+    /// （对话框抑制、恢复宽限期、指针守卫）整套拆除：那套机制
+    /// 在任务栏/托盘等系统外壳区域焦点语义混乱，真机表现为
+    /// 「点别处就消失且唤不回」。
     clickwatch: clickwatch::ClickWatch,
-    /// 最近一次点外隐藏发生的时刻：点托盘图标本身也是一次
-    /// 「点外」——钩子先 hide()，托盘 Toggle 紧接着投递到，
-    /// 若 Toggle 再 show() 就成了同一次点击先藏后显的抖动。
     /// 手判拖动/拉伸的控件矩形集：每帧绘制时把所有交互控件的
     /// rect 推进 _cur，帧末轮换为 _prev；下一帧按下判定读
     /// _prev——按下点落在任一控件上 → 绝不 StartDrag，微位移
@@ -1934,6 +1946,23 @@ struct CtxMenu {
 
 impl ShunSeekApp {
     fn new(cc: &eframe::CreationContext<'_>) -> ShunSeekApp {
+        // 主窗口 HWND 存入 winvis（v0.1.12，可见性原生层的地基）：
+        // 必须赶在托盘/热键/唤醒等线程启动之前——它们从此直接
+        // 拿这个句柄调 ShowWindow，不再等 UI 线程消费队列。
+        // CreationContext 的 HasWindowHandle 在原生 runner 下由
+        // winit 窗口填充；万一这里取不到（Err/非 Win32 句柄），
+        // update() 首帧会再从 Frame 重取一次（见 update 开头）。
+        #[cfg(windows)]
+        {
+            use raw_window_handle::HasWindowHandle;
+            if let Ok(handle) = cc.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(w) =
+                    handle.as_raw()
+                {
+                    winvis::store_hwnd(w.hwnd.get());
+                }
+            }
+        }
         let dir = data_dir();
         let _ = std::fs::create_dir_all(&dir);
 
@@ -1987,8 +2016,11 @@ impl ShunSeekApp {
         spawn_rebuild(dir.clone(), index_tx);
 
         // 单实例唤醒等待线程（v0.1.8，Windows）：main 建好的命名
-        // 事件句柄在这里等——第二进程 SetEvent 后置位 WAKE_FLAG
-        // 并唤醒 UI 线程（update 里 show）。
+        // 事件句柄在这里等——第二进程 SetEvent 后，本线程**直接**
+        // winvis::show() 把已有窗口呼出来（v0.1.12：不再只置
+        // WAKE_FLAG 等 UI 线程消费——隐藏态下那条唤醒链正是六版
+        // 真机全灭的病根）。WAKE_FLAG + repaint 保留，只负责让
+        // UI 随后补一帧呼出副作用（重搜/全选/聚焦请求）。
         #[cfg(windows)]
         {
             let h = WAKE_EVENT.load(Ordering::SeqCst);
@@ -2008,6 +2040,8 @@ impl ShunSeekApp {
                             unsafe {
                                 ResetEvent(h);
                             }
+                            // 当场呼出（本线程直接调 ShowWindow）
+                            winvis::show();
                             WAKE_FLAG.store(true, Ordering::SeqCst);
                             ctx.request_repaint();
                         }
@@ -2296,31 +2330,58 @@ impl ShunSeekApp {
             })
             .ok();
     }
-    fn hide(&mut self, ctx: &egui::Context) {
+    /// 隐藏到托盘（UI 线程内的落点：✕ 按钮 / Esc 终段 / 打开
+    /// 条目后 / 点外裁决兜底）。v0.1.12 起实际动作收敛到
+    /// winvis::hide()（ShowWindow SW_HIDE，本线程当场执行）；
+    /// 此前六版走 ViewportCommand::Visible 的老路已整段删除。
+    /// 非 Windows 无 Win32 可调，同一调用点以 ViewportCommand
+    /// 兜底（演示平台机制，不进 Windows 链）。
+    fn hide(&mut self, _ctx: &egui::Context) {
         self.visible = false;
-        // 隐藏时把所有弹出层一并收掉：下次呼出是干净界面，
-        // 也免得面板开着的状态被钩子判定链拖进下一轮。
+        self.on_hidden();
+        winvis::hide();
+        #[cfg(not(windows))]
+        _ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+    }
+
+    /// 隐藏的界面清理（与 hide() 本体拆开：窗口被其他线程直接
+    /// ShowWindow 藏掉时，UI 是在帧首 OS 同步里发现状态变化的，
+    /// 清理走同一入口——见 sync_shadow_from_os 的跃迁处理）。
+    /// 隐藏时把所有弹出层一并收掉：下次呼出是干净界面，也免得
+    /// 面板开着的状态被钩子判定链拖进下一轮。
+    fn on_hidden(&mut self) {
         self.expanded_filter = None;
         self.ctx_menu = None;
         self.home_add_open = false;
         self.pending_drag = None;
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
     }
 
-    fn show(&mut self, ctx: &egui::Context) {
+    /// 呼出（UI 线程内的落点）。实际动作收敛到 winvis::show()
+    /// （最小化 → SW_RESTORE、否则 SW_SHOW + SetForegroundWindow，
+    /// 本线程当场执行）；旧版「Visible+Minimized+Focus 三件套」
+    /// 已删除——它依赖 UI 线程先被 repaint 唤醒，正是病根。
+    /// 非 Windows 同 hide() 口径以 ViewportCommand 兜底。
+    /// 注：v0.1.12 起外部呼出（托盘/热键/唤醒）都由发起线程
+    /// 直接执行，本方法是 UI 侧唯一的呼出入口，暂无调用点
+    /// 是设计结果而非遗漏（可见性单点收敛，见 winvis 模块头）。
+    #[allow(dead_code)]
+    fn show(&mut self, _ctx: &egui::Context) {
+        winvis::show();
+        #[cfg(not(windows))]
+        {
+            _ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            _ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            _ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
         self.visible = true;
         self.minimized = false;
-        // 恢复命令三件套，顺序固定（v0.1.9 立、v0.1.10 沿用）：
-        // 只发 Visible(true) 解不了最小化态——窗口还缩在任务栏
-        // 里，Focus 对最小化窗口无效；只发 Focus 而窗口不可见
-        // 更是空转。先可见、再解除最小化、最后聚焦。托盘 Show
-        // 路径在 v0.1.10 起无条件走这里（不再有「visible 就只
-        // Focus」的分支——SetForegroundWindow 会被前台锁定静默
-        // 拒绝，窗口埋在其他窗口下面时正是那种情形，见 update
-        // 的托盘分发处注释）。
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        self.on_shown();
+    }
+
+    /// 呼出的 UI 副作用（与 show() 本体拆开：窗口被托盘/热键/
+    /// 唤醒线程直接 ShowWindow 呼出时，可见性已经落地，UI 在
+    /// 随后的帧里只需补这组副作用——见 after_external_summon）。
+    fn on_shown(&mut self) {
         // 呼出保留查询词 + 全选（v0.1.9 对齐原版 Show 的
         // SelectAll 口径）：打字即覆盖、按方向键即改词，比旧版
         // 「呼出即清空」更接近原版体感。全选在 draw_search_box
@@ -2332,19 +2393,35 @@ impl ShunSeekApp {
         self.focus_search = true;
     }
 
-    fn toggle(&mut self, ctx: &egui::Context) {
-        // 最小化态算「没显示」：托盘左键要恢复它而不是再隐藏
-        // （v0.1.9——旧版 visible=true 就走 hide，最小化后点托盘
-        // 反而把窗口彻底藏没，是唤不回链上的另一环）。
-        if self.visible && !self.minimized {
-            self.hide(ctx);
-        } else {
-            // v0.1.11：旧版这里有 300ms 守卫（防同一次托盘点击
-            // 双路触发），其前提是图标点击会被钩子记成点外；
-            // 图标矩形豁免后该前提已消失，守卫只会误吃用户
-            // 「点外隐藏后立刻点托盘」的正当呼出，一并拆除。
-            self.show(ctx);
+    /// 每帧把影子标志与 OS 状态对齐（v0.1.12）：visible /
+    /// minimized 从此只是缓存，真相在 winvis::state()
+    /// （IsWindowVisible / IsIconic）。可见性现在会被托盘/热键/
+    /// 钩子/唤醒四个线程直接改动，影子必然滞后——绘制与武装
+    /// 判定读缓存即可（滞后一帧无害），但任何**决策**不许读
+    /// 缓存（托盘/热键的切换决策在发起线程里现读 OS，见
+    /// winvis::toggle）。跃迁到 Hidden 时补跑 on_hidden 清理
+    /// （外部线程藏窗时 UI 没有别的入口知道）。
+    fn sync_shadow_from_os(&mut self) {
+        let st = winvis::state();
+        let now_visible = st != winvis::VisState::Hidden;
+        if self.visible && !now_visible {
+            self.on_hidden();
         }
+        self.visible = now_visible;
+        self.minimized = st == winvis::VisState::Minimized;
+    }
+
+    /// 外部显式呼出（单实例唤醒 / 热键 / 托盘 Toggle·Show·
+    /// 设置·关于）在 UI 侧的统一收尾：发起线程已经直接
+    /// ShowWindow 改完可见性，这里只做两件事——影子与 OS
+    /// 对齐（sync 内含跃迁清理）、窗口确实在显示时补呼出
+    /// 副作用，最后 drain 点外标志防陈旧标志坑下一轮。
+    fn after_external_summon(&mut self) {
+        self.sync_shadow_from_os();
+        if self.visible {
+            self.on_shown();
+        }
+        self.clickwatch.drain();
     }
 
     /// 把主窗/设置窗/托盘图标的矩形（物理像素）发布给点外钩子（clickwatch）。
@@ -4052,10 +4129,16 @@ impl ShunSeekApp {
                 let min_resp = header_tool_button(ui, pal, WinGlyph::Min);
                 self.blockers_cur.push(min_resp.rect);
                 if min_resp.on_hover_text("最小化").clicked() {
-                    // 先行置位：viewport 上报回来之前，托盘 Toggle
-                    // 就得知道窗口是最小化不是隐藏
-                    self.minimized = true;
+                    // v0.1.12：最小化也走 ShowWindow（SW_MINIMIZE，
+                    // 本线程当场执行），不再发 ViewportCommand::
+                    // Minimized。影子先行置位只是缓存预热——托盘/
+                    // 热键的决策现读 OS（IsIconic），不依赖它；
+                    // 每帧 sync_shadow_from_os 也会再对齐一次。
+                    // 非 Windows 以 ViewportCommand 兜底（演示口径）。
+                    winvis::minimize();
+                    #[cfg(not(windows))]
                     ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                    self.minimized = true;
                 }
                 ui.add_space(2.0);
                 // 主题切换（原版书眉的主题 ToolButton）：字形 = 将去的
@@ -6858,19 +6941,34 @@ impl eframe::App for ShunSeekApp {
         // 绘制中刚把面板打开，帧末若拿同一个 press 再判点外，
         // 会把刚开的面板当场关掉（回归实测：面板永远打不开）。
         let expanded_at_frame_start = self.expanded_filter;
-        // 全局点外隐藏（v0.1.10，原版 GlobalClickWatcher 机制；
-        // v0.1.11 起判定块前置到本帧最前）：先把本帧的窗口矩形
-        // （物理像素）发布给钩子线程，再消费它报上来的点外事件。
-        // 判定纯几何：点在主窗/设置窗/托盘图标矩形之外才藏，窗
-        // 内点击与焦点事件一概不参与——v0.1.6 起的失焦隐藏整套
-        // 已拆除（见 clickwatch 模块头）。
-        // 为什么必须排在托盘/热键之前（v0.1.11 真机战争）：旧
-        // 顺序托盘先行——Show 刚 show() 出窗口，排在后面的
-        // take_outside() 又拿托盘图标点击攒下的陈旧点外标志把
-        // 窗口当帧藏回，隐藏永远赢，托盘「打开」永远打不开。
-        // 前置后本帧先按当前可见性裁决点外（可见才藏、隐藏只
-        // 清账），随后的显式呼出（单实例唤醒/热键/托盘）再各
-        // 自 drain 兜底：陈旧标志不许活过一次显式呼出。
+        // HWND 兜底重取（v0.1.12）：App::new 里从 CreationContext
+        // 没取到时，这里从 Frame 再取一次（两处都实现了
+        // HasWindowHandle）。存入后恒非 0，本分支永不再走。
+        #[cfg(windows)]
+        if winvis::hwnd() == 0 {
+            use raw_window_handle::HasWindowHandle;
+            if let Ok(handle) = _frame.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(w) =
+                    handle.as_raw()
+                {
+                    winvis::store_hwnd(w.hwnd.get());
+                }
+            }
+        }
+        // 可见性影子与 OS 对齐（v0.1.12）：先同步、再发布点外
+        // 判定矩形——武装位要的是同步后的可见状态。跃迁到
+        // Hidden 时 sync 内部已跑 on_hidden 清理（外部线程直接
+        // 藏窗时 UI 没有别的入口知道）。
+        self.sync_shadow_from_os();
+        // 全局点外隐藏（v0.1.10 几何判定、v0.1.12 执行点前移）：
+        // 钩子线程命中点外时**当场** ShowWindowAsync(SW_HIDE)
+        // 把窗口藏掉（见 clickwatch 模块头），UI 这里不再有
+        // 「消费标志再 hide()」的排队环节——那正是旧链的唤醒
+        // 依赖，也是 v0.1.11「托盘呼出被陈旧标志同帧反杀」的
+        // 战场：钩子能当场隐藏时根本不置标志（标志只在 HWND
+        // 未存入的降级情形兜底），反杀的弹药从源头消失。
+        // 这里剩下的只有：发布本帧矩形 + 隐藏期间清账 + 上述
+        // 降级兜底的一次消费。
         self.publish_click_bounds(ctx);
         if self.visible {
             if self.clickwatch.take_outside() {
@@ -6885,43 +6983,34 @@ impl eframe::App for ShunSeekApp {
         if START_HIDDEN.swap(false, Ordering::SeqCst) {
             self.hide(ctx);
         }
-        // 单实例唤醒（v0.1.8）：第二进程 SetEvent 后等待线程置位
-        // WAKE_FLAG 并 request_repaint，这里把已有窗口呼出来
+        // 单实例唤醒（v0.1.8 建链、v0.1.12 换执行点）：等待线程
+        // 已在事件到达时直接 winvis::show() 把窗口呼出来，这里
+        // 只补呼出副作用（重搜/全选/聚焦请求）+ 清账。
         if WAKE_FLAG.swap(false, Ordering::SeqCst) {
-            self.show(ctx);
-            // 显式呼出后清账（v0.1.11，同托盘/热键口径）
-            self.clickwatch.drain();
+            self.after_external_summon();
         }
-        // 热键 / 托盘（都要在窗口隐藏时也能响应，靠各自线程 request_repaint 唤醒）
+        // 热键（v0.1.12）：轮询线程已在按下边沿直接
+        // winvis::toggle() 改完可见性，这里只补副作用/清理。
+        // 托盘同理（见下方分发各臂）——可见性不再经 UI 队列，
+        // 本帧处理到时窗口早已显示/隐藏，repaint 只管副作用。
         if self.hotkey.take_fired() {
-            self.toggle(ctx);
-            // 热键呼出后清账（v0.1.11）：钩子可能在本帧判定块
-            // 之后才投递点外标志，drain 保证它坑不到这次呼出
-            self.clickwatch.drain();
+            self.after_external_summon();
         }
         while let Some(action) = self.tray.poll() {
             match action {
                 tray::TrayAction::Toggle => {
-                    self.toggle(ctx);
-                    // 同上：Toggle 呼出后不许陈旧点外标志反杀
-                    self.clickwatch.drain();
+                    // 托盘线程已在图标回调里直接 winvis::toggle()
+                    // 按 OS 状态改完可见性（见 tray.rs），这里只
+                    // 补呼出副作用/隐藏清理 + 清账。
+                    self.after_external_summon();
                 }
                 tray::TrayAction::Show => {
-                    // 无条件走 show() 的三件套（v0.1.10 复查结论）：
-                    // 旧分支「visible && !minimized 时只发 Focus」
-                    // 不够——winit 的 Focus 最终是 SetForegroundWindow，
-                    // 会被 Windows 前台锁定静默拒绝（刚在别的进程里
-                    // 活动过时正是拒绝高发场景），窗口明明 visible
-                    // 却埋在其他窗口下面、点托盘永远唤不到前面，
-                    // 用户口径就是「恢复不了」。三件套里 Visible(true)
-                    // 对已可见窗口是无害空操作，Minimized(false) 对
-                    // 未最小化窗口同理，所以不再分支，一律全发。
-                    self.show(ctx);
-                    // 显式呼出后立即清账（v0.1.11）：右键菜单打开
-                    // 期间钩子虽被挂起，点图标那一下（挂起生效前）
-                    // 仍可能留下陈旧点外标志——不 drain 的话它会
-                    // 在下一帧把刚呼出的窗口又藏回去。
-                    self.clickwatch.drain();
+                    // 托盘线程已在菜单分发时直接 winvis::show()
+                    // 呼出（SW_RESTORE/SW_SHOW + SetForegroundWindow，
+                    // 不经 UI 队列——旧版在这里发三件套
+                    // ViewportCommand 的前提是 UI 先被 repaint
+                    // 唤醒，正是六版真机全灭的病根，已整段删除）。
+                    self.after_external_summon();
                 }
                 tray::TrayAction::RebuildIndex => self.start_rebuild(),
                 tray::TrayAction::RefreshIndex => {
@@ -6934,21 +7023,21 @@ impl eframe::App for ShunSeekApp {
                     }
                 }
                 tray::TrayAction::OpenSettings => {
-                    if !self.visible || self.minimized {
-                        self.show(ctx);
-                    }
+                    // 托盘线程已直接 winvis::show() 呼出主窗；
+                    // 设置 viewport 只能由 UI 线程绘制，这里补
+                    // 呼出副作用后打开它。窗口已被 ShowWindow
+                    // 显示，winit 事件循环有系统消息驱动，本帧
+                    // 必然被处理——与旧链「隐藏态靠 repaint 唤醒」
+                    // 有本质区别。
+                    self.after_external_summon();
                     self.open_settings();
-                    // 显式呼出后清账（v0.1.11，同 Show 口径）
-                    self.clickwatch.drain();
                 }
                 tray::TrayAction::About => {
-                    if !self.visible || self.minimized {
-                        self.show(ctx);
-                    }
+                    // 托盘线程已直接 winvis::show() 呼出主窗，
+                    // 这里只补副作用并写状态栏。
+                    self.after_external_summon();
                     // 版本信息临时显示在状态栏（下一次搜索完成会覆盖）
                     self.status = about_text();
-                    // 显式呼出后清账（v0.1.11，同 Show 口径）
-                    self.clickwatch.drain();
                 }
                 tray::TrayAction::AdminRestart => {
                     // 以管理员身份重启（v0.1.9）：runas 拉起同一
@@ -6983,15 +7072,11 @@ impl eframe::App for ShunSeekApp {
             self.hide(ctx);
         }
 
-        // 最小化状态每帧与 viewport 同步（托盘 Toggle/Show 的
-        // 「已显示」判定要用；自绘最小化按钮按下时已先行置位，
-        // 这里是与系统状态对齐的兜底）。
-        if let Some(m) = ctx.input(|i| i.viewport().minimized) {
-            self.minimized = m;
-        }
-
-        // （点外判定块已前置到本帧最前，见 update() 开头——
-        // 必须排在托盘/热键呼出之前，v0.1.11。）
+        // （可见性/最小化影子已在帧首 sync_shadow_from_os 与
+        // OS 对齐——旧版在这里读 viewport 上报的 minimized 做
+        // 同步，v0.1.12 起 IsWindowVisible/IsIconic 是唯一真相，
+        // 见 winvis 模块头。点外判定与呼出收尾同在帧首，顺序见
+        // update() 开头。）
 
         self.poll_channels(ctx);
         if self.visible {
