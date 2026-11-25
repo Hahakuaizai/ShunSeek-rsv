@@ -2,6 +2,10 @@
 
 每版只记本版改动（最新在前）。
 
+## v0.1.13
+
+隐藏方式从「ShowWindow(SW_HIDE)」改为「移屏隐藏」，修掉 v0.1.12 遗留的最后一类失效动作。v0.1.12 把可见性收敛到发起线程直接调 ShowWindow，解决了显示类动作（托盘打开/设置/关于、热键呼出、单实例唤醒），但托盘菜单的「重新建立索引」「立即刷新索引」「以管理员身份重启」三个动作只 push_action 入队、不显示窗口——SW_HIDE 后 Windows 不再投递 WM_PAINT，winit 的 request_redraw 走 RedrawWindow(RDW_INTERNALPAINT) 对不可见窗口同样无效，update() 整条停摆，队列无人消费，点了没反应（用户口径里「托盘只有退出有效」的残留部分）。本版不再让窗口不可见：hide() 改为记原位与最大化态 → 加 WS_EX_TOOLWINDOW 摘掉任务栏与 Alt+Tab 项 → SetWindowPos 移到 (-32000,-32000) 并带 SWP_SHOWWINDOW，WS_VISIBLE 全程为真，WM_PAINT 照常投递，update() 永不停摆，任何 push_action 都有人消费；show() 则解最小化 → 恢复任务栏项 → 移回原位 → 隐藏前是最大化就补 SW_MAXIMIZE → SetForegroundWindow。配套两处：hide 末尾若自己是前台就把前台交给桌面窗口（GetShellWindow），否则窗口虽在屏幕外仍是活动窗口，用户在其他应用里打的字会进这个看不见的窗口；state() 以离屏原子量为先、再读 IsIconic，离屏态直接判 Hidden。不碰任何会禁用 OpenGL 合成的扩展样式（WS_EX_LAYERED 那套不可用）。其余行为不动。
+
 ## v0.1.12
 
 窗口可见性整层换原生实现（v0.1.6–v0.1.11 连续六版真机唤回全灭后的结构性重做）：统一病根是旧链「托盘/热键/唤醒线程置标志 + request_repaint → UI 线程醒来消费队列 → 发 ViewportCommand::Visible/Minimized/Focus」——凡需要「隐藏状态下的 UI 线程被唤醒并处理」的动作全死（托盘打开/设置/热键呼出/单实例唤醒），凡托盘线程自己独立完成的动作全活（退出、菜单弹出）。新版照原版 .NET 的做法，新增 winvis.rs：主窗口 HWND 在 App 创建时从 eframe 的 window_handle 存入全局原子量（首帧另有 Frame 兜底重取），托盘、热键、点外钩子、单实例唤醒四个线程共享读；显示/隐藏/最小化/还原全部改走 ShowWindow 且由发起线程当场执行——托盘左键在本线程按 OS 状态 toggle、菜单「打开瞬觅/设置/关于」在本线程先 show 再入队、热键轮询线程在按下边沿直接 toggle、单实例等待线程在事件到达时直接 show、点外钩子命中时当场 ShowWindowAsync(SW_HIDE)；状态判定改现读 IsWindowVisible/IsIconic，UI 侧的 visible/minimized 降为每帧从 OS 同步的影子缓存（只供绘制与武装判定，决策不读缓存），UI 侧 show()/hide() 收敛为同一组 Win32 调用的薄封装，旧 ViewportCommand 可见性三件套整段删除；repaint 从此只负责呼出后的一帧副作用（重搜/全选/聚焦请求），唤不醒也只丢副作用、绝不丢可见性。连带收尾：点外「陈旧标志反杀呼出」的弹药从源头消失（钩子能当场藏窗时不再置标志，标志只留 HWND 未存入的降级兜底），外部藏窗后 UI 在帧首同步里补跑弹出层清理。其余功能与行为不动；钩子链与 ShowWindow 时序为 Windows 专属，Linux 侧为 stub，本版以代码走查 + 决策表为准，真机待验。
