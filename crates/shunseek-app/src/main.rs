@@ -22,6 +22,17 @@
 //!    index.bin（save_to 自带 tmp+rename）；托盘菜单补全（打开 /
 //!    重建索引 / 深色·宫格·自启动勾选 / 关于 / 退出）且事件走全局
 //!    handler 唤醒队列，隐藏时也能退出；浅色去灰（近纯白 + 描边分层）。
+//!  - v0.1.6（真机暴雷修复 + 视觉照抄原版）：托盘改专职线程 + 原生
+//!    Win32（tray.rs），退出独立于 UI 线程；搜索冻结根治（切片前先
+//!    收敛字符边界 + 全 app 锁中毒恢复 + 搜索线程 catch_unwind 兜底）；
+//!    图标 worker 初始化 COM + 失败回退通用图标 + 计数可观测；窗口
+//!    补齐最小化/最大化/关闭（✕ 恒隐藏到托盘，不再有 close_action
+//!    设置）、可拖可缩放（780×540 / 最小 600×400）、进任务栏、不再
+//!    置顶 + 失焦自动隐藏；首页改用户自选 pins（pins.txt，强制宫格、
+//!    只显名称、悬浮看详情）；筛选面板点外可关、选中态改原版 Pill
+//!    语言；视觉令牌整体换成原版 .NET 的 ThemeManager 色板与布局
+//!    常量（朱砂强调、Ink 三段渐变、Serif 书眉/名单），逐项对照见
+//!    docs/feature-parity.md「设计令牌」节。
 //!  - 单实例：C# 版用命名 Mutex；Rust 版 TODO（需要 Windows 命名互斥 FFI
 //!    或单实例 socket），当前不做，重复启动会开两个窗口。
 //!  - 全局热键：轮询实现，见 hotkey.rs；非 Windows 无全局热键。
@@ -56,11 +67,13 @@ use shunseek_core::{
 const RESULT_LIMIT: usize = 100;
 const ROW_H: f32 = 52.0;
 
-/// 宫格格子尺寸（宽×高）：图标 40 + 名字 2 行 + 分类小字。
+/// 宫格格子尺寸（宽×高）：图标 40 + 名字至多 2 行。
 const GRID_CELL_W: f32 = 104.0;
 const GRID_CELL_H: f32 = 96.0;
-/// 强调蓝（选中 / 聚焦 / chips），与 WPF 版 AccentBrush 对齐。
-const ACCENT: Color32 = Color32::from_rgb(37, 99, 235);
+/// 首页磁贴尺寸（原版 TileItem）：170×92，项间距 12。
+const HOME_TILE_W: f32 = 170.0;
+const HOME_TILE_H: f32 = 92.0;
+const HOME_TILE_GAP: f32 = 12.0;
 /// 空索引护栏文案：数据源全灭时亮红字，让用户能原样转达给开发者。
 const ALERT_EMPTY_INDEX: &str = "索引为空（0 条）——数据源都没拿到数据，把这行字发给开发者";
 
@@ -88,204 +101,211 @@ impl Theme {
     }
 }
 
-/// 全套界面取色。v0.1.2 时这些颜色硬编码散落在各绘制函数里，v0.1.3
-/// 全部收进这里：绘制代码只从 Palette 取色，不再写字面量。
-/// Palette::dark() 的每个数值都与 v0.1.2 的硬编码逐项对齐，深色外观
-/// 零变化；Palette::light() 按 LeiBox 原作（流光描边 / 玻璃标签栏本就是
-/// 浅色设计）的浅色磨砂感另定，不是深色反色。
-/// 用构造函数而非 const：from_white_alpha 等在 egui 0.29 不是 const fn。
+/// 全套界面取色：绘制代码只从 Palette 取色，不写字面量。
+/// v0.1.6 起数值整体换成原版 .NET 的设计令牌（ThemeManager.cs 的
+/// 37 个命名画刷 + InkFill/TopGlow 渐变），字段名尽量沿用原版令牌名，
+/// 逐项对照见 docs/feature-parity.md「设计令牌」节。此前 LeiBox 玻璃
+/// 语言（白胶囊选中 / 光束描边 / 玻璃高光）整体退役。
+/// 用构造函数而非 const：from_rgba_unmultiplied 等不是 const fn。
 #[derive(Clone, Copy)]
 struct Palette {
-    /// 窗口竖向渐变的上 / 下色。
+    /// 窗口底 InkFill 三段渐变（上 / 0.55 处 / 下）。
     grad_top: Color32,
+    grad_mid: Color32,
     grad_bottom: Color32,
-    /// 顶部玻璃高光带的峰值 alpha（纵向渐隐到 0）。
+    /// 顶部光晕 TopGlow 的峰值 alpha（原版渐变峰值 × 层不透明度 0.5 已折入）。
     top_highlight_peak: u8,
-    /// 面板描边：外层（Frame stroke）/ 内层（背景层内缩 1px 手绘）。
+    /// 窗口外壳描边 ShellStroke。
     panel_stroke: Color32,
-    panel_inner_stroke: Color32,
-    /// 面板投影色（offset/blur 在 update() 里固定，只换颜色）。
-    shadow_color: Color32,
-    /// 全局 Visuals 的 panel_fill / extreme_bg_color。
+    /// 设置窗口等独立 viewport 的底色（取 InkFill 底段近似）。
     panel_fill: Color32,
+    /// extreme_bg（输入控件深底）= Surface。
     extreme_bg: Color32,
-    /// 弹窗（「更多」菜单等）填充 / 描边 / 投影色。
+    /// 菜单/弹窗：MenuFill / MenuStroke / 投影色（ShadowColor × ShadowOpacity）。
     popup_fill: Color32,
     popup_stroke: Color32,
     popup_shadow_color: Color32,
-    /// 搜索框填充 / 流光描边的底圈淡边。
-    search_fill: Color32,
-    search_faint: Color32,
-    /// 放大镜未聚焦色（聚焦色两主题同为 #3B82F6，见 draw_search_box）。
-    search_icon: Color32,
-    /// 输入文字色。深色取 egui 0.29 深色 Visuals 下 TextEdit 的默认
-    /// widgets.inactive 文字色 gray(180)，显式写出与不写效果一致。
-    search_text: Color32,
-    /// hint 色。None = 不指定（egui 用它自算的 weak 色）——深色保持
-    /// v0.1.2 原样；浅色给 Some(#9AA3B2)，靠带色 RichText 精确落色。
-    hint: Option<Color32>,
-    /// ESC 徽标与主题切换按钮共用的玻璃小片：填充 / 顶部高光 / 文字。
-    esc_fill: Color32,
-    esc_highlight: Color32,
-    esc_text: Color32,
-    /// 玻璃标签栏：填充 / 顶部高光 / 描边（深色无描边，TRANSPARENT）。
-    bar_fill: Color32,
-    bar_highlight: Color32,
-    bar_stroke: Color32,
-    /// chip 未选文字 RGB / 选中文字 RGB（选中态切换要按进度插值，
-    /// 所以存 RGB 三元组而不是 Color32）。
-    chip_text_rgb: (u8, u8, u8),
-    chip_sel_text_rgb: (u8, u8, u8),
-    /// 选中胶囊：白色填充的满格 alpha（按选中进度 v 缩放）。
-    chip_sel_fill_alpha: u8,
-    /// 选中胶囊脚下投影（向下 1px 黑影）的满格 alpha。
-    chip_sel_shadow_alpha: u8,
-    /// 选中胶囊顶部高光线的满格 alpha；浅色为 0（改走投影 + 描边圈）。
-    chip_sel_highlight_alpha: u8,
-    /// 选中胶囊描边圈（深色 TRANSPARENT 不画；浅色黑 alpha 10）。
-    chip_sel_ring: Color32,
-    /// 未选 chip 的 hover 填充。
-    chip_hover_fill: Color32,
-    /// 结果行 hover 填充 / 选中填充 / 选中行顶部高光线。
-    row_hover_fill: Color32,
-    row_sel_fill: Color32,
-    row_sel_highlight: Color32,
-    /// 分类色块上半部的玻璃高光 alpha。
-    tile_gloss_alpha: u8,
-    /// 名字 / 路径 / 空列表提示的文字色。
+    /// 朱砂强调 AccentBrush（强调文字 AccentText 落在
+    /// chip_sel_text_rgb 与 highlight 两槽，同值）。
+    accent: Color32,
+    /// 主文字 TextHi / 次文字 TextMid。
     name_text: Color32,
+    text_mid: Color32,
+    /// 弱文字 TextLow：路径 / 状态 / 副标题共用（三个语义槽同值）。
     path_text: Color32,
     empty_text: Color32,
-    /// 名字命中段高亮色（兼下划线色）。
-    highlight: Color32,
-    /// 状态栏文字 / 右侧快捷键提示文字。
     status_text: Color32,
-    status_hint: Color32,
-    /// 警戒态文字与圆点色（空索引护栏）。
+    /// 发丝线 HairLine / 一般描边 EdgeLine / 强描边 EdgeStrong。
+    hairline: Color32,
+    edge_line: Color32,
+    edge_strong: Color32,
+    /// 表面三态：Surface / SurfaceHover / SurfaceSel。
+    surface: Color32,
+    surface_hover: Color32,
+    surface_sel: Color32,
+    /// 搜索框：填充 = Surface、放大镜 = TextLow、输入文字 = TextHi。
+    search_fill: Color32,
+    search_icon: Color32,
+    search_text: Color32,
+    /// 占位文字色（两主题都显式给 TextLow）。
+    hint: Option<Color32>,
+    /// 小芯片（Enter 键帽 / 工具栏小片）：ChipFill 底 / TextLow 字。
+    esc_fill: Color32,
+    esc_text: Color32,
+    /// 筛选控件收起态：底 = Surface、描边 = EdgeLine。
+    bar_fill: Color32,
+    bar_stroke: Color32,
+    /// chip 未选 / 选中文字 RGB（选中过渡按进度插值）：TextMid / AccentText。
+    chip_text_rgb: (u8, u8, u8),
+    chip_sel_text_rgb: (u8, u8, u8),
+    /// 选中语言（原版 FilterChip）：PillFill 淡填充 / PillHover / PillStroke 描边。
+    pill_fill: Color32,
+    pill_hover: Color32,
+    pill_stroke: Color32,
+    /// 未选行/chip 的 hover 填充 = MenuHover。
+    chip_hover_fill: Color32,
+    /// 结果行三态：RowHover / RowSel / RowSelStroke。
+    row_hover_fill: Color32,
+    row_sel_fill: Color32,
+    row_sel_stroke: Color32,
+    /// 折叠组行底 FoldFill / 图标占位盘 IconPlate。
+    fold_fill: Color32,
+    icon_plate: Color32,
+    /// 名字命中段高亮 = AccentText。
+    highlight: Color32,
+    /// 警戒态文字（空索引护栏）= CloseHover 红。
     alert_text: Color32,
-    /// 就绪圆点色。
-    dot_ok: Color32,
-    /// 分类胶囊文字的调色方向：false=深色做法（各通道提亮，下限 165）；
-    /// true=浅色做法（各通道压暗 ×0.62）。胶囊底两主题同为分类色 alpha 40。
-    cat_text_darken: bool,
+    /// 首页固定标记 PinMark（朱砂 @70%）。
+    pin_mark: Color32,
+    /// 重要度点三档：ImportanceHigh / Normal / Low。
+    importance_high: Color32,
+    importance_normal: Color32,
+    importance_low: Color32,
+    /// 关闭按钮悬停 / 按下底与悬停字色（两主题同值）。
+    close_hover: Color32,
+    close_pressed: Color32,
+    close_text: Color32,
 }
-
 impl Palette {
-    /// 分类胶囊文字色：由分类色按主题方向调出（见 cat_text_darken）。
-    fn cat_text_color(&self, r: u8, g: u8, b: u8) -> Color32 {
-        if self.cat_text_darken {
-            Color32::from_rgb(
-                (r as f32 * 0.62) as u8,
-                (g as f32 * 0.62) as u8,
-                (b as f32 * 0.62) as u8,
-            )
-        } else {
-            Color32::from_rgb(r.max(165), g.max(165), b.max(165))
-        }
-    }
 
     /// 深色：v0.1.2 全部硬编码数值原样。
+    /// 深色（原版默认）：ThemeManager.cs 深色画刷逐值。
     fn dark() -> Self {
         Self {
-    grad_top: Color32::from_rgb(37, 42, 53), // #252A35
-    grad_bottom: Color32::from_rgb(22, 24, 29), // #16181D
-    top_highlight_peak: 26,
-    panel_stroke: Color32::from_white_alpha(22),
-    panel_inner_stroke: Color32::from_white_alpha(10),
-    shadow_color: Color32::from_black_alpha(140),
-    panel_fill: Color32::from_rgb(22, 24, 29),
-    extreme_bg: Color32::from_rgb(10, 11, 14),
-    popup_fill: Color32::from_rgba_unmultiplied(30, 34, 43, 235),
-    popup_stroke: Color32::from_white_alpha(24),
-    popup_shadow_color: Color32::from_black_alpha(120),
-    search_fill: Color32::from_white_alpha(22),
-    search_faint: Color32::from_white_alpha(26),
-    search_icon: Color32::from_rgb(139, 148, 158),
-    search_text: Color32::from_gray(180),
-    hint: None,
-    esc_fill: Color32::from_white_alpha(10),
-    esc_highlight: Color32::from_white_alpha(50),
-    esc_text: Color32::from_rgb(110, 118, 129),
-    bar_fill: Color32::from_white_alpha(14),
-    bar_highlight: Color32::from_white_alpha(60),
-    bar_stroke: Color32::TRANSPARENT,
-    chip_text_rgb: (201, 209, 217),     // #C9D1D9
-    chip_sel_text_rgb: (26, 29, 35),    // #1A1D23
-    chip_sel_fill_alpha: 225,
-    chip_sel_shadow_alpha: 80,
-    chip_sel_highlight_alpha: 200,
-    chip_sel_ring: Color32::TRANSPARENT,
-    chip_hover_fill: Color32::from_white_alpha(10),
-    row_hover_fill: Color32::from_white_alpha(8),
-    row_sel_fill: Color32::from_rgba_unmultiplied(37, 99, 235, 46),
-    row_sel_highlight: Color32::from_white_alpha(50),
-    tile_gloss_alpha: 46,
-    name_text: Color32::from_rgb(242, 242, 242),
-    path_text: Color32::from_rgb(139, 148, 158),
-    empty_text: Color32::from_rgb(154, 154, 154),
-    highlight: Color32::from_rgb(251, 191, 36), // #FBBF24
-    status_text: Color32::from_rgb(154, 154, 154),
-    status_hint: Color32::from_rgb(110, 110, 110),
-    alert_text: Color32::from_rgb(248, 113, 113), // #F87171
-    dot_ok: Color32::from_rgb(52, 211, 153),      // #34D399
-    cat_text_darken: false,
+            grad_top: Color32::from_rgb(18, 24, 28), // InkFill #12181C
+            grad_mid: Color32::from_rgb(14, 20, 24), // InkFill #0E1418
+            grad_bottom: Color32::from_rgb(10, 15, 18), // InkFill #0A0F12
+            top_highlight_peak: 10,                  // TopGlow 白@8% × 层 0.5
+            panel_stroke: Color32::from_rgb(42, 52, 58), // ShellStroke #2A343A
+            panel_fill: Color32::from_rgb(10, 15, 18),
+            extreme_bg: Color32::from_rgb(22, 29, 34), // Surface #161D22
+            popup_fill: Color32::from_rgba_unmultiplied(20, 26, 31, 250), // MenuFill #141A1F
+            popup_stroke: Color32::from_rgb(38, 48, 54), // MenuStroke #263036
+            popup_shadow_color: Color32::from_black_alpha(140), // #000 @0.55
+            accent: Color32::from_rgb(196, 87, 63),    // AccentBrush #C4573F
+            name_text: Color32::from_rgb(237, 233, 225), // TextHi #EDE9E1
+            text_mid: Color32::from_rgb(154, 165, 171), // TextMid #9AA5AB
+            path_text: Color32::from_rgb(115, 126, 132), // TextLow #737E84
+            empty_text: Color32::from_rgb(115, 126, 132),
+            status_text: Color32::from_rgb(115, 126, 132),
+            hairline: Color32::from_rgb(30, 38, 43),   // HairLine #1E262B
+            edge_line: Color32::from_rgb(36, 45, 51),  // EdgeLine #242D33
+            edge_strong: Color32::from_rgb(48, 59, 66), // EdgeStrong #303B42
+            surface: Color32::from_rgb(22, 29, 34),    // Surface #161D22
+            surface_hover: Color32::from_rgb(28, 36, 42), // SurfaceHover #1C242A
+            surface_sel: Color32::from_rgb(33, 43, 50), // SurfaceSel #212B32
+            search_fill: Color32::from_rgb(22, 29, 34),
+            search_icon: Color32::from_rgb(115, 126, 132),
+            search_text: Color32::from_rgb(237, 233, 225),
+            hint: Some(Color32::from_rgb(115, 126, 132)),
+            esc_fill: Color32::from_rgb(26, 34, 39),   // ChipFill #1A2227
+            esc_text: Color32::from_rgb(115, 126, 132),
+            bar_fill: Color32::from_rgb(22, 29, 34),
+            bar_stroke: Color32::from_rgb(36, 45, 51),
+            chip_text_rgb: (154, 165, 171),
+            chip_sel_text_rgb: (217, 122, 95),
+            pill_fill: Color32::from_rgba_unmultiplied(196, 87, 63, 31), // @12%
+            pill_hover: Color32::from_rgba_unmultiplied(196, 87, 63, 58), // @23%
+            pill_stroke: Color32::from_rgba_unmultiplied(196, 87, 63, 89), // @35%
+            chip_hover_fill: Color32::from_rgb(30, 40, 46), // MenuHover #1E282E
+            row_hover_fill: Color32::from_rgb(22, 29, 34), // RowHover #161D22
+            row_sel_fill: Color32::from_rgb(33, 43, 50), // RowSel #212B32
+            row_sel_stroke: Color32::from_rgb(47, 59, 67), // RowSelStroke #2F3B43
+            fold_fill: Color32::from_rgb(21, 29, 34),  // FoldFill #151D22
+            icon_plate: Color32::from_rgb(27, 36, 42), // IconPlate #1B242A
+            highlight: Color32::from_rgb(217, 122, 95),
+            alert_text: Color32::from_rgb(193, 68, 50), // CloseHover #C14432
+            pin_mark: Color32::from_rgba_unmultiplied(196, 87, 63, 179), // @70%
+            importance_high: Color32::from_rgb(196, 87, 63),
+            importance_normal: Color32::from_rgb(124, 136, 144), // #7C8890
+            importance_low: Color32::from_rgb(74, 85, 92), // #4A555C
+            close_hover: Color32::from_rgb(193, 68, 50),
+            close_pressed: Color32::from_rgb(166, 55, 40), // #A63728
+            close_text: Color32::from_rgb(253, 247, 242), // #FDF7F2
         }
     }
-
     /// 浅色：LeiBox 原作的浅色磨砂感——近白渐变底、白卡片浮起、
     /// 深字、强调蓝只出现在选中行与聚焦处。
     /// v0.1.5 按用户反馈去灰：渐变改近纯白（#FFFFFF → #F6F7F9），
     /// 不再用带灰蓝的 #F7F8FA→#E9ECF1；底变白后，原先靠半透明白叠
     /// 灰底显形的元素（搜索框 / 玻璃栏）提高不透明度、描边加深，
     /// 改靠描边分层。
+    /// 浅色：ThemeManager.cs 浅色画刷逐值。
     fn light() -> Self {
         Self {
-    grad_top: Color32::from_rgb(255, 255, 255), // 纯白（v0.1.5 去灰）
-    grad_bottom: Color32::from_rgb(246, 247, 249), // #F6F7F9，只留一丝层次
-    top_highlight_peak: 90,
-    panel_stroke: Color32::from_white_alpha(160),
-    panel_inner_stroke: Color32::from_black_alpha(10),
-    shadow_color: Color32::from_black_alpha(70),
-    panel_fill: Color32::from_rgb(255, 255, 255),
-    extreme_bg: Color32::from_rgb(255, 255, 255),
-    popup_fill: Color32::from_rgba_unmultiplied(250, 250, 252, 242),
-    popup_stroke: Color32::from_black_alpha(12),
-    popup_shadow_color: Color32::from_black_alpha(60),
-    search_fill: Color32::from_white_alpha(235), // 近实白（v0.1.5：白底上靠描边分层）
-    search_faint: Color32::from_black_alpha(38),
-    search_icon: Color32::from_rgb(138, 147, 163), // #8A93A3
-    search_text: Color32::from_rgb(23, 26, 33),    // #171A21
-    hint: Some(Color32::from_rgb(154, 163, 178)),  // #9AA3B2
-    esc_fill: Color32::from_black_alpha(6),
-    esc_highlight: Color32::from_white_alpha(120),
-    esc_text: Color32::from_rgb(107, 114, 128), // #6B7280
-    bar_fill: Color32::from_white_alpha(215), // v0.1.5：白底上提高不透明度
-    bar_highlight: Color32::from_white_alpha(200),
-    bar_stroke: Color32::from_black_alpha(12),
-    chip_text_rgb: (74, 85, 104),      // #4A5568
-    chip_sel_text_rgb: (23, 26, 33),   // #171A21
-    chip_sel_fill_alpha: 255,
-    chip_sel_shadow_alpha: 28,
-    chip_sel_highlight_alpha: 0,
-    chip_sel_ring: Color32::from_black_alpha(10),
-    chip_hover_fill: Color32::from_black_alpha(6),
-    row_hover_fill: Color32::from_black_alpha(5),
-    row_sel_fill: Color32::from_rgba_unmultiplied(37, 99, 235, 26),
-    row_sel_highlight: Color32::from_white_alpha(160),
-    tile_gloss_alpha: 46,
-    name_text: Color32::from_rgb(23, 26, 33),
-    path_text: Color32::from_rgb(122, 132, 148), // #7A8494
-    empty_text: Color32::from_rgb(122, 132, 148),
-    highlight: Color32::from_rgb(217, 119, 6), // #D97706
-    status_text: Color32::from_rgb(122, 132, 148),
-    status_hint: Color32::from_rgb(154, 163, 178),
-    alert_text: Color32::from_rgb(220, 38, 38), // #DC2626
-    dot_ok: Color32::from_rgb(52, 211, 153),    // #34D399，浅色下仍可读
-    cat_text_darken: true,
+            grad_top: Color32::from_rgb(250, 251, 249), // InkFill #FAFBF9
+            grad_mid: Color32::from_rgb(242, 244, 241), // InkFill #F2F4F1
+            grad_bottom: Color32::from_rgb(233, 236, 232), // InkFill #E9ECE8
+            top_highlight_peak: 51,                     // TopGlow 白@40% × 层 0.5
+            panel_stroke: Color32::from_rgb(195, 203, 196), // ShellStroke #C3CBC4
+            panel_fill: Color32::from_rgb(233, 236, 232),
+            extreme_bg: Color32::from_rgb(255, 255, 255), // Surface #FFFFFF
+            popup_fill: Color32::from_rgba_unmultiplied(252, 253, 251, 250), // MenuFill #FCFDFB
+            popup_stroke: Color32::from_rgb(214, 220, 213), // MenuStroke #D6DCD5
+            popup_shadow_color: Color32::from_rgba_unmultiplied(74, 90, 80, 71), // #4A5A50 @0.28
+            accent: Color32::from_rgb(178, 67, 44),     // AccentBrush #B2432C
+            name_text: Color32::from_rgb(27, 35, 32),   // TextHi #1B2320
+            text_mid: Color32::from_rgb(83, 96, 90),    // TextMid #53605A
+            path_text: Color32::from_rgb(111, 123, 116), // TextLow #6F7B74
+            empty_text: Color32::from_rgb(111, 123, 116),
+            status_text: Color32::from_rgb(111, 123, 116),
+            hairline: Color32::from_rgb(221, 226, 220), // HairLine #DDE2DC
+            edge_line: Color32::from_rgb(204, 211, 204), // EdgeLine #CCD3CC
+            edge_strong: Color32::from_rgb(176, 187, 178), // EdgeStrong #B0BBB2
+            surface: Color32::from_rgb(255, 255, 255),  // Surface #FFFFFF
+            surface_hover: Color32::from_rgb(244, 246, 243), // SurfaceHover #F4F6F3
+            surface_sel: Color32::from_rgb(234, 239, 233), // SurfaceSel #EAEFE9
+            search_fill: Color32::from_rgb(255, 255, 255),
+            search_icon: Color32::from_rgb(111, 123, 116),
+            search_text: Color32::from_rgb(27, 35, 32),
+            hint: Some(Color32::from_rgb(111, 123, 116)),
+            esc_fill: Color32::from_rgb(242, 244, 241), // ChipFill #F2F4F1
+            esc_text: Color32::from_rgb(111, 123, 116),
+            bar_fill: Color32::from_rgb(255, 255, 255),
+            bar_stroke: Color32::from_rgb(204, 211, 204),
+            chip_text_rgb: (83, 96, 90),
+            chip_sel_text_rgb: (156, 58, 36),
+            pill_fill: Color32::from_rgba_unmultiplied(178, 67, 44, 26), // @10%
+            pill_hover: Color32::from_rgba_unmultiplied(178, 67, 44, 48), // @19%
+            pill_stroke: Color32::from_rgba_unmultiplied(178, 67, 44, 89), // @35%
+            chip_hover_fill: Color32::from_rgb(237, 241, 236), // MenuHover #EDF1EC
+            row_hover_fill: Color32::from_rgb(242, 245, 241), // RowHover #F2F5F1
+            row_sel_fill: Color32::from_rgb(232, 237, 231), // RowSel #E8EDE7
+            row_sel_stroke: Color32::from_rgb(200, 209, 200), // RowSelStroke #C8D1C8
+            fold_fill: Color32::from_rgb(240, 243, 239), // FoldFill #F0F3EF
+            icon_plate: Color32::from_rgb(237, 239, 234), // IconPlate #EDEFEA
+            highlight: Color32::from_rgb(156, 58, 36),
+            alert_text: Color32::from_rgb(193, 68, 50),
+            pin_mark: Color32::from_rgba_unmultiplied(178, 67, 44, 179), // @70%
+            importance_high: Color32::from_rgb(178, 67, 44),
+            importance_normal: Color32::from_rgb(138, 148, 141), // #8A948D
+            importance_low: Color32::from_rgb(194, 202, 194), // #C2CAC2
+            close_hover: Color32::from_rgb(193, 68, 50),
+            close_pressed: Color32::from_rgb(166, 55, 40),
+            close_text: Color32::from_rgb(253, 247, 242),
         }
     }
 }
-
 // ---------------------------------------------------------------- 设置存储
 
 /// 全部可持久化设置（v0.1.5 统一）：数据目录 settings.txt，key=value 行。
@@ -294,29 +314,13 @@ impl Palette {
 /// load 时 theme/view 在 settings.txt 缺省时回退老版 theme.txt /
 /// view.txt 的值（老用户无感迁移）；save 只写 settings.txt，
 /// 老文件留着不动。
-/// 关窗行为（设置「常规」二选一）：Tray = 最小化到托盘（默认）；
-/// Exit = 退出程序。settings.txt 键 close_action=tray|exit
-///（旧 hide_on_close 键作废，load 时按其值迁移一次）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CloseAction {
-    Tray,
-    Exit,
-}
-
-impl CloseAction {
-    fn key_str(self) -> &'static str {
-        match self {
-            CloseAction::Tray => "tray",
-            CloseAction::Exit => "exit",
-        }
-    }
-}
-
+/// 关窗行为（v0.1.6 用户钉死）：✕ 恒最小化到托盘，无条件，无设置项；
+/// 进程唯一正常退出 = 托盘菜单「退出」。旧 settings.txt 里的
+/// close_action / hide_on_close 键加载时直接忽略（不读不写）。
 #[derive(Clone)]
 struct Settings {
     theme: Theme,
     view: ViewMode,
-    close_action: CloseAction,
     hotkey: hotkey::HotkeyCombo,
     result_limit: usize,
     fold_demoted: bool,
@@ -392,13 +396,7 @@ fn load_settings() -> Settings {
     Settings {
         theme,
         view,
-        close_action: match kv.get("close_action").map(|s| s.as_str()) {
-            Some("exit") => CloseAction::Exit,
-            Some("tray") => CloseAction::Tray,
-            // 旧 hide_on_close 键迁移：0 曾表示关窗即退出
-            _ if kv.get("hide_on_close").map(|s| s.as_str()) == Some("0") => CloseAction::Exit,
-            _ => CloseAction::Tray,
-        },
+        // close_action / hide_on_close 键：v0.1.6 起忽略（✕ 恒到托盘）
         hotkey: kv
             .get("hotkey")
             .and_then(|s| hotkey::HotkeyCombo::parse(s))
@@ -413,6 +411,19 @@ fn load_settings() -> Settings {
         scope_drives,
         scope_custom,
     }
+}
+
+/// 首页 pins 读取（数据目录 pins.txt，一行一条完整路径；
+/// 文件缺失/为空都是合法状态——首页显示引导文案 + 添加格）。
+fn load_pins(dir: &PathBuf) -> Vec<String> {
+    std::fs::read_to_string(dir.join("pins.txt"))
+        .map(|text| {
+            text.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 范围预设：(settings 键名, %USERPROFILE% 下子目录, 显示名)。
@@ -482,11 +493,21 @@ impl ViewMode {
 
 // ---------------------------------------------------------------- 字体
 
-/// 启动时把系统 CJK 字体塞进 egui：egui 自带字体没有汉字，不装就是豆腐块。
-/// 逐个路径尝试，第一个读到的为准；都找不到就用默认字体（界面仍可用，
-/// 汉字显示成缺字框，需要用户自行装 Noto Sans CJK / 微软雅黑）。
+// 启动时把系统 CJK 字体塞进 egui：egui 自带字体没有汉字，不装就是豆腐块。
+// 无衬线走 Proportional（界面主体），另装 Serif 家族供原版 SerifFont
+// 的落点（书眉标题 / 搜索输入 / 结果名 / 磁贴名）使用。
+
+/// Serif 家族名（原版 SerifFont 的 egui 落点，见 install_cjk_font）。
+const SERIF_FAMILY: &str = "serif";
+
+/// Serif 字体快捷构造（书眉标题 22 / 搜索输入 17 / 结果名 14 /
+/// 组行 12 / 磁贴名 12.5 / 空状态 14 都用它）。
+fn serif(size: f32) -> FontId {
+    FontId::new(size, egui::FontFamily::Name(SERIF_FAMILY.into()))
+}
+
 fn install_cjk_font(ctx: &egui::Context) {
-    let candidates: &[&str] = &[
+    let sans_candidates: &[&str] = &[
         // Windows
         r"C:\Windows\Fonts\msyh.ttc", // 微软雅黑
         r"C:\Windows\Fonts\simhei.ttf",
@@ -499,25 +520,54 @@ fn install_cjk_font(ctx: &egui::Context) {
         // macOS
         "/System/Library/Fonts/PingFang.ttc",
     ];
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "cjk".to_owned(),
-                egui::FontData::from_owned(bytes),
-            );
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                if let Some(list) = fonts.families.get_mut(&family) {
-                    list.insert(0, "cjk".to_owned());
-                }
+    // 原版 SerifFont 栈：Noto Serif SC → 华文中宋 → SimSun（宋体）。
+    // 本机一般只有宋体可命中；Noto Serif SC 若装了优先。
+    let serif_candidates: &[&str] = &[
+        r"C:\Windows\Fonts\NotoSerifSC-Regular.otf",
+        r"C:\Windows\Fonts\simsun.ttc", // 宋体
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSerifCJK-Regular.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+    ];
+    let load = |paths: &[&str]| paths.iter().find_map(|p| std::fs::read(p).ok());
+    let sans = load(sans_candidates);
+    let serif_bytes = load(serif_candidates);
+    if sans.is_none() && serif_bytes.is_none() {
+        eprintln!("ShunSeek: 未找到系统 CJK 字体，汉字可能显示为缺字框");
+        return;
+    }
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(bytes) = sans {
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            if let Some(list) = fonts.families.get_mut(&family) {
+                list.insert(0, "cjk".to_owned());
             }
-            ctx.set_fonts(fonts);
-            return;
         }
     }
-    eprintln!("ShunSeek: 未找到系统 CJK 字体，汉字可能显示为缺字框");
+    // Serif 家族：优先真衬线字体，缺失时回退无衬线 CJK（汉字不缺字，
+    // 只是字形不衬线，属已知近似差距）。
+    let mut serif_list: Vec<String> = Vec::new();
+    if let Some(bytes) = serif_bytes {
+        fonts.font_data.insert(
+            "serif_cjk".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        serif_list.push("serif_cjk".to_owned());
+    }
+    if fonts.font_data.contains_key("cjk") {
+        serif_list.push("cjk".to_owned());
+    }
+    if !serif_list.is_empty() {
+        fonts
+            .families
+            .insert(egui::FontFamily::Name(SERIF_FAMILY.into()), serif_list);
+    }
+    ctx.set_fonts(fonts);
 }
-
 // ---------------------------------------------------------------- 数据目录
 
 /// 数据目录：Windows %LocalAppData%\ShunSeek；其他 ~/.local/share/ShunSeek。
@@ -535,8 +585,42 @@ fn data_dir() -> PathBuf {
     PathBuf::from(home).join(".local").join("share").join("ShunSeek")
 }
 
-// ---------------------------------------------------------------- 索引装配
+// ---------------------------------------------------------------- 通用辅助
 
+/// 全 app 锁的统一入口（v0.1.6 冻结根治）：锁中毒（持有者 panic）时
+/// 恢复内部值继续用，绝不让一次 panic 把此后所有 lock() 变成 Err
+/// 被静默吞掉——那正是 v0.1.5「搜一次之后结果再也不变」的根因。
+fn lock_rec<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 把字节偏移向下收敛到最近的字符边界。用 core 给的字节偏移
+/// （SearchHit.match_start）切片前必须先过这里：偏移理论上总落在
+/// 边界上，但 UI 不依赖这一点（v0.1.5 真机曾因此 panic 毒化锁）。
+fn floor_char_boundary(s: &str, mut b: usize) -> usize {
+    if b > s.len() {
+        b = s.len();
+    }
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
+}
+
+/// 千分位分组（原版状态栏 "{N0} 项" 的格式）：353041 → "353,041"。
+fn group_thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+// ---------------------------------------------------------------- 索引装配
 enum IndexMsg {
     /// 后台重建（阶段性或最终）完成：新索引本体直接随消息传给 UI 线程
     /// 换入（内存直传，不再走 rename + mmap 的文件换入——那条路一旦
@@ -1024,8 +1108,10 @@ enum SearchMsg {
     Done {
         rows: Vec<ResultRow>,
         elapsed_ms: f64,
-        total: usize,
         empty_query: bool,
+        /// 搜索线程 panic 兜底标记（v0.1.6）：true 时 rows 为空且无意义，
+        /// UI 只显示「搜索线程异常，已自动恢复」，保留现有结果不冻结。
+        error: bool,
     },
 }
 
@@ -1061,13 +1147,8 @@ struct ShunSeekApp {
     status: String,
     /// 状态栏警戒标志（空索引护栏）：true 时状态文字与圆点标红。
     status_alert: bool,
-    /// 最近一次索引就绪文案（含来源摘要）；空查询的搜索完成消息
-    /// 会覆盖 status，用它把就绪文案找回来，别让摘要一闪而过。
-    ready_status: Option<String>,
     /// 搜索框上一帧是否聚焦（放大镜着色读它，一帧延迟无感）。
     search_focused: bool,
-    /// 搜索框上一帧是否悬停（与聚焦一起决定流光描边是流动还是静止）。
-    search_hovered: bool,
     store: Arc<Mutex<IndexStore>>,
     usage: Arc<Mutex<UsageStore>>,
     search_cancel: Arc<AtomicBool>,
@@ -1097,9 +1178,8 @@ struct ShunSeekApp {
     ///（打开时从注册表回读，以实际状态为准）。
     settings_open: bool,
     settings_autostart: bool,
-    /// 设置项（与 settings.txt 一一对应，见 Settings）：关窗行为 /
+    /// 设置项（与 settings.txt 一一对应，见 Settings）：
     /// 唤醒热键预设 / 结果上限 / 是否折叠不重要结果。
-    close_action: CloseAction,
     hotkey_combo: hotkey::HotkeyCombo,
     result_limit: usize,
     fold_demoted: bool,
@@ -1116,6 +1196,30 @@ struct ShunSeekApp {
     hotkey_capture: bool,
     hotkey_note: String,
     hotkey_recs: Vec<hotkey::HotkeyCombo>,
+    /// 首页 pins（v0.1.6）：用户自选的完整路径列表，持久化到数据
+    /// 目录 pins.txt（一行一条）。home_items 是 pins 派生的展示行
+    /// （分类尽量取自索引），空查询时由 draw_home 强制宫格绘制。
+    pins: Vec<String>,
+    home_items: Vec<ResultRow>,
+    /// 首页宫格上一帧列数（键盘导航按它跳行，绘制时更新）。
+    home_cols: usize,
+    /// 页脚中央结果计数（原版 ResultText："{n} 项 · {ms} ms"）。
+    result_text: String,
+    /// 窗口是否最大化（自绘最大化按钮的图标切换 + 命令取反用）。
+    maximized: bool,
+    /// 主窗口上一帧是否聚焦（失焦自动隐藏看 true→false 跳变）。
+    was_focused: bool,
+    /// 打开系统文件对话框前置位：对话框关后的一帧焦点丢失不隐藏。
+    suppress_focus_hide: bool,
+    /// 最近一次「失焦自动隐藏」的时刻：托盘左键 Toggle 若紧接着
+    /// 到达（同一次点击托盘图标既让主窗失焦、又发 Toggle），忽略
+    /// 这次 Toggle，免得窗口刚被失焦藏好又被 Toggle 弹出来。
+    focus_hide_at: Option<Instant>,
+    /// 筛选控件上一帧的圆点/胶囊 Rect 与展开面板 Rect（点外关闭判定）。
+    filter_dot_rect: Option<egui::Rect>,
+    filter_panel_rect: Option<egui::Rect>,
+    /// 首页「＋ 添加」弹层是否打开（popup 锚在添加格上）。
+    home_add_open: bool,
 }
 
 impl ShunSeekApp {
@@ -1134,7 +1238,7 @@ impl ShunSeekApp {
         {
             Ok(s) => {
                 let n = s.count();
-                (s, format!("索引就绪（缓存）· {n} 条"))
+                (s, format!("{} 项", group_thousands(n)))
             }
             Err(_) => (build_index(Vec::new(), None), "正在准备索引…".to_string()),
         };
@@ -1166,9 +1270,7 @@ impl ShunSeekApp {
             selected: 0,
             status,
             status_alert: false,
-            ready_status: None,
             search_focused: false,
-            search_hovered: false,
             store: Arc::new(Mutex::new(store)),
             usage: Arc::new(Mutex::new(usage)),
             search_cancel: Arc::new(AtomicBool::new(true)),
@@ -1196,7 +1298,6 @@ impl ShunSeekApp {
             meta_cache: HashMap::new(),
             settings_open: false,
             settings_autostart: false,
-            close_action: settings.close_action,
             hotkey_combo: settings.hotkey,
             result_limit: settings.result_limit,
             fold_demoted: settings.fold_demoted,
@@ -1207,18 +1308,39 @@ impl ShunSeekApp {
             hotkey_capture: false,
             hotkey_note: String::new(),
             hotkey_recs: Vec::new(),
+            pins: Vec::new(),
+            home_items: Vec::new(),
+            home_cols: 4,
+            result_text: String::new(),
+            maximized: false,
+            was_focused: false,
+            suppress_focus_hide: false,
+            focus_hide_at: None,
+            filter_dot_rect: None,
+            filter_panel_rect: None,
+            home_add_open: false,
         };
+        app.pins = load_pins(&dir);
+        app.rebuild_home_items();
         app.schedule_search();
         app
     }
 
     /// 输入变化 → 取消上次 → 30ms 防抖 → 后台线程搜索 → 通道回 UI。
+    /// 输入变化 → 取消上次 → 30ms 防抖 → 后台线程搜索 → 通道回 UI。
+    /// v0.1.6 冻结根治三件套：① 结果行映射切片前先收敛字符边界；
+    /// ② store/usage 锁一律 lock_rec 中毒恢复，不再 Err 静默 return；
+    /// ③ 线程体整体 catch_unwind，panic 也发 Done（error 标记），UI
+    /// 显示「搜索线程异常，已自动恢复」，绝不冻结在旧结果上。
+    /// 空查询不再走 UsageStore 首页：首页 = 用户 pins，由 UI 侧
+    /// home_items 绘制（usage 只用于搜索排序加分，见 core）。
     fn schedule_search(&mut self) {
         self.search_cancel.store(true, Ordering::SeqCst);
         let cancel = Arc::new(AtomicBool::new(false));
         self.search_cancel = cancel.clone();
 
         let query = self.query.clone();
+        let empty_query = query.trim().is_empty();
         let cat_set = self.cat_set.clone();
         let cat_mask: u16 = cat_set
             .iter()
@@ -1231,152 +1353,105 @@ impl ShunSeekApp {
         std::thread::Builder::new()
             .name("shunseek-search".into())
             .spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                if cancel.load(Ordering::SeqCst) {
-                    return;
-                }
-                let started = Instant::now();
-                let rows: Vec<ResultRow>;
-                let total: usize;
-                {
-                    let store_g = match store.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    let usage_g = match usage.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    total = store_g.count();
-                    let empty_query = query.trim().is_empty();
-                    if empty_query {
-                        // 首页 = 常用（.NET 版语义）：按 UsageStore 次数
-                        // 降序（同次按最近使用降序）取前 N；从未打开过
-                        // 任何条目时回退索引原序前 N（首次运行别空着）。
-                        // chips 选了分类时首页按该分类过滤——「全部」
-                        // 与首页是同一视图，不另做一套。
-                        let snap: HashMap<String, (u32, u64)> = usage_g
-                            .snapshot()
-                            .into_iter()
-                            .map(|(p, c, t)| (p, (c, t)))
-                            .collect();
-                        let mut picked: Vec<(usize, u32, u64)> = Vec::new();
-                        if !snap.is_empty() {
-                            for i in 0..total {
-                                if cat_set.len() < ALL_CATEGORIES.len()
-                                    && !cat_set.contains(&store_g.category(i))
-                                {
-                                    continue;
-                                }
-                                if let Some(s) = &scope {
-                                    if !s.matches(&store_g.full_path(i)) {
-                                        continue;
-                                    }
-                                }
-                                let mut p = store_g.full_path(i);
-                                p.make_ascii_lowercase();
-                                if let Some(&(cnt, last)) = snap.get(&p) {
-                                    picked.push((i, cnt, last));
-                                }
-                            }
-                            picked.sort_by(|a, b| {
-                                b.1.cmp(&a.1)
-                                    .then_with(|| b.2.cmp(&a.2))
-                                    .then_with(|| a.0.cmp(&b.0))
-                            });
-                            picked.truncate(result_limit);
-                        }
-                        let idxs: Vec<usize> = if picked.is_empty() {
-                            (0..total)
-                                .filter(|&i| {
-                                    (cat_set.len() >= ALL_CATEGORIES.len()
-                                        || cat_set.contains(&store_g.category(i)))
-                                        && scope.as_ref().map_or(true, |s| {
-                                            s.matches(&store_g.full_path(i))
-                                        })
-                                })
-                                .take(result_limit)
-                                .collect()
-                        } else {
-                            picked.iter().map(|&(i, _, _)| i).collect()
-                        };
-                        rows = idxs
-                            .iter()
-                            .map(|&i| ResultRow {
-                                name: store_g.name(i).to_string(),
-                                path: store_g.full_path(i),
-                                category: store_g.category(i),
-                                match_start: usize::MAX,
-                                match_len: 0,
-                                demoted: false,
-                            })
-                            .collect();
-                    } else {
-                        let engine = SearchEngine::new(&store_g, Some(&usage_g));
-                        let hits = engine.search_scoped(
-                            &query,
-                            cat_mask,
-                            result_limit,
-                            &cancel,
-                            scope.as_ref(),
-                        );
-                        if cancel.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        rows = hits
-                            .iter()
-                            .map(|h| {
-                                let i = h.index as usize;
-                                let name = store_g.name(i);
-                                // 高亮长度：core 给的是名字段的字符数
-                                //（路径模式下不含路径片段），换算成字节数。
-                                // match_start 是字节偏移 → 先数它前面的
-                                // 字符数，再前进 match_len 个字符取终点。
-                                let match_len = if h.match_len == 0 {
-                                    0
-                                } else {
-                                    let start_byte =
-                                        (h.match_start as usize).min(name.len());
-                                    let start_char =
-                                        name[..start_byte].chars().count();
-                                    let end_byte = name
-                                        .char_indices()
-                                        .nth(start_char + h.match_len as usize)
-                                        .map(|(b, _)| b)
-                                        .unwrap_or(name.len());
-                                    end_byte - start_byte
-                                };
-                                ResultRow {
-                                    name: name.to_string(),
-                                    path: store_g.full_path(i),
-                                    category: store_g.category(i),
-                                    // 拼音首字母 / 子序列命中的 match_start
-                                    // 不是连续命中段，不高亮以免标错位置
-                                    match_start: if h.via_initials || h.fuzzy {
-                                        usize::MAX
-                                    } else {
-                                        h.match_start as usize
-                                    },
-                                    match_len,
-                                    demoted: h.demoted,
-                                }
-                            })
-                            .collect();
+                let tx_panic = tx.clone();
+                let body = std::panic::AssertUnwindSafe(|| {
+                    std::thread::sleep(Duration::from_millis(30));
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
                     }
-                }
-                if cancel.load(Ordering::SeqCst) {
-                    return;
-                }
-                let _ = tx.send(SearchMsg::Done {
-                    rows,
-                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-                    total,
-                    empty_query: query.trim().is_empty(),
+                    let started = Instant::now();
+                    let rows: Vec<ResultRow>;
+                    {
+                        let store_g = lock_rec(&store);
+                        let usage_g = lock_rec(&usage);
+                        if empty_query {
+                            // 首页由 UI 侧 pins 绘制；空查询只回空结果集，
+                            // 保持消息管线（计数/选中复位）一致。
+                            rows = Vec::new();
+                        } else {
+                            let engine = SearchEngine::new(&store_g, Some(&usage_g));
+                            let hits = engine.search_scoped(
+                                &query,
+                                cat_mask,
+                                result_limit,
+                                &cancel,
+                                scope.as_ref(),
+                            );
+                            if cancel.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            rows = hits
+                                .iter()
+                                .map(|h| {
+                                    let i = h.index as usize;
+                                    let name = store_g.name(i);
+                                    // 高亮长度：core 给的是名字段的字符数
+                                    // （路径模式下不含路径片段），换算成字节数。
+                                    // match_start 是字节偏移：切片数字符前先
+                                    // 收敛到字符边界（v0.1.6 根治——旧版直接
+                                    // name[..start_byte] 切片，偏移落进多字节
+                                    // 字符中间即 panic 并毒化互斥锁）。
+                                    let match_len = if h.match_len == 0 {
+                                        0
+                                    } else {
+                                        let start_byte = floor_char_boundary(
+                                            name,
+                                            h.match_start as usize,
+                                        );
+                                        let start_char =
+                                            name[..start_byte].chars().count();
+                                        let end_byte = name
+                                            .char_indices()
+                                            .nth(start_char + h.match_len as usize)
+                                            .map(|(b, _)| b)
+                                            .unwrap_or(name.len());
+                                        end_byte - start_byte
+                                    };
+                                    ResultRow {
+                                        name: name.to_string(),
+                                        path: store_g.full_path(i),
+                                        category: store_g.category(i),
+                                        // 拼音首字母 / 子序列命中的 match_start
+                                        // 不是连续命中段，不高亮以免标错位置；
+                                        // 连续命中也先收敛边界再存。
+                                        match_start: if h.via_initials || h.fuzzy {
+                                            usize::MAX
+                                        } else {
+                                            floor_char_boundary(
+                                                name,
+                                                h.match_start as usize,
+                                            )
+                                        },
+                                        match_len,
+                                        demoted: h.demoted,
+                                    }
+                                })
+                                .collect();
+                        }
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let _ = tx.send(SearchMsg::Done {
+                        rows,
+                        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                        empty_query,
+                        error: false,
+                    });
                 });
+                if std::panic::catch_unwind(body).is_err() {
+                    // panic 兜底：仍发 Done（error），UI 提示已自动恢复；
+                    // 就算锁被毒化，下一次搜索的 lock_rec 也能恢复。
+                    let _ = tx_panic.send(SearchMsg::Done {
+                        rows: Vec::new(),
+                        elapsed_ms: 0.0,
+                        empty_query,
+                        error: true,
+                    });
+                }
             })
             .ok();
     }
-
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
@@ -1400,6 +1475,15 @@ impl ShunSeekApp {
         if self.visible {
             self.hide(ctx);
         } else {
+            // 刚被失焦隐藏（<300ms）又收到 Toggle：多半是同一次托盘
+            // 点击的双路触发（失焦先藏、Toggle 后到），忽略这次，
+            // 免得窗口藏好又弹出来。用户再点一次即可正常呼出。
+            if let Some(t) = self.focus_hide_at {
+                if t.elapsed() < Duration::from_millis(300) {
+                    self.focus_hide_at = None;
+                    return;
+                }
+            }
             self.show(ctx);
         }
     }
@@ -1410,7 +1494,7 @@ impl ShunSeekApp {
         };
         opener::open(&row.path, &row.name, locate);
         {
-            let mut u = self.usage.lock().unwrap();
+            let mut u = lock_rec(&self.usage);
             u.record_use(&row.path);
             let _ = u.save();
         }
@@ -1418,6 +1502,14 @@ impl ShunSeekApp {
     }
 
     fn open_selected(&mut self, ctx: &egui::Context, locate: bool) {
+        // 首页：Enter 打开选中的 pin 磁贴。
+        if self.is_home() {
+            if !self.home_items.is_empty() {
+                let idx = self.selected.min(self.home_items.len() - 1);
+                self.open_home_item(ctx, idx, locate);
+            }
+            return;
+        }
         // 与 C# 版一致：没选中时退回第一条。组行 Enter = 展开/收起，不打开。
         let idx = if self.display.get(self.selected).is_some() {
             self.selected
@@ -1432,10 +1524,16 @@ impl ShunSeekApp {
     }
 
     fn move_selection(&mut self, delta: i32) {
-        if self.display.is_empty() {
+        // 导航长度：首页 = pins 数；搜索结果 = 展示行数。
+        let len = if self.is_home() {
+            self.home_items.len()
+        } else {
+            self.display.len()
+        };
+        if len == 0 {
             return;
         }
-        let next = (self.selected as i32 + delta).clamp(0, self.display.len() as i32 - 1);
+        let next = (self.selected as i32 + delta).clamp(0, len as i32 - 1);
         self.selected = next as usize;
         self.scroll_to_selected = true;
     }
@@ -1550,7 +1648,7 @@ impl ShunSeekApp {
     /// 连写（如 CD）；scope_custom 一行一个完整路径（可重复多行）。
     fn save_settings(&self) {
         let mut text = format!(
-            "theme={}\nview={}\nclose_action={}\nhotkey={}\nresult_limit={}\nfold_demoted={}\n",
+            "theme={}\nview={}\nhotkey={}\nresult_limit={}\nfold_demoted={}\n",
             match self.theme {
                 Theme::Dark => "dark",
                 Theme::Light => "light",
@@ -1559,7 +1657,6 @@ impl ShunSeekApp {
                 ViewMode::List => "list",
                 ViewMode::Grid => "grid",
             },
-            self.close_action.key_str(),
             self.hotkey_combo.key_str(),
             self.result_limit,
             self.fold_demoted as u8,
@@ -1647,6 +1744,96 @@ impl ShunSeekApp {
         }
     }
 
+    /// pins 持久化（数据目录 pins.txt，一行一条完整路径）。
+    fn save_pins(&self) {
+        let _ = std::fs::write(self.data_dir.join("pins.txt"), self.pins.join("\n"));
+    }
+
+    fn add_pin(&mut self, path: &str) {
+        if self.pins.iter().any(|p| p.eq_ignore_ascii_case(path)) {
+            return;
+        }
+        self.pins.push(path.to_string());
+        self.save_pins();
+        self.rebuild_home_items();
+    }
+
+    fn remove_pin(&mut self, path: &str) {
+        self.pins.retain(|p| !p.eq_ignore_ascii_case(path));
+        self.save_pins();
+        self.rebuild_home_items();
+    }
+
+    fn is_pinned(&self, path: &str) -> bool {
+        self.pins.iter().any(|p| p.eq_ignore_ascii_case(path))
+    }
+
+    /// 由 pins 派生首页展示行：分类优先从当前索引查（一次全表扫描
+    /// 只为命中 pins，pins 数量小）；不在索引里则按磁盘/扩展名推断
+    /// （目标已删也照常显示：名称取路径末段，图标按路径取）。
+    fn rebuild_home_items(&mut self) {
+        let mut found: HashMap<String, Category> = HashMap::new();
+        if !self.pins.is_empty() {
+            let wanted: HashSet<String> =
+                self.pins.iter().map(|p| p.to_lowercase()).collect();
+            let store = lock_rec(&self.store);
+            for i in 0..store.count() {
+                let fp = store.full_path(i);
+                let low = fp.to_lowercase();
+                if wanted.contains(&low) {
+                    found.insert(low, store.category(i));
+                }
+            }
+        }
+        self.home_items = self
+            .pins
+            .iter()
+            .map(|p| {
+                let name = p
+                    .trim_end_matches(['\\', '/'])
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(p.as_str())
+                    .to_string();
+                let category = found.get(&p.to_lowercase()).copied().unwrap_or_else(|| {
+                    if std::path::Path::new(p).is_dir() {
+                        Category::Folder
+                    } else {
+                        shunseek_core::classify_by_extension(&name)
+                    }
+                });
+                ResultRow {
+                    name,
+                    path: p.clone(),
+                    category,
+                    match_start: usize::MAX,
+                    match_len: 0,
+                    demoted: false,
+                }
+            })
+            .collect();
+    }
+
+    /// 打开一个首页磁贴（与 open_row 同语义：记录使用 + 隐藏）。
+    fn open_home_item(&mut self, ctx: &egui::Context, idx: usize, locate: bool) {
+        let Some(row) = self.home_items.get(idx).cloned() else {
+            return;
+        };
+        opener::open(&row.path, &row.name, locate);
+        {
+            let mut u = lock_rec(&self.usage);
+            u.record_use(&row.path);
+            let _ = u.save();
+        }
+        self.hide(ctx);
+    }
+
+    /// 当前是否首页（空查询）：首页只显 pins，与搜索结果管线分开。
+    fn is_home(&self) -> bool {
+        self.query.trim().is_empty()
+    }
+
     /// 重新建立索引的唯一入口（托盘 / 设置面板共用）：已有重建在跑
     /// 就忽略（并发护栏），进度沿用分级建立的状态栏摘要。
     fn start_rebuild(&mut self) {
@@ -1694,10 +1881,12 @@ impl ShunSeekApp {
                             self.hide(ctx);
                         }
                     }
-                    // 宫格模式：↑↓ 按列数跳一行，←→ 按 1 格走；
-                    // 列表模式与旧版一致（只有 ↑↓，步长 1）。
+                    // 宫格步长：首页用首页列数、搜索宫格用宫格列数；
+                    // 列表步长 1。首页强制宫格，←→ 恒可用。
                     Key::ArrowDown => {
-                        let d = if self.view_mode == ViewMode::Grid {
+                        let d = if self.is_home() {
+                            self.home_cols.max(1) as i32
+                        } else if self.view_mode == ViewMode::Grid {
                             self.grid_cols.max(1) as i32
                         } else {
                             1
@@ -1705,17 +1894,23 @@ impl ShunSeekApp {
                         self.move_selection(d);
                     }
                     Key::ArrowUp => {
-                        let d = if self.view_mode == ViewMode::Grid {
+                        let d = if self.is_home() {
+                            self.home_cols.max(1) as i32
+                        } else if self.view_mode == ViewMode::Grid {
                             self.grid_cols.max(1) as i32
                         } else {
                             1
                         };
                         self.move_selection(-d);
                     }
-                    Key::ArrowLeft if self.view_mode == ViewMode::Grid => {
+                    Key::ArrowLeft
+                        if self.is_home() || self.view_mode == ViewMode::Grid =>
+                    {
                         self.move_selection(-1)
                     }
-                    Key::ArrowRight if self.view_mode == ViewMode::Grid => {
+                    Key::ArrowRight
+                        if self.is_home() || self.view_mode == ViewMode::Grid =>
+                    {
                         self.move_selection(1)
                     }
                     Key::Enter => self.open_selected(ctx, modifiers.ctrl),
@@ -1727,6 +1922,7 @@ impl ShunSeekApp {
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
         // 索引重建完成：store 本体内存直传，直接换入，不再经文件。
+        // 换入锁走 lock_rec：就算此前有线程 panic 毒化过也能恢复。
         while let Ok(msg) = self.index_rx.try_recv() {
             match msg {
                 IndexMsg::Rebuilt {
@@ -1736,40 +1932,27 @@ impl ShunSeekApp {
                     summary,
                     final_stage,
                 } => {
-                    if let Ok(mut guard) = self.store.lock() {
-                        *guard = store;
-                    }
+                    *lock_rec(&self.store) = store;
                     self.index_count = count;
                     self.index_summary = summary.clone();
+                    // pins 的分类随索引变化（在/不在索引），重建首页项
+                    self.rebuild_home_items();
                     if final_stage {
                         self.rebuilding = false;
                         self.tray.set_rebuild_enabled(true);
                         self.status_alert = count == 0;
-                        let text = if count == 0 {
+                        // 状态栏只放短格式（原版 "{N0} 项"）；完整来源
+                        // 摘要只在设置窗口「索引」区（index_summary）。
+                        self.status = if count == 0 {
                             ALERT_EMPTY_INDEX.to_string()
+                        } else if saved {
+                            format!("{} 项", group_thousands(count))
                         } else {
-                            // 摘要过长截断到约 60 字，免得状态栏被撑爆
-                            let summary_short = if summary.chars().count() > 60 {
-                                let mut s: String = summary.chars().take(59).collect();
-                                s.push('…');
-                                s
-                            } else {
-                                summary
-                            };
-                            let mut s =
-                                format!("索引就绪 · {count} 条（来源 {summary_short}）");
-                            if !saved {
-                                s.push_str(" · 缓存写入失败，不影响本次使用");
-                            }
-                            s
+                            format!("{} 项 · 缓存写入失败", group_thousands(count))
                         };
-                        self.status = text.clone();
-                        self.ready_status = Some(text);
                     } else {
-                        // 阶段性换入：状态栏报建立进度；搜索已可对
-                        // 当前换入的索引用，不等最终一级。
-                        self.status = summary.clone();
-                        self.ready_status = Some(summary);
+                        // 阶段性换入：搜索已可对当前索引用，不等最终一级
+                        self.status = "正在建立索引…".to_string();
                     }
                     self.schedule_search();
                 }
@@ -1783,25 +1966,27 @@ impl ShunSeekApp {
         if let Some(SearchMsg::Done {
             rows,
             elapsed_ms,
-            total,
             empty_query,
+            error,
         }) = latest
         {
-            self.rows = rows;
-            self.fold_active = !empty_query;
-            self.rebuild_display();
-            self.selected = 0;
-            self.status = if self.status_alert {
-                // 警戒态下别让搜索文案把红字冲掉
-                ALERT_EMPTY_INDEX.to_string()
-            } else if empty_query {
-                // 空查询回到就绪文案（含来源摘要），没有就用总数文案
-                self.ready_status.clone().unwrap_or_else(|| {
-                    format!("全部 {total} 条 · 输入关键词开始搜索")
-                })
+            if error {
+                // 搜索线程 panic 过：保留现有结果不冻结，只提示已恢复；
+                // 下一次输入会重新调度（锁可中毒恢复，不再全灭）。
+                self.status = "搜索线程异常，已自动恢复".to_string();
             } else {
-                format!("{} 条结果 · {elapsed_ms:.0} ms", self.rows.len())
-            };
+                self.rows = rows;
+                self.fold_active = !empty_query;
+                self.rebuild_display();
+                self.selected = 0;
+                // 结果计数走页脚中央（原版 ResultText "{n} 项 · {ms} ms"）；
+                // 左侧状态只管索引状态，不再被每次搜索覆盖。
+                self.result_text = if empty_query {
+                    String::new()
+                } else {
+                    format!("{} 项 · {elapsed_ms:.0} ms", self.rows.len())
+                };
+            }
         }
         let _ = ctx;
     }
@@ -1816,285 +2001,100 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 /// 竖向渐变背景：把圆角矩形轮廓 + 圆心做扇形三角化（epaint Mesh），
 /// 每个顶点按自己的 y 在 top/bottom 之间插值上色，得到平滑渐变，
 /// 且四角严格贴合圆角，不会像分段矩形那样在角上戳出去。
+/// 圆角轮廓在高度 y 处的左右内缩量（圆方程），渐变/光晕 Mesh 共用。
+fn rounded_inset_at(rect: egui::Rect, radius: f32, y: f32) -> f32 {
+    let dy = (y - rect.top()).min(rect.bottom() - y);
+    if dy >= radius {
+        0.0
+    } else {
+        radius - (radius * radius - (radius - dy) * (radius - dy)).max(0.0).sqrt()
+    }
+}
+
+/// 三段渐变插值（InkFill：0 → 0.55 → 1）。
+fn grad_color(top: Color32, mid: Color32, bottom: Color32, t: f32) -> Color32 {
+    let (a, b, k) = if t <= 0.55 {
+        (top, mid, t / 0.55)
+    } else {
+        (mid, bottom, (t - 0.55) / 0.45)
+    };
+    Color32::from_rgb(
+        lerp_u8(a.r(), b.r(), k),
+        lerp_u8(a.g(), b.g(), k),
+        lerp_u8(a.b(), b.b(), k),
+    )
+}
+
+/// 竖向渐变背景（v0.1.6 改回单个 Mesh）：12 个横向分带拼成一张
+/// 三角网（13×2 顶点、24 个三角形、**1 个 Shape**），替代旧版每帧
+/// 100 条 rect_filled 色带。旧版弃 Mesh 是因为「顶点色被压暗」的
+/// 观察——后来证实灰幕真凶是 Frame 阴影（已删），Mesh 本身无罪。
+/// 顶点色按原版 InkFill 的对角方向 (0,0)→(0.45,1) 取 t：
+/// t = (0.45·nx + ny) / 1.45，左右顶点 t 不同即成对角渐变；
+/// 分带边界按圆角轮廓收边，四角不缺角不出界。
 fn paint_vertical_gradient(
     painter: &egui::Painter,
     rect: egui::Rect,
     radius: f32,
     top: Color32,
+    mid: Color32,
     bottom: Color32,
 ) {
-    let color_at = |y: f32| {
-        let t = ((y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
-        Color32::from_rgb(
-            lerp_u8(top.r(), bottom.r(), t),
-            lerp_u8(top.g(), bottom.g(), t),
-            lerp_u8(top.b(), bottom.b(), t),
-        )
-    };
-    // 用一摞水平色带（rect_filled）拼渐变，不用 Mesh：v0.1.3 的 Mesh 顶点色
-    // 在部分渲染栈上会被压暗（实测浅色底被压成灰 #ADADB2，而同期 rect_filled
-    // 的色块分毫不差），色带路径与普通形状同管线，颜色在哪都准。
-    // 每条带按其 y 在圆角轮廓内的横向跨度收边，圆角不缺角也不出界。
-    const STRIPS: i32 = 100;
-    let strip_h = rect.height() / STRIPS as f32;
-    let inset_at = |y: f32| -> f32 {
-        // 距上/下边的距离落进圆角区时，按圆方程给出左右内缩量
-        let dy = (y - rect.top()).min(rect.bottom() - y);
-        if dy >= radius {
-            0.0
+    const BANDS: usize = 12;
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=BANDS {
+        let y = rect.top() + rect.height() * (i as f32 / BANDS as f32);
+        let inset = rounded_inset_at(rect, radius, y);
+        let ny = (y - rect.top()) / rect.height().max(1.0);
+        for (x, nx) in [
+            (rect.left() + inset, 0.0f32),
+            (rect.right() - inset, 1.0f32),
+        ] {
+            let t = ((0.45 * nx + ny) / 1.45).clamp(0.0, 1.0);
+            mesh.colored_vertex(
+                egui::pos2(x, y),
+                grad_color(top, mid, bottom, t),
+            );
+        }
+    }
+    for i in 0..BANDS {
+        let a = (i * 2) as u32;
+        mesh.indices
+            .extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// 顶部光晕（原版 TopGlow）：窗口顶部 220px 的白色渐隐层，方向
+/// (0,0)→(0.2,1) 近似为竖向；峰值 alpha 由 palette 给（已折入原版
+/// 层 Opacity 0.5）。v0.1.6 起与渐变同法：单个 Mesh（6 分带），
+/// 替代旧版 18×4=72 个小矩形切片。
+fn paint_top_glow(painter: &egui::Painter, rect: egui::Rect, radius: f32, peak: u8) {
+    const GLOW_H: f32 = 220.0;
+    const BANDS: usize = 6;
+    let h = GLOW_H.min(rect.height());
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=BANDS {
+        let y = rect.top() + h * (i as f32 / BANDS as f32);
+        // 只在圆角区（顶部 radius 范围内）需要收边
+        let inset = if y - rect.top() < radius {
+            rounded_inset_at(rect, radius, y)
         } else {
-            radius - (radius * radius - (radius - dy) * (radius - dy)).max(0.0).sqrt()
-        }
-    };
-    for i in 0..STRIPS {
-        let y0 = rect.top() + strip_h * i as f32;
-        let y1 = y0 + strip_h + 0.5; // 轻微重叠，防带间露缝
-        let inset = inset_at(y0 + strip_h * 0.5);
-        let strip = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + inset, y0),
-            egui::pos2(rect.right() - inset, y1),
-        );
-        painter.rect_filled(strip, Rounding::ZERO, color_at(y0 + strip_h * 0.5));
-    }
-}
-
-/// 光束彩虹带：青 #22D3EE → 蓝 #3B82F6 → 紫 #A855F7 → 粉 #EC4899，
-/// s 是段内位置（0=束头，1=束尾），供光束游走时给每小段上色。
-fn beam_color(s: f32) -> (u8, u8, u8) {
-    const STOPS: [(f32, (u8, u8, u8)); 4] = [
-        (0.0, (34, 211, 238)),
-        (1.0 / 3.0, (59, 130, 246)),
-        (2.0 / 3.0, (168, 85, 247)),
-        (1.0, (236, 72, 153)),
-    ];
-    let s = s.clamp(0.0, 1.0);
-    for w in STOPS.windows(2) {
-        let (t0, c0) = w[0];
-        let (t1, c1) = w[1];
-        if s <= t1 {
-            let k = if t1 > t0 { (s - t0) / (t1 - t0) } else { 0.0 };
-            return (
-                lerp_u8(c0.0, c1.0, k),
-                lerp_u8(c0.1, c1.1, k),
-                lerp_u8(c0.2, c1.2, k),
-            );
-        }
-    }
-    (236, 72, 153)
-}
-
-/// 往轮廓折线里加点（与上一点重合的跳过）。
-fn push_pt(pts: &mut Vec<egui::Pos2>, p: egui::Pos2) {
-    if pts.last().map(|l: &egui::Pos2| l.distance(p) > 0.01).unwrap_or(true) {
-        pts.push(p);
-    }
-}
-
-/// 圆角矩形的稠密轮廓折线（顺时针，不闭合，首尾靠绘制时回绕相连）。
-/// 直边每 ~6px 一个点、圆弧每 7.5° 一个点，供流光描边按弧长重采样。
-fn rounded_rect_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
-    let mut pts: Vec<egui::Pos2> = Vec::new();
-    let r = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
-    let edge_steps = |len: f32| ((len / 6.0).ceil().max(1.0)) as usize;
-    let arc = |pts: &mut Vec<egui::Pos2>, cx: f32, cy: f32, a0: f32| {
-        let mut a = a0;
-        while a < a0 + 90.0 {
-            let rad = a.to_radians();
-            push_pt(pts, egui::pos2(cx + r * rad.cos(), cy + r * rad.sin()));
-            a += 7.5;
-        }
-        let rad = (a0 + 90.0).to_radians();
-        push_pt(pts, egui::pos2(cx + r * rad.cos(), cy + r * rad.sin()));
-    };
-    // 顶边（左→右）
-    let n = edge_steps(rect.width() - r * 2.0);
-    for i in 0..=n {
-        push_pt(
-            &mut pts,
-            egui::pos2(
-                rect.left() + r + (rect.width() - r * 2.0) * (i as f32 / n as f32),
-                rect.top(),
-            ),
-        );
-    }
-    // 右上弧 -90°→0°
-    arc(&mut pts, rect.right() - r, rect.top() + r, -90.0);
-    // 右边（上→下）
-    let n = edge_steps(rect.height() - r * 2.0);
-    for i in 1..=n {
-        push_pt(
-            &mut pts,
-            egui::pos2(
-                rect.right(),
-                rect.top() + r + (rect.height() - r * 2.0) * (i as f32 / n as f32),
-            ),
-        );
-    }
-    // 右下弧 0°→90°
-    arc(&mut pts, rect.right() - r, rect.bottom() - r, 0.0);
-    // 底边（右→左）
-    let n = edge_steps(rect.width() - r * 2.0);
-    for i in 1..=n {
-        push_pt(
-            &mut pts,
-            egui::pos2(
-                rect.right() - r - (rect.width() - r * 2.0) * (i as f32 / n as f32),
-                rect.bottom(),
-            ),
-        );
-    }
-    // 左下弧 90°→180°
-    arc(&mut pts, rect.left() + r, rect.bottom() - r, 90.0);
-    // 左边（下→上）
-    let n = edge_steps(rect.height() - r * 2.0);
-    for i in 1..=n {
-        push_pt(
-            &mut pts,
-            egui::pos2(
-                rect.left(),
-                rect.bottom() - r - (rect.height() - r * 2.0) * (i as f32 / n as f32),
-            ),
-        );
-    }
-    // 左上弧 180°→270°，终点即顶边起点
-    arc(&mut pts, rect.left() + r, rect.top() + r, 180.0);
-    pts
-}
-
-/// 【LeiBox 光束游走描边】底圈是一整圈淡边（深色 white alpha 26 /
-/// 浅色黑 alpha 28，由 faint 参数传入）；
-/// beam_phase 有值时，一束约 1/4 周长的光沿周界游走：束头最亮、向尾
-/// 按距离渐隐到 0，颜色沿段内位置走青→蓝→紫→粉彩虹带；每小段先画
-/// 一层线宽 4、alpha 约 1/3 的同色辉光，再画线宽 1.5 的亮芯。
-/// beam_phase=None（未聚焦）时只留淡边，静态不动画。
-fn paint_flow_border(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    radius: f32,
-    beam_phase: Option<f32>,
-    faint_color: Color32,
-) {
-    let pts = rounded_rect_outline(rect, radius);
-    if pts.len() < 2 {
-        return;
-    }
-    // 底圈淡边
-    let faint = Stroke::new(1.0_f32, faint_color);
-    let n = pts.len();
-    for i in 0..n {
-        painter.line_segment([pts[i], pts[(i + 1) % n]], faint);
-    }
-    let Some(phase) = beam_phase else {
-        return;
-    };
-    // 累计弧长（含收尾回绕段）+ 按弧长取点
-    let mut cum: Vec<f32> = Vec::with_capacity(n + 1);
-    cum.push(0.0);
-    for i in 0..n {
-        let d = pts[i].distance(pts[(i + 1) % n]);
-        cum.push(cum[i] + d);
-    }
-    let total = cum[n];
-    if total <= 0.0 {
-        return;
-    }
-    let point_at = |d: f32| -> egui::Pos2 {
-        let d = d.rem_euclid(total);
-        let seg = match cum.binary_search_by(|v| v.partial_cmp(&d).unwrap()) {
-            Ok(i) => i.min(n - 1),
-            Err(i) => i.saturating_sub(1).min(n - 1),
+            0.0
         };
-        let seg_len = (cum[seg + 1] - cum[seg]).max(f32::EPSILON);
-        let k = ((d - cum[seg]) / seg_len).clamp(0.0, 1.0);
-        pts[seg].lerp(pts[(seg + 1) % n], k)
-    };
-    // 光束：束头在 phase 处，束身向后（逆行进方向）拖 1/4 周长
-    const SUB: usize = 40;
-    let beam_len = total * 0.25;
-    let head = phase.rem_euclid(1.0) * total;
-    // 先整束辉光（宽、淡），再整束亮芯（细、亮），保证芯压在辉光上
-    for pass in 0..2 {
-        for i in 0..SUB {
-            let s = (i as f32 + 0.5) / SUB as f32; // 段内位置：0 束头 → 1 束尾
-            let fade = 1.0 - s;
-            let alpha = (255.0 * fade * fade) as u8;
-            if alpha == 0 {
-                continue;
-            }
-            let (r, g, b) = beam_color(s);
-            let d0 = head - beam_len * (i as f32 / SUB as f32);
-            let d1 = head - beam_len * ((i + 1) as f32 / SUB as f32);
-            if pass == 0 {
-                painter.line_segment(
-                    [point_at(d0), point_at(d1)],
-                    Stroke::new(4.0_f32, Color32::from_rgba_unmultiplied(r, g, b, alpha / 3)),
-                );
-            } else {
-                painter.line_segment(
-                    [point_at(d0), point_at(d1)],
-                    Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(r, g, b, alpha)),
-                );
-            }
-        }
+        let t = (y - rect.top()) / h.max(1.0);
+        let alpha = (peak as f32 * (1.0 - t)) as u8;
+        let color = Color32::from_white_alpha(alpha);
+        mesh.colored_vertex(egui::pos2(rect.left() + inset, y), color);
+        mesh.colored_vertex(egui::pos2(rect.right() - inset, y), color);
     }
-}
-
-/// 窗口顶部玻璃高光带：顶部 90px 内白色 alpha 自峰值（深色 26 / 浅色 90）
-/// 渐隐到 0，且横向偏左上加强（每片横向分 4 段、权重 1.0→0.35 递减，
-/// 模拟光从左上打在玻璃面上；玻璃透镜的折射 egui 做不了，只取这点受光感）。
-/// 纵向切片叠画，首片带上圆角，贴合面板圆角轮廓。
-fn paint_top_glass_highlight(painter: &egui::Painter, rect: egui::Rect, peak: u8) {
-    const BAND_H: f32 = 90.0;
-    const SLICES: usize = 18;
-    const X_WEIGHTS: [f32; 4] = [1.0, 0.8, 0.55, 0.35];
-    let inner = rect.shrink(1.0);
-    let slice_h = BAND_H / SLICES as f32;
-    let seg_w = inner.width() / X_WEIGHTS.len() as f32;
-    for i in 0..SLICES {
-        let t = i as f32 / SLICES as f32;
-        let alpha = peak as f32 * (1.0 - t);
-        if alpha < 1.0 {
-            continue;
-        }
-        for (j, w) in X_WEIGHTS.iter().enumerate() {
-            let seg = egui::Rect::from_min_max(
-                egui::pos2(
-                    inner.left() + seg_w * j as f32,
-                    inner.top() + slice_h * i as f32,
-                ),
-                egui::pos2(
-                    inner.left() + seg_w * (j + 1) as f32,
-                    inner.top() + slice_h * (i + 1) as f32,
-                ),
-            );
-            // 只有首片的最左/最右段需要贴合面板上圆角
-            let rounding = if i == 0 && j == 0 {
-                Rounding {
-                    nw: 11.0,
-                    ne: 0.0,
-                    sw: 0.0,
-                    se: 0.0,
-                }
-            } else if i == 0 && j == X_WEIGHTS.len() - 1 {
-                Rounding {
-                    nw: 0.0,
-                    ne: 11.0,
-                    sw: 0.0,
-                    se: 0.0,
-                }
-            } else {
-                Rounding {
-                    nw: 0.0,
-                    ne: 0.0,
-                    sw: 0.0,
-                    se: 0.0,
-                }
-            };
-            painter.rect_filled(seg, rounding, Color32::from_white_alpha((alpha * w) as u8));
-        }
+    for i in 0..BANDS {
+        let a = (i * 2) as u32;
+        mesh.indices
+            .extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
     }
+    painter.add(egui::Shape::mesh(mesh));
 }
-
 /// 类型控件展开后的迷你 chip 顺序：全部 + 12 类（安装目录在旧
 /// chips 栏里被塞进「更多」，这里一并摆出，免得该类没法单独筛选）。
 const TYPE_CHIPS: &[Option<Category>] = &[
@@ -2174,6 +2174,11 @@ enum RowHit {
 
 /// 范围面板的一行：选中 = 整行胶囊填充（glass chip 选中语言），
 /// 不用复选框方块。单击切换、双击 solo（语义由调用方处理）。
+/// 范围面板的一行（v0.1.6 选中语言与原版 FilterChip 统一）：
+/// 选中 = PillFill 淡填充 + PillStroke 描边 + AccentText 字，
+/// **禁用白填充**（v0.1.5 白胶囊贴白面板看不见，用户点名）；
+/// 未选 = 透明底 TextMid 字；hover = MenuHover 淡填充。
+/// 单击切换、双击 solo（语义由调用方处理）。
 fn scope_row(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> RowHit {
     let font = FontId::proportional(12.5);
     let (tr, tg, tb) = if selected {
@@ -2184,13 +2189,20 @@ fn scope_row(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> Ro
     let text_color = Color32::from_rgb(tr, tg, tb);
     let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, text_color));
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), egui::Sense::click());
     let painter = ui.painter_at(rect);
     if selected {
-        painter.rect_filled(
+        // 选中行悬停时叠 PillHover（原版 pill 悬停层），否则 PillFill
+        let fill = if response.hovered() {
+            pal.pill_hover
+        } else {
+            pal.pill_fill
+        };
+        painter.rect_filled(rect, Rounding::same(7.0), fill);
+        painter.rect_stroke(
             rect,
             Rounding::same(7.0),
-            Color32::from_white_alpha(pal.chip_sel_fill_alpha),
+            Stroke::new(1.0_f32, pal.pill_stroke),
         );
     } else if response.hovered() {
         painter.rect_filled(rect, Rounding::same(7.0), pal.chip_hover_fill);
@@ -2208,64 +2220,187 @@ fn scope_row(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> Ro
         RowHit::None
     }
 }
-
 enum RowAction {
     /// 选中一个展示行（下标是 display 下标）。
     Select(usize),
     /// 打开一个展示行对应的结果（下标是 display 下标）。
     Open(usize),
+    /// 打开结果所在文件夹（右键菜单 / Ctrl+Enter 路径）。
+    Locate(usize),
     /// 展开/收起一个折叠组（display 下标 + 父目录路径）。
     Toggle(usize, String),
+    /// 右键菜单「添加到首页」（display 下标，处理方解析到结果行）。
+    Pin(usize),
+}
+
+/// 首页磁贴动作（下标是 home_items 下标）。
+enum HomeAction {
+    Select(usize),
+    Open(usize),
+    Locate(usize),
+    Remove(usize),
 }
 
 impl ShunSeekApp {
+    /// 搜索框（原版 SearchField）：Surface 填充 + EdgeLine 描边的
+    /// 高 54、圆角 12 面板；左放大镜 16 号 TextLow；输入 Serif 17
+    /// TextHi、占位 Serif 16 TextLow；聚焦时左侧 2px 朱砂焦点条
+    /// （淡入 ~150ms）；右侧「Enter」键帽（ChipFill + EdgeLine 边，
+    /// Sans 9.5 TextLow）。v0.1.6 起 LeiBox 光束游走描边退役（视觉
+    /// 照抄原版），这里唯一的动画是焦点条淡入：过渡期间用
+    /// repaint_after(16ms) 续命，静止后一帧不多画。
+    /// 书眉（原版 Header，高 46 的行区）：左 = 拖动区（标题
+    /// 「瞬觅」Serif 22 TextHi + 1×14 EdgeStrong 竖线 + 副标题
+    /// 「SHUNSEEK · 本机索引」Sans 9.5 TextLow）；右 = 工具按钮组
+    /// （主题 / 最小化 / 最大化-还原 / 关闭，34×30）。拖动区按下
+    /// 走 StartDrag、双击切换最大化。✕ = 隐藏到托盘（v0.1.6 用户
+    /// 钉死：无条件，进程只从托盘菜单退出）。
+    fn draw_header(&mut self, ui: &mut egui::Ui) {
+        let pal = self.theme.palette();
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            // ---- 左：标题拖动区 ----
+            let title_g = ui.fonts(|f| {
+                f.layout_no_wrap("瞬觅".to_string(), serif(22.0), pal.name_text)
+            });
+            let cap_g = ui.fonts(|f| {
+                f.layout_no_wrap(
+                    "SHUNSEEK · 本机索引".to_string(),
+                    FontId::proportional(9.5),
+                    pal.path_text,
+                )
+            });
+            let title_w = title_g.size().x;
+            let drag_w = title_w + 14.0 + 1.0 + 14.0 + cap_g.size().x + 2.0;
+            let (drag_rect, drag_resp) =
+                ui.allocate_exact_size(Vec2::new(drag_w, 30.0), egui::Sense::drag());
+            let painter = ui.painter_at(drag_rect);
+            let cy = drag_rect.center().y;
+            painter.galley(
+                egui::pos2(drag_rect.left(), cy - title_g.size().y / 2.0),
+                title_g,
+                pal.name_text,
+            );
+            let div_x = drag_rect.left() + title_w + 14.0;
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(div_x, cy - 7.0), Vec2::new(1.0, 14.0)),
+                Rounding::ZERO,
+                pal.edge_strong,
+            );
+            painter.galley(
+                egui::pos2(div_x + 15.0, cy - cap_g.size().y / 2.0),
+                cap_g,
+                pal.path_text,
+            );
+            if drag_resp.double_clicked() {
+                self.maximized = !self.maximized;
+                ctx.send_viewport_cmd(ViewportCommand::Maximized(self.maximized));
+            } else if drag_resp.drag_started() {
+                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+
+            // ---- 右：工具按钮组（从右往左放：关闭/最大化/最小化/主题） ----
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if header_tool_button(ui, pal, WinGlyph::Close)
+                    .on_hover_text("关闭（最小化到托盘）")
+                    .clicked()
+                {
+                    self.hide(&ctx);
+                }
+                ui.add_space(6.0);
+                let max_glyph = if self.maximized {
+                    WinGlyph::Restore
+                } else {
+                    WinGlyph::Max
+                };
+                if header_tool_button(ui, pal, max_glyph)
+                    .on_hover_text(if self.maximized { "还原" } else { "最大化" })
+                    .clicked()
+                {
+                    self.maximized = !self.maximized;
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(self.maximized));
+                }
+                ui.add_space(2.0);
+                if header_tool_button(ui, pal, WinGlyph::Min)
+                    .on_hover_text("最小化")
+                    .clicked()
+                {
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                }
+                ui.add_space(2.0);
+                // 主题切换（原版书眉的主题 ToolButton）：字形 = 将去的
+                // 主题（深色时画太阳 = 去浅色），13px 级手绘。
+                let (trect, tresp) =
+                    ui.allocate_exact_size(Vec2::new(34.0, 30.0), egui::Sense::click());
+                let tp = ui.painter_at(trect);
+                if tresp.is_pointer_button_down_on() {
+                    tp.rect_filled(trect, Rounding::same(8.0), pal.surface_sel);
+                } else if tresp.hovered() {
+                    tp.rect_filled(trect, Rounding::same(8.0), pal.surface_hover);
+                }
+                let tfg = if tresp.hovered() {
+                    pal.name_text
+                } else {
+                    pal.text_mid
+                };
+                match self.theme {
+                    Theme::Dark => paint_sun(&tp, trect.center(), 15.0, tfg),
+                    Theme::Light => {
+                        paint_moon(&tp, trect.center(), 15.0, tfg, pal.panel_fill)
+                    }
+                }
+                if tresp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(match self.theme {
+                        Theme::Dark => "切换到浅色",
+                        Theme::Light => "切换到深色",
+                    })
+                    .clicked()
+                {
+                    let next = self.theme.toggled();
+                    self.set_theme(&ctx, next);
+                }
+            });
+        });
+    }
+
     fn draw_search_box(&mut self, ui: &mut egui::Ui) {
         let pal = self.theme.palette();
-        // Frame 本身不再描边：边框由 paint_flow_border 手工画——
-        // 一圈淡边 + 一束沿周界游走的彩虹光（LeiBox 光束描边）。
-        // 聚焦/悬停时光束游走，未聚焦只留静态淡边（不请求重绘，省电）。
         let frame = egui::Frame::none()
             .fill(pal.search_fill)
-            .rounding(Rounding::same(10.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 10.0));
+            .rounding(Rounding::same(12.0))
+            .stroke(Stroke::new(1.0_f32, pal.edge_line))
+            .inner_margin(egui::Margin {
+                left: 17.0,
+                right: 14.0,
+                top: 15.0,
+                bottom: 15.0,
+            });
         let frame_resp = frame.show(ui, |ui| {
             ui.horizontal(|ui| {
-                // 左侧放大镜：手绘圆 + 斜线两笔，不用 emoji；
-                // 聚焦时换成流光蓝 #3B82F6（两主题同值），未聚焦走 palette。
-                let (icon_rect, _) = ui.allocate_exact_size(
-                    Vec2::new(22.0, 22.0),
-                    egui::Sense::hover(),
-                );
+                // 放大镜：手绘圆 + 斜线，16px，TextLow（原版不随聚焦变色）
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(16.0, 24.0), egui::Sense::hover());
                 let painter = ui.painter_at(icon_rect);
-                let c = icon_rect.center() + Vec2::new(-1.5, -1.5);
-                let icon_color = if self.search_focused {
-                    Color32::from_rgb(59, 130, 246)
-                } else {
-                    pal.search_icon
-                };
-                let icon_stroke = Stroke::new(1.6_f32, icon_color);
-                painter.circle_stroke(c, 5.5, icon_stroke);
+                let c = icon_rect.center() + Vec2::new(-1.0, -1.0);
+                let st = Stroke::new(1.6_f32, pal.search_icon);
+                painter.circle_stroke(c, 5.0, st);
                 painter.line_segment(
-                    [
-                        c + Vec2::new(4.0, 4.0),
-                        c + Vec2::new(8.0, 8.0),
-                    ],
-                    icon_stroke,
+                    [c + Vec2::new(3.6, 3.6), c + Vec2::new(7.2, 7.2)],
+                    st,
                 );
-                // hint：浅色带显式色（#9AA3B2）；深色不带色，
-                // 让 egui 沿用它自算的 weak 色，与 v0.1.2 逐像素一致。
-                let hint_text = match pal.hint {
-                    Some(c) => RichText::new("搜索应用、文件、文件夹…").color(c),
-                    None => RichText::new("搜索应用、文件、文件夹…"),
-                };
-                // 输入框宽度必须有界：右侧还要放 ESC 徽标，给 INFINITY 会把
-                // 徽标顶出框外被窗口切掉（v0.1.3 预览里徽标只剩「ES」）。
+                ui.add_space(11.0);
+                let hint_text = RichText::new("搜索文件、应用、文件夹…")
+                    .color(pal.hint.unwrap_or(pal.path_text))
+                    .size(16.0);
+                // 输入框宽度必须有界：右侧还要放 Enter 键帽，给
+                // INFINITY 会把键帽顶出框外被窗口切掉。
                 let edit = egui::TextEdit::singleline(&mut self.query)
-                    .desired_width((ui.available_width() - 52.0).max(60.0))
+                    .desired_width((ui.available_width() - 64.0).max(60.0))
                     .hint_text(hint_text)
                     .text_color(pal.search_text)
                     .frame(false)
-                    .font(FontId::proportional(17.0));
+                    .font(serif(17.0));
                 let out = edit.show(ui);
                 self.search_focused = out.response.has_focus();
                 if self.focus_search {
@@ -2275,48 +2410,46 @@ impl ShunSeekApp {
                 if out.response.changed() {
                     self.schedule_search();
                 }
-                // 右侧 ESC 徽标（不可点，纯提示，与 WPF 版一致）：
-                // 玻璃小片——半透填充 + 顶部 1px 高光线，取色与主题切换按钮共用。
-                let badge = egui::Frame::none()
+                // 右侧「Enter」键帽（纯提示，与原版一致）
+                egui::Frame::none()
                     .fill(pal.esc_fill)
-                    .rounding(Rounding::same(4.0))
-                    .inner_margin(egui::Margin::symmetric(6.0, 1.0))
+                    .rounding(Rounding::same(5.0))
+                    .stroke(Stroke::new(1.0_f32, pal.edge_line))
+                    .inner_margin(egui::Margin::symmetric(7.0, 3.0))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("ESC")
-                                .size(10.0)
-                                .color(pal.esc_text),
-                        );
+                        ui.label(RichText::new("Enter").size(9.5).color(pal.esc_text));
                     });
-                let br = badge.response.rect;
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(br.left() + 3.0, br.top() + 0.5),
-                        egui::pos2(br.right() - 3.0, br.top() + 0.5),
-                    ],
-                    Stroke::new(1.0_f32, pal.esc_highlight),
-                );
             });
         });
-        // 光束描边：画在 Frame 之上（同一层后画者居上）。
+        // 焦点标记条：2px 朱砂竖条，左内缩 1、上下内缩 10，圆角 1；
+        // 聚焦淡入 / 失焦淡出（animate 0.18s 近似原版 150/200ms）。
         let rect = frame_resp.response.rect;
-        let hovered = frame_resp.response.hovered();
-        self.search_hovered = hovered;
-        let animated = self.search_focused || hovered;
-        let ctx = ui.ctx().clone();
-        let beam_phase = if animated {
-            // 约 7 秒绕一圈，束头位置随时间推进
-            Some((ctx.input(|i| i.time) * 0.14) as f32 % 1.0)
-        } else {
-            None
-        };
-        paint_flow_border(&ui.painter_at(rect), rect, 10.0, beam_phase, pal.search_faint);
-        // 只在窗口可见且处于游走态时才请求重绘驱动动画
-        if animated && self.visible {
-            ctx.request_repaint();
+        let v = ui.ctx().animate_bool_with_time(
+            ui.make_persistent_id("search_focus_bar"),
+            self.search_focused,
+            0.18,
+        );
+        if (0.0..1.0).contains(&v) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        if v > 0.01 {
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 1.0, rect.top() + 10.0),
+                egui::pos2(rect.left() + 3.0, rect.bottom() - 10.0),
+            );
+            ui.painter().rect_filled(
+                bar,
+                Rounding::same(1.0),
+                Color32::from_rgba_unmultiplied(
+                    pal.accent.r(),
+                    pal.accent.g(),
+                    pal.accent.b(),
+                    (255.0 * v) as u8,
+                ),
+            );
         }
     }
-
     /// 工具栏一行（v0.1.5 定稿）：[类型控件] [范围控件] ……右端
     /// [宫格/列表切换]。原来的整排分类 chips 玻璃栏撤掉，腾出的
     /// 高度归结果区。两个筛选控件独立、互斥展开（expanded_filter
@@ -2356,7 +2489,9 @@ impl ShunSeekApp {
             0.18,
         );
         if (0.0..1.0).contains(&v) {
-            ui.ctx().request_repaint();
+            // 展开/收起过渡期间 60fps 续命，静止即停（v0.1.6 帧率纪律）
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
         }
         let full = self.cat_set.len() >= ALL_CATEGORIES.len();
         let target_w = if expanded {
@@ -2369,6 +2504,11 @@ impl ShunSeekApp {
             ui.allocate_exact_size(Vec2::new(w, 26.0), egui::Sense::click());
         let painter = ui.painter_at(rect);
         let dot_center = egui::pos2(rect.left() + 13.0, rect.center().y);
+        if expanded {
+            // 点外关闭判定（见 update）：圆点与展开胶囊是同一个 Rect
+            self.filter_dot_rect = Some(rect);
+            self.filter_panel_rect = Some(rect);
+        }
         if v > 0.02 {
             painter.rect_filled(rect, Rounding::same(13.0), pal.bar_fill);
             if pal.bar_stroke.a() > 0 {
@@ -2384,7 +2524,7 @@ impl ShunSeekApp {
         } else {
             painter.circle_filled(dot_center, 13.0, pal.esc_fill);
             if !full {
-                painter.circle_stroke(dot_center, 12.5, Stroke::new(1.6_f32, ACCENT));
+                painter.circle_stroke(dot_center, 12.5, Stroke::new(1.6_f32, pal.accent));
             }
         }
         // 漏斗图标（单选且收起时圆点是分类色，漏斗画白色）
@@ -2397,7 +2537,7 @@ impl ShunSeekApp {
         // 多选数量角标
         if !full && self.cat_set.len() > 1 {
             let badge = egui::pos2(rect.left() + 22.0, rect.top() + 4.0);
-            painter.circle_filled(badge, 7.0, ACCENT);
+            painter.circle_filled(badge, 7.0, pal.accent);
             painter.text(
                 badge,
                 egui::Align2::CENTER_CENTER,
@@ -2516,6 +2656,10 @@ impl ShunSeekApp {
         let painter = ui.painter_at(rect);
         let dot_center = egui::pos2(rect.left() + 13.0, rect.center().y);
         if expanded {
+            // 点外关闭判定（见 update）：圆点 Rect（面板 Rect 在 popup 里记）
+            self.filter_dot_rect = Some(rect);
+        }
+        if expanded {
             painter.rect_filled(rect, Rounding::same(13.0), pal.bar_fill);
             if pal.bar_stroke.a() > 0 {
                 painter.rect_stroke(
@@ -2527,12 +2671,12 @@ impl ShunSeekApp {
         } else {
             painter.circle_filled(dot_center, 13.0, pal.esc_fill);
             if !all {
-                painter.circle_stroke(dot_center, 12.5, Stroke::new(1.6_f32, ACCENT));
+                painter.circle_stroke(dot_center, 12.5, Stroke::new(1.6_f32, pal.accent));
             }
         }
-        // 文件夹图形（填充版小色块，一眼是「范围/目录」）
-        let tile = egui::Rect::from_center_size(dot_center, Vec2::splat(16.0));
-        paint_folder_tile(&painter, tile, pal);
+        // 文件夹字形（真实比例矢量字形，一眼是「范围/目录」）
+        let tile = egui::Rect::from_center_size(dot_center, Vec2::splat(18.0));
+        paint_folder_glyph(&painter, tile);
         if show_summary {
             let pill = egui::Rect::from_min_size(
                 egui::pos2(rect.left() + 32.0, rect.center().y - 9.0),
@@ -2570,15 +2714,16 @@ impl ShunSeekApp {
         let mut drives = self.scope_drives.clone();
         let mut custom = self.scope_custom.clone();
         let mut changed = false;
+        let mut panel_rect: Option<egui::Rect> = None;
         egui::containers::popup::popup_below_widget(
             ui,
             popup_id,
             &resp,
             egui::containers::popup::PopupCloseBehavior::CloseOnClickOutside,
             |ui| {
-                ui.set_min_width(230.0);
+                ui.set_min_width(260.0);
                 ui.label(
-                    RichText::new("预设").size(11.5).color(pal.path_text),
+                    RichText::new("预设").size(11.0).color(pal.status_text),
                 );
                 let all_now = PRESET_KEYS
                     .iter()
@@ -2601,9 +2746,9 @@ impl ShunSeekApp {
                         RowHit::None => {}
                     }
                 }
-                ui.add_space(4.0);
+                ui.add_space(8.0);
                 ui.label(
-                    RichText::new("磁盘").size(11.5).color(pal.path_text),
+                    RichText::new("磁盘").size(11.0).color(pal.status_text),
                 );
                 for d in existing_drives() {
                     match scope_row(ui, pal, &format!("{d}:\\"), drives.contains(&d)) {
@@ -2618,11 +2763,11 @@ impl ShunSeekApp {
                         RowHit::None => {}
                     }
                 }
-                ui.add_space(4.0);
+                ui.add_space(8.0);
                 ui.label(
                     RichText::new("自定义文件夹")
-                        .size(11.5)
-                        .color(pal.path_text),
+                        .size(11.0)
+                        .color(pal.status_text),
                 );
                 let mut remove: Option<usize> = None;
                 for (i, path) in custom.iter().enumerate() {
@@ -2655,8 +2800,13 @@ impl ShunSeekApp {
                 {
                     ui.add_enabled(false, egui::Button::new("添加文件夹…"));
                 }
+                // 点外关闭判定用：记下本帧面板的实际 Rect（见 update）
+                panel_rect = Some(ui.min_rect());
             },
         );
+        if let Some(r) = panel_rect {
+            self.filter_panel_rect = Some(r);
+        }
         if changed {
             self.scope_presets = presets;
             self.scope_drives = drives;
@@ -2671,17 +2821,31 @@ impl ShunSeekApp {
     }
 
     fn draw_results(&mut self, ui: &mut egui::Ui) {
+        // 首页（空查询）：只显用户 pins、强制宫格，不走搜索结果管线
+        if self.is_home() {
+            self.draw_home(ui);
+            return;
+        }
         if self.rows.is_empty() {
             let pal = self.theme.palette();
+            // 空状态文案（原版）：索引还在建 / 没有匹配的内容
+            let text = if self.rebuilding && self.index_count == 0 {
+                "索引还在建，等它跑完再搜"
+            } else {
+                "没有匹配的内容"
+            };
             ui.centered_and_justified(|ui| {
-                ui.label(
-                    RichText::new(if self.query.trim().is_empty() {
-                        "暂无条目"
-                    } else {
-                        "没有找到结果"
-                    })
-                    .size(13.0)
-                    .color(pal.empty_text),
+                let rect = ui.max_rect();
+                let galley = ui.fonts(|f| {
+                    f.layout_no_wrap(text.to_string(), serif(14.0), pal.empty_text)
+                });
+                ui.painter().galley(
+                    egui::pos2(
+                        rect.center().x - galley.size().x / 2.0,
+                        rect.center().y - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    pal.empty_text,
                 );
             });
             return;
@@ -2690,6 +2854,306 @@ impl ShunSeekApp {
             ViewMode::List => self.draw_results_list(ui),
             ViewMode::Grid => self.draw_results_grid(ui),
         }
+    }
+    /// 首页（v0.1.6 用户定义）：只显示用户自选 pins，强制宫格
+    /// （不受 view_mode 影响），磁贴只显图标 + 名称，详情走悬浮卡。
+    /// 末尾恒有「＋ 添加」格；pins 为空时另显一行引导文案。
+    fn draw_home(&mut self, ui: &mut egui::Ui) {
+        let pal = self.theme.palette();
+        if self.home_items.is_empty() {
+            // 引导文案（原版空状态语言：Serif 14 TextLow 居中）
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::hover());
+            let galley = ui.fonts(|f| {
+                f.layout_no_wrap(
+                    "右键任意搜索结果选『添加到首页』，或点＋添加".to_string(),
+                    serif(14.0),
+                    pal.empty_text,
+                )
+            });
+            ui.painter_at(rect).galley(
+                egui::pos2(
+                    rect.center().x - galley.size().x / 2.0,
+                    rect.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                pal.empty_text,
+            );
+            ui.add_space(6.0);
+        } else {
+            // 说明行（原版 HomeCaption：Sans 10.5 TextLow，下 Margin 10）
+            ui.label(
+                RichText::new(format!("已固定 {}", self.home_items.len()))
+                    .size(10.5)
+                    .color(pal.status_text),
+            );
+            ui.add_space(10.0);
+        }
+
+        let avail_w = ui.available_width();
+        let cols = (((avail_w + HOME_TILE_GAP) / (HOME_TILE_W + HOME_TILE_GAP)) as usize).max(1);
+        self.home_cols = cols;
+        let total_cells = self.home_items.len() + 1; // pins + 添加格
+        let grid_rows = total_cells.div_ceil(cols);
+        let row_pitch = HOME_TILE_H + HOME_TILE_GAP;
+        let mut action: Option<HomeAction> = None;
+        let mut add_clicked = false;
+        let mut add_resp: Option<egui::Response> = None;
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if self.scroll_to_selected {
+            let offset =
+                ((self.selected / cols) as f32 * row_pitch - 120.0).max(0.0);
+            scroll = scroll.vertical_scroll_offset(offset);
+            self.scroll_to_selected = false;
+        }
+        scroll.show_rows(ui, row_pitch, grid_rows, |ui, range| {
+            for gr in range {
+                let (row_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), row_pitch),
+                    egui::Sense::hover(),
+                );
+                for c in 0..cols {
+                    let idx = gr * cols + c;
+                    if idx >= total_cells {
+                        break;
+                    }
+                    let cell = egui::Rect::from_min_size(
+                        row_rect.min
+                            + Vec2::new(c as f32 * (HOME_TILE_W + HOME_TILE_GAP), 0.0),
+                        Vec2::new(HOME_TILE_W, HOME_TILE_H),
+                    );
+                    if idx < self.home_items.len() {
+                        if let Some(a) = self.draw_home_tile(ui, cell, idx) {
+                            action = Some(a);
+                        }
+                    } else {
+                        // 「＋ 添加」格：EdgeLine 描边 + 手绘加号 + 文字
+                        let resp = ui.interact(
+                            cell,
+                            ui.id().with("home_add_cell"),
+                            egui::Sense::click(),
+                        );
+                        let painter = ui.painter_at(cell);
+                        if resp.hovered() {
+                            painter.rect_filled(
+                                cell,
+                                Rounding::same(12.0),
+                                pal.surface_hover,
+                            );
+                        }
+                        painter.rect_stroke(
+                            cell,
+                            Rounding::same(12.0),
+                            Stroke::new(1.0_f32, pal.edge_line),
+                        );
+                        let cc = egui::pos2(cell.center().x, cell.top() + 30.0);
+                        let plus = Stroke::new(2.0_f32, pal.path_text);
+                        painter.line_segment(
+                            [egui::pos2(cc.x - 9.0, cc.y), egui::pos2(cc.x + 9.0, cc.y)],
+                            plus,
+                        );
+                        painter.line_segment(
+                            [egui::pos2(cc.x, cc.y - 9.0), egui::pos2(cc.x, cc.y + 9.0)],
+                            plus,
+                        );
+                        painter.text(
+                            egui::pos2(cell.center().x, cell.top() + 62.0),
+                            Align2::CENTER_CENTER,
+                            "添加",
+                            FontId::proportional(11.0),
+                            pal.path_text,
+                        );
+                        if resp.clicked() {
+                            add_clicked = true;
+                        }
+                        add_resp = Some(resp);
+                    }
+                }
+            }
+        });
+
+        // 「＋ 添加」弹层：选文件 / 选文件夹（锚在添加格下方）
+        let popup_id = ui.make_persistent_id("home_add_popup");
+        if add_clicked {
+            self.home_add_open = !self.home_add_open;
+        }
+        if self.home_add_open {
+            ui.memory_mut(|m| m.open_popup(popup_id));
+        }
+        #[allow(unused_mut)] // 只有 Windows 分支会改它们（rfd 对话框）
+        let mut pick_file = false;
+        #[allow(unused_mut)]
+        let mut pick_folder = false;
+        if let Some(resp) = &add_resp {
+            egui::containers::popup::popup_below_widget(
+                ui,
+                popup_id,
+                resp,
+                egui::containers::popup::PopupCloseBehavior::CloseOnClickOutside,
+                |ui| {
+                    ui.set_min_width(150.0);
+                    #[cfg(windows)]
+                    {
+                        if ui.button("选择文件…").clicked() {
+                            pick_file = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("选择文件夹…").clicked() {
+                            pick_folder = true;
+                            ui.close_menu();
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        ui.add_enabled(false, egui::Button::new("选择文件…"));
+                        ui.add_enabled(false, egui::Button::new("选择文件夹…"));
+                    }
+                },
+            );
+        }
+        if self.home_add_open && !ui.memory(|m| m.is_popup_open(popup_id)) {
+            self.home_add_open = false;
+        }
+        // 系统对话框会抢焦点：先置抑制位，对话框关后一帧的失焦不隐藏
+        #[cfg(windows)]
+        {
+            if pick_file {
+                self.suppress_focus_hide = true;
+                if let Some(p) = rfd::FileDialog::new().pick_file() {
+                    self.add_pin(&p.to_string_lossy().into_owned());
+                }
+            }
+            if pick_folder {
+                self.suppress_focus_hide = true;
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.add_pin(&p.to_string_lossy().into_owned());
+                }
+            }
+        }
+        let _ = (pick_file, pick_folder);
+
+        match action {
+            Some(HomeAction::Select(idx)) => self.selected = idx,
+            Some(HomeAction::Open(idx)) => {
+                let ctx = ui.ctx().clone();
+                self.open_home_item(&ctx, idx, false);
+            }
+            Some(HomeAction::Locate(idx)) => {
+                let ctx = ui.ctx().clone();
+                self.open_home_item(&ctx, idx, true);
+            }
+            Some(HomeAction::Remove(idx)) => {
+                if let Some(item) = self.home_items.get(idx).cloned() {
+                    self.remove_pin(&item.path);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// 一个首页磁贴（原版 TileItem）：170×92、圆角 12、Surface 底
+    /// + EdgeLine 边；图标 44×44（行高 54、上距 10），未取到时
+    /// 40×40 IconPlate 占位盘；名称 Serif 12.5 居中单行省略。
+    /// 悬停叠 SurfaceHover，选中（键盘焦点）叠 SurfaceSel +
+    /// PillStroke 边。右键菜单：打开 / 打开所在文件夹 / 从首页移除。
+    fn draw_home_tile(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        idx: usize,
+    ) -> Option<HomeAction> {
+        let pal = self.theme.palette();
+        let response = ui.interact(rect, ui.id().with(("home_tile", idx)), egui::Sense::click());
+        let painter = ui.painter_at(rect);
+        let selected = idx == self.selected;
+        painter.rect_filled(rect, Rounding::same(12.0), pal.surface);
+        if selected {
+            painter.rect_filled(rect, Rounding::same(12.0), pal.surface_sel);
+        } else if response.hovered() {
+            painter.rect_filled(rect, Rounding::same(12.0), pal.surface_hover);
+        }
+        if selected {
+            painter.rect_stroke(
+                rect,
+                Rounding::same(12.0),
+                Stroke::new(1.0_f32, pal.pill_stroke),
+            );
+        } else {
+            painter.rect_stroke(
+                rect,
+                Rounding::same(12.0),
+                Stroke::new(1.0_f32, pal.edge_line),
+            );
+        }
+        let item = self.home_items.get(idx)?;
+        // 图标：真实图标优先（按路径取，目标已删时 worker 取不到
+        // 就恒占位盘，格子照常显示，不崩）
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.center().x - 22.0, rect.top() + 10.0),
+            Vec2::splat(44.0),
+        );
+        let icon_key = icons::key_for(&item.name, &item.path, item.category);
+        let tex = self.icons.texture(ui.ctx(), &icon_key);
+        match tex {
+            Some(tex) => {
+                painter.image(
+                    tex.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            None => {
+                let plate =
+                    egui::Rect::from_center_size(icon_rect.center(), Vec2::splat(40.0));
+                painter.rect_filled(plate, Rounding::same(10.0), pal.icon_plate);
+            }
+        }
+        // 名称：Serif 12.5，左右 Margin 14，单行省略
+        let name_clip = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 14.0, rect.top() + 60.0),
+            egui::pos2(rect.right() - 14.0, rect.bottom() - 2.0),
+        );
+        let np = painter.with_clip_rect(name_clip);
+        let galley = np.layout_no_wrap(item.name.clone(), serif(12.5), pal.name_text);
+        np.galley(
+            egui::pos2(
+                rect.center().x - galley.size().x / 2.0,
+                rect.bottom() - 10.0 - galley.size().y,
+            ),
+            galley,
+            pal.name_text,
+        );
+        if response.hovered() {
+            self.hover_seen = Some(HoverTarget {
+                name: item.name.clone(),
+                path: item.path.clone(),
+                category: item.category,
+            });
+        }
+        let mut act = None;
+        if response.double_clicked() {
+            act = Some(HomeAction::Open(idx));
+        } else if response.clicked() {
+            act = Some(HomeAction::Select(idx));
+        }
+        let mut menu_act = None;
+        response.context_menu(|ui| {
+            if ui.button("打开").clicked() {
+                menu_act = Some(HomeAction::Open(idx));
+                ui.close_menu();
+            }
+            if ui.button("打开所在文件夹").clicked() {
+                menu_act = Some(HomeAction::Locate(idx));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("从首页移除").clicked() {
+                menu_act = Some(HomeAction::Remove(idx));
+                ui.close_menu();
+            }
+        });
+        menu_act.or(act)
     }
 
     fn draw_results_list(&mut self, ui: &mut egui::Ui) {
@@ -2711,11 +3175,27 @@ impl ShunSeekApp {
             Some(RowAction::Select(idx)) => self.selected = idx,
             Some(RowAction::Open(idx)) => {
                 let ctx = ui.ctx().clone();
-                self.open_display_row(&ctx, idx);
+                self.open_display_row(&ctx, idx, false);
+            }
+            Some(RowAction::Locate(idx)) => {
+                self.selected = idx;
+                let ctx = ui.ctx().clone();
+                self.open_display_row(&ctx, idx, true);
             }
             Some(RowAction::Toggle(idx, dir)) => {
                 self.selected = idx;
                 self.toggle_group(&dir);
+            }
+            Some(RowAction::Pin(idx)) => {
+                self.selected = idx;
+                if let Some(DisplayRow::Single { row, .. }) =
+                    self.display.get(idx).cloned()
+                {
+                    if let Some(r) = self.rows.get(row) {
+                        let p = r.path.clone();
+                        self.add_pin(&p);
+                    }
+                }
             }
             None => {}
         }
@@ -2763,20 +3243,37 @@ impl ShunSeekApp {
             Some(RowAction::Select(idx)) => self.selected = idx,
             Some(RowAction::Open(idx)) => {
                 let ctx = ui.ctx().clone();
-                self.open_display_row(&ctx, idx);
+                self.open_display_row(&ctx, idx, false);
+            }
+            Some(RowAction::Locate(idx)) => {
+                self.selected = idx;
+                let ctx = ui.ctx().clone();
+                self.open_display_row(&ctx, idx, true);
             }
             Some(RowAction::Toggle(idx, dir)) => {
                 self.selected = idx;
                 self.toggle_group(&dir);
             }
+            Some(RowAction::Pin(idx)) => {
+                self.selected = idx;
+                if let Some(DisplayRow::Single { row, .. }) =
+                    self.display.get(idx).cloned()
+                {
+                    if let Some(r) = self.rows.get(row) {
+                        let p = r.path.clone();
+                        self.add_pin(&p);
+                    }
+                }
+            }
             None => {}
         }
     }
 
-    /// 一个宫格格子：普通项 = 图标 + 名字（≤2 行省略）+ 分类小字；
-    /// 组项 = 文件夹色块 + 父目录末段 + 「N 项」+ 展开三角。点击 =
-    /// 选中、双击普通项 = 打开、组项单击/双击 = 展开收起（与列表
-    /// 的 RowAction 语义完全一致）。
+    /// 一个宫格格子：普通项 = 图标 40 + 名字（Serif 12，≤2 行）；
+    /// 组项 = 占位盘 + 文件夹字形 + 父目录末段 + 「N 项」。
+    /// 悬停 SurfaceHover、选中 SurfaceSel + PillStroke（原版磁贴
+    /// 语言）。绘制借用 rows 不 clone（v0.1.6 减负）。右键菜单与
+    /// 列表行同：打开 / 打开所在文件夹 / 添加到首页（组项无菜单）。
     fn draw_grid_cell(
         &mut self,
         ui: &mut egui::Ui,
@@ -2784,24 +3281,41 @@ impl ShunSeekApp {
         idx: usize,
     ) -> Option<RowAction> {
         let pal = self.theme.palette();
-        let item = self.display.get(idx)?.clone();
+        // 先把展示项按小拷贝取出（Single 全是 Copy 字段；Group 只
+        // clone dir 字符串），行本体绘制时借用，不整行 clone。
+        enum CellData {
+            Single(usize, bool),
+            Group(String, usize, bool),
+        }
+        let data = match self.display.get(idx)? {
+            DisplayRow::Single { row, indent } => CellData::Single(*row, *indent),
+            DisplayRow::Group {
+                dir,
+                count,
+                expanded,
+            } => CellData::Group(dir.clone(), *count, *expanded),
+        };
         let rect = cell.shrink(3.0);
         let response = ui.interact(rect, ui.id().with(("grid_cell", idx)), egui::Sense::click());
         let painter = ui.painter_at(rect);
         let selected = idx == self.selected;
         if selected {
-            painter.rect_filled(rect, Rounding::same(10.0), pal.row_sel_fill);
-            painter.rect_stroke(rect, Rounding::same(10.0), Stroke::new(1.2_f32, ACCENT));
+            painter.rect_filled(rect, Rounding::same(10.0), pal.surface_sel);
+            painter.rect_stroke(
+                rect,
+                Rounding::same(10.0),
+                Stroke::new(1.0_f32, pal.pill_stroke),
+            );
         } else if response.hovered() {
-            painter.rect_filled(rect, Rounding::same(10.0), pal.row_hover_fill);
+            painter.rect_filled(rect, Rounding::same(10.0), pal.surface_hover);
         }
         let icon_rect = egui::Rect::from_min_size(
             egui::pos2(rect.center().x - 20.0, rect.top() + 6.0),
             Vec2::splat(40.0),
         );
-        match &item {
-            DisplayRow::Single { row, indent } => {
-                let r = self.rows.get(*row)?.clone();
+        match &data {
+            CellData::Single(row_idx, indent) => {
+                let r = self.rows.get(*row_idx)?;
                 if response.hovered() {
                     self.hover_seen = Some(HoverTarget {
                         name: r.name.clone(),
@@ -2809,7 +3323,7 @@ impl ShunSeekApp {
                         category: r.category,
                     });
                 }
-                // 图标：真实图标优先（40×40 绘制），没有就分类色块
+                // 图标：真实图标优先（40×40），未取到 = IconPlate 占位盘
                 let icon_key = icons::key_for(&r.name, &r.path, r.category);
                 let drawn = self
                     .icons
@@ -2827,55 +3341,24 @@ impl ShunSeekApp {
                     })
                     .is_some();
                 if !drawn {
-                    let (tr, tg, tb) = r.category.tile_color();
                     painter.rect_filled(
                         icon_rect,
-                        Rounding::same(9.0),
-                        Color32::from_rgb(tr, tg, tb),
-                    );
-                    let gloss = egui::Rect::from_min_size(
-                        icon_rect.min,
-                        Vec2::new(icon_rect.width(), icon_rect.height() / 2.0),
-                    );
-                    painter.rect_filled(
-                        gloss,
-                        Rounding {
-                            nw: 9.0,
-                            ne: 9.0,
-                            sw: 0.0,
-                            se: 0.0,
-                        },
-                        Color32::from_white_alpha(pal.tile_gloss_alpha),
-                    );
-                    let ch = r
-                        .category
-                        .display_name()
-                        .chars()
-                        .next()
-                        .unwrap_or('?')
-                        .to_string();
-                    painter.text(
-                        icon_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        ch,
-                        FontId::proportional(17.0),
-                        Color32::WHITE,
+                        Rounding::same(10.0),
+                        pal.icon_plate,
                     );
                 }
                 if *indent {
                     painter.circle_filled(
                         egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
                         2.5,
-                        ACCENT,
+                        pal.accent,
                     );
                 }
-                // 名字：最多 2 行、超出省略、居中。用 fonts.layout 标准
-                // 路径排版（手动拼 LayoutJob 曾出现首字丢失，原因不明，
-                // 换用与 Label 相同的排版入口后正常）。
+                // 名字：Serif 12，最多 2 行、超出省略、居中
                 let galley = ui.fonts(|f| {
                     f.layout(
                         r.name.clone(),
-                        FontId::proportional(12.0),
+                        serif(12.0),
                         pal.name_text,
                         92.0,
                     )
@@ -2888,27 +3371,31 @@ impl ShunSeekApp {
                     galley,
                     pal.name_text,
                 );
-                // 分类小字
-                painter.text(
-                    egui::pos2(rect.center().x, rect.bottom() - 8.0),
-                    egui::Align2::CENTER_CENTER,
-                    r.category.display_name(),
-                    FontId::proportional(10.5),
-                    pal.path_text,
-                );
+                let mut act = None;
                 if response.double_clicked() {
-                    Some(RowAction::Open(idx))
+                    act = Some(RowAction::Open(idx));
                 } else if response.clicked() {
-                    Some(RowAction::Select(idx))
-                } else {
-                    None
+                    act = Some(RowAction::Select(idx));
                 }
+                let mut menu_act = None;
+                response.context_menu(|ui| {
+                    if ui.button("打开").clicked() {
+                        menu_act = Some(RowAction::Open(idx));
+                        ui.close_menu();
+                    }
+                    if ui.button("打开所在文件夹").clicked() {
+                        menu_act = Some(RowAction::Locate(idx));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("添加到首页").clicked() {
+                        menu_act = Some(RowAction::Pin(idx));
+                        ui.close_menu();
+                    }
+                });
+                menu_act.or(act)
             }
-            DisplayRow::Group {
-                dir,
-                count,
-                expanded,
-            } => {
+            CellData::Group(dir, count, expanded) => {
                 if response.hovered() {
                     self.hover_seen = Some(HoverTarget {
                         name: dir_last(dir),
@@ -2916,11 +3403,17 @@ impl ShunSeekApp {
                         category: Category::Folder,
                     });
                 }
-                paint_folder_tile(&painter, icon_rect, pal);
+                // 占位盘 + 文件夹字形（组格没有单一真实图标可取）
+                painter.rect_filled(icon_rect, Rounding::same(10.0), pal.icon_plate);
+                let glyph = egui::Rect::from_center_size(
+                    icon_rect.center(),
+                    Vec2::splat(30.0),
+                );
+                paint_folder_glyph(&painter, glyph);
                 let galley = ui.fonts(|f| {
                     f.layout(
                         dir_last(dir),
-                        FontId::proportional(12.0),
+                        serif(12.0),
                         pal.name_text,
                         92.0,
                     )
@@ -2948,33 +3441,45 @@ impl ShunSeekApp {
             }
         }
     }
-
-    /// 打开一个展示行：普通行打开对应结果，组行展开/收起（鼠标路径用；
-    /// 键盘路径走 open_selected，逻辑一致）。
-    fn open_display_row(&mut self, ctx: &egui::Context, idx: usize) {
+    /// 打开一个展示行：普通行打开对应结果（locate = 打开所在
+    /// 文件夹），组行展开/收起（鼠标路径用；键盘路径走
+    /// open_selected，逻辑一致）。
+    fn open_display_row(&mut self, ctx: &egui::Context, idx: usize, locate: bool) {
         match self.display.get(idx).cloned() {
             Some(DisplayRow::Group { dir, .. }) => self.toggle_group(&dir),
-            Some(DisplayRow::Single { row, .. }) => self.open_row(ctx, row, false),
+            Some(DisplayRow::Single { row, .. }) => self.open_row(ctx, row, locate),
             None => {}
         }
     }
 
     fn draw_display_row(&mut self, ui: &mut egui::Ui, idx: usize) -> Option<RowAction> {
-        match self.display.get(idx)?.clone() {
-            DisplayRow::Single { row, indent } => self.draw_row(ui, row, idx, indent),
+        // 借用取出（v0.1.6 减负）：Single 的字段是 Copy；Group 只
+        // clone 一条 dir 字符串，不再整行 clone DisplayRow。
+        match self.display.get(idx)? {
+            DisplayRow::Single { row, indent } => {
+                let (r, i) = (*row, *indent);
+                self.draw_row(ui, r, idx, i)
+            }
             DisplayRow::Group {
                 dir,
                 count,
                 expanded,
-            } => self.draw_group_row(ui, idx, &dir, count, expanded),
+            } => {
+                let (d, c, e) = (dir.clone(), *count, *expanded);
+                self.draw_group_row(ui, idx, &d, c, e)
+            }
         }
     }
 
-    /// 手绘一行：图标位（真图标优先，回退分类色块）+ 名字（命中段
-    /// 高亮）/ 路径 / 分类胶囊。row_idx 是原始结果下标，display_idx
-    /// 是展示行下标（选中态与 RowAction 都按展示行算）；indent 为
-    /// 折叠组展开后的成员行，内容整体右移一截表示从属。
-    /// 手绘而不用子控件拼装，是为了 show_rows 虚拟化下每行开销恒定。
+    /// 手绘一行（原版 ResultRow 样式）：行高 52、圆角 10；内容左
+    /// Margin 18，图标 24×24（真实图标优先，未取到 = IconPlate
+    /// 占位盘圆角 6，不再画分类色块字）；名 Serif 14 TextHi（命中
+    /// 段 AccentText 高亮）、路径 Sans 10 TextLow；右侧簇 = 类型
+    /// 标签 Sans 10 TextLow + 重要度点 5px + 已固定标记（PinMark）。
+    /// 悬停 RowHover；选中 RowSel + RowSelStroke + 左侧 3×26 朱砂
+    /// 标记条；行底发丝线（左 56 起、HairLine）悬停/选中时隐藏。
+    /// 绘制只借用 rows 不 clone（v0.1.6 减负，悬停时才 clone 一份
+    /// HoverTarget）。右键菜单：打开 / 打开所在文件夹 / 添加到首页。
     fn draw_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -2983,147 +3488,111 @@ impl ShunSeekApp {
         indent: bool,
     ) -> Option<RowAction> {
         let pal = self.theme.palette();
-        let row = self.rows.get(row_idx)?.clone();
         let (rect, response) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), ROW_H),
             egui::Sense::click(),
         );
+        let row = self.rows.get(row_idx)?;
         let selected = display_idx == self.selected;
         let painter = ui.painter_at(rect);
+        let rounding = Rounding::same(10.0);
         if selected {
-            painter.rect_filled(
+            painter.rect_filled(rect, rounding, pal.row_sel_fill);
+            painter.rect_stroke(
                 rect,
-                Rounding::same(8.0),
-                pal.row_sel_fill,
+                rounding,
+                Stroke::new(1.0_f32, pal.row_sel_stroke),
             );
-            // 左侧 3px 强调蓝竖条（内缩，带圆角；#2563EB 两主题同值）
-            let bar = egui::Rect::from_min_size(
-                rect.min + Vec2::new(1.0, 10.0),
-                Vec2::new(3.0, ROW_H - 20.0),
+            // 选中标记条：3×26 朱砂，圆角 1.5，左 Margin 6
+            let mark = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 6.0, rect.center().y - 13.0),
+                Vec2::new(3.0, 26.0),
             );
-            painter.rect_filled(bar, Rounding::same(2.0), ACCENT);
-            // 顶部 1px 高光线（玻璃上缘受光，与玻璃栏/胶囊同一语言）
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left() + 8.0, rect.top() + 0.5),
-                    egui::pos2(rect.right() - 8.0, rect.top() + 0.5),
-                ],
-                Stroke::new(1.0_f32, pal.row_sel_highlight),
-            );
+            painter.rect_filled(mark, Rounding::same(1.5), pal.accent);
         } else if response.hovered() {
-            painter.rect_filled(rect, Rounding::same(8.0), pal.row_hover_fill);
+            painter.rect_filled(rect, rounding, pal.row_hover_fill);
         }
 
-        // 图标位 36×36：先查真实系统图标（v0.1.5，Windows 按 key 后台
-        // 取、到了自动换上）；没有（未取到 / 非 Windows / 取失败）回退
-        // 分类色块 + 首字，与旧版一致。
         let indent_x = if indent { 16.0 } else { 0.0 };
-        let (r, g, b) = row.category.tile_color();
-        let tile_rect = egui::Rect::from_min_size(
-            rect.min + Vec2::new(6.0 + indent_x, (ROW_H - 36.0) / 2.0),
-            Vec2::splat(36.0),
+        // 图标 24×24（列位左 18）：真实系统图标优先，未取到回退占位盘
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.left() + 18.0 + indent_x,
+                rect.center().y - icons::ICON_SIZE / 2.0,
+            ),
+            Vec2::splat(icons::ICON_SIZE),
         );
         let icon_key = icons::key_for(&row.name, &row.path, row.category);
         let icon_tex = self.icons.texture(ui.ctx(), &icon_key);
-        if let Some(tex) = icon_tex {
-            let icon_rect = egui::Rect::from_min_size(
-                tile_rect.min + Vec2::splat((36.0 - icons::ICON_SIZE) / 2.0),
-                Vec2::splat(icons::ICON_SIZE),
-            );
-            painter.image(
-                tex.id(),
-                icon_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        } else {
-            painter.rect_filled(tile_rect, Rounding::same(9.0), Color32::from_rgb(r, g, b));
-            // 色块玻璃感：上半部叠一层高光（上圆角、下直角），像光打在玻璃面上
-            let tile_gloss = egui::Rect::from_min_size(
-                tile_rect.min,
-                Vec2::new(tile_rect.width(), tile_rect.height() / 2.0),
-            );
-            painter.rect_filled(
-                tile_gloss,
-                Rounding {
-                    nw: 9.0,
-                    ne: 9.0,
-                    sw: 0.0,
-                    se: 0.0,
-                },
-                Color32::from_white_alpha(pal.tile_gloss_alpha),
-            );
-            let tile_char = row
-                .category
-                .display_name()
-                .chars()
-                .next()
-                .unwrap_or('?')
-                .to_string();
-            painter.text(
-                tile_rect.center(),
-                Align2::CENTER_CENTER,
-                tile_char,
-                FontId::proportional(15.0),
-                Color32::WHITE,
-            );
+        match icon_tex {
+            Some(tex) => {
+                painter.image(
+                    tex.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            None => {
+                painter.rect_filled(icon_rect, Rounding::same(6.0), pal.icon_plate);
+            }
         }
 
-        // 右侧分类胶囊：分类色低透明底（alpha 40）+ 分类色调出的文字
-        // （深色提亮 / 浅色压暗，见 Palette::cat_text_color），先量宽，
-        // 名字区域要给它让位
-        let cat_name = row.category.display_name();
-        let cat_font = FontId::proportional(10.5);
-        let cat_text_color = pal.cat_text_color(r, g, b);
-        let cat_galley = painter.layout_no_wrap(
-            cat_name.to_string(),
-            cat_font.clone(),
-            cat_text_color,
+        // 右侧簇（右 Margin 12 起向左）：类型标签 → 重要度点 → 固定标记
+        let type_galley = painter.layout_no_wrap(
+            row.category.display_name().to_string(),
+            FontId::proportional(10.0),
+            pal.path_text,
         );
-        let capsule_w = cat_galley.size().x + 14.0;
-        let capsule_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                rect.right() - capsule_w - 6.0,
-                rect.center().y - 9.0,
-            ),
-            Vec2::new(capsule_w, 18.0),
-        );
-        painter.rect_filled(
-            capsule_rect,
-            Rounding::same(8.0),
-            Color32::from_rgba_unmultiplied(r, g, b, 40),
-        );
+        let type_x = rect.right() - 12.0 - type_galley.size().x;
         painter.galley(
-            egui::pos2(
-                capsule_rect.center().x - cat_galley.size().x / 2.0,
-                capsule_rect.center().y - cat_galley.size().y / 2.0,
-            ),
-            cat_galley,
-            cat_text_color,
+            egui::pos2(type_x, rect.center().y - type_galley.size().y / 2.0),
+            type_galley,
+            pal.path_text,
         );
+        let imp_color = if row.demoted {
+            pal.importance_low
+        } else {
+            match row.category {
+                Category::App | Category::Shortcut => pal.importance_high,
+                _ => pal.importance_normal,
+            }
+        };
+        let dot_c = egui::pos2(type_x - 7.0 - 2.5, rect.center().y);
+        painter.circle_filled(dot_c, 2.5, imp_color);
+        let mut text_right = dot_c.x - 2.5 - 8.0;
+        if self.is_pinned(&row.path) {
+            // 固定标记（原版 E840 图钉的近似：圆头 + 尖尾，PinMark 色）
+            let pc = egui::pos2(text_right - 4.5, rect.center().y);
+            painter.circle_filled(pc + Vec2::new(0.0, -1.5), 3.2, pal.pin_mark);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    pc + Vec2::new(-2.2, 0.5),
+                    pc + Vec2::new(2.2, 0.5),
+                    pc + Vec2::new(0.0, 4.5),
+                ],
+                pal.pin_mark,
+                Stroke::NONE,
+            ));
+            text_right = pc.x - 4.5 - 8.0;
+        }
 
-        // 名字（命中段高亮）+ 路径，横向裁剪不换行
-        let text_x = rect.left() + 50.0 + indent_x;
+        // 名字（命中段高亮）+ 路径，横向裁剪到右侧簇之前
+        let text_x = rect.left() + 60.0 + indent_x;
         let text_clip = egui::Rect::from_min_max(
             egui::pos2(text_x, rect.top()),
-            egui::pos2(capsule_rect.left() - 8.0, rect.bottom()),
+            egui::pos2(text_right - 12.0, rect.bottom()),
         );
         let painter = painter.with_clip_rect(text_clip);
-        let name_font = FontId::proportional(14.0);
+        let name_font = serif(14.0);
         let mut job = egui::text::LayoutJob::default();
         let name = &row.name;
-        let hl = if row.match_start != usize::MAX
-            && row.match_start < name.len()
-            && row.match_len > 0
-        {
-            let start = row.match_start;
-            let end = (start + row.match_len).min(name.len());
-            // 保证落在字符边界上（match_start 是字节偏移，查询长度按字节算）
-            if name.is_char_boundary(start) && name.is_char_boundary(end) {
-                Some((start, end))
-            } else {
-                None
-            }
+        // 高亮区间：match_start/match_len 都是字节量，切片前双双
+        // 收敛到字符边界（core 语义钉死 + app 侧防御，见 search.rs）
+        let hl = if row.match_start != usize::MAX && row.match_len > 0 {
+            let s = floor_char_boundary(name, row.match_start);
+            let e = floor_char_boundary(name, s + row.match_len);
+            if s < e { Some((s, e)) } else { None }
         } else {
             None
         };
@@ -3139,7 +3608,7 @@ impl ShunSeekApp {
                     &name[s..e],
                     0.0,
                     TextFormat {
-                        font_id: FontId::proportional(14.0),
+                        font_id: serif(14.0),
                         color: pal.highlight,
                         underline: Stroke::new(1.0_f32, pal.highlight),
                         ..Default::default()
@@ -3151,18 +3620,29 @@ impl ShunSeekApp {
         }
         job.wrap.max_width = f32::INFINITY;
         let galley = painter.layout_job(job);
-        painter.galley(egui::pos2(text_x, rect.top() + 7.0), galley, Color32::WHITE);
+        painter.galley(egui::pos2(text_x, rect.top() + 8.0), galley, Color32::WHITE);
 
         let path_galley = painter.layout_no_wrap(
             row.path.clone(),
-            FontId::proportional(11.5),
+            FontId::proportional(10.0),
             pal.path_text,
         );
         painter.galley(
-            egui::pos2(text_x, rect.top() + 30.0),
+            egui::pos2(text_x, rect.top() + 31.0),
             path_galley,
             pal.path_text,
         );
+
+        // 行底发丝线：左 56 起、右 12 止；悬停/选中时隐藏（原版规则）
+        if !selected && !response.hovered() {
+            ui.painter_at(rect).line_segment(
+                [
+                    egui::pos2(rect.left() + 56.0 + indent_x, rect.bottom() - 0.5),
+                    egui::pos2(rect.right() - 12.0, rect.bottom() - 0.5),
+                ],
+                Stroke::new(1.0_f32, pal.hairline),
+            );
+        }
 
         if response.hovered() {
             self.hover_seen = Some(HoverTarget {
@@ -3171,18 +3651,34 @@ impl ShunSeekApp {
                 category: row.category,
             });
         }
-        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let mut act = None;
         if response.double_clicked() {
-            Some(RowAction::Open(display_idx))
+            act = Some(RowAction::Open(display_idx));
         } else if response.clicked() {
-            Some(RowAction::Select(display_idx))
-        } else {
-            None
+            act = Some(RowAction::Select(display_idx));
         }
+        let mut menu_act = None;
+        response.context_menu(|ui| {
+            if ui.button("打开").clicked() {
+                menu_act = Some(RowAction::Open(display_idx));
+                ui.close_menu();
+            }
+            if ui.button("打开所在文件夹").clicked() {
+                menu_act = Some(RowAction::Locate(display_idx));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("添加到首页").clicked() {
+                menu_act = Some(RowAction::Pin(display_idx));
+                ui.close_menu();
+            }
+        });
+        menu_act.or(act)
     }
-
-    /// 折叠组行：文件夹色块（手绘文件夹图形）+ 父目录末两段 +
-    /// 「N 个同目录结果已折叠 / 已展开」+ 右侧展开箭头（三角手绘）。
+    /// 折叠组行（原版 FoldRow）：FoldFill 底、圆角 9，内缩近似
+    /// 原版 Margin 2,4,6,4；左侧小三角字形（9.5 级 TextLow）+
+    /// Serif 12 TextMid 单行文字「{末两段} · N 个同目录结果」。
+    /// 选中描 PillStroke 边，悬停叠 SurfaceHover。
     /// 点击 = 展开/收起（RowAction::Toggle），悬停提示完整父目录。
     fn draw_group_row(
         &mut self,
@@ -3199,84 +3695,57 @@ impl ShunSeekApp {
         );
         let selected = display_idx == self.selected;
         let painter = ui.painter_at(rect);
+        let bg = egui::Rect::from_min_max(
+            rect.min + Vec2::new(2.0, 5.0),
+            rect.max - Vec2::new(6.0, 5.0),
+        );
+        painter.rect_filled(bg, Rounding::same(9.0), pal.fold_fill);
         if selected {
-            painter.rect_filled(rect, Rounding::same(8.0), pal.row_sel_fill);
-            let bar = egui::Rect::from_min_size(
-                rect.min + Vec2::new(1.0, 10.0),
-                Vec2::new(3.0, ROW_H - 20.0),
-            );
-            painter.rect_filled(bar, Rounding::same(2.0), ACCENT);
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left() + 8.0, rect.top() + 0.5),
-                    egui::pos2(rect.right() - 8.0, rect.top() + 0.5),
-                ],
-                Stroke::new(1.0_f32, pal.row_sel_highlight),
+            painter.rect_stroke(
+                bg,
+                Rounding::same(9.0),
+                Stroke::new(1.0_f32, pal.pill_stroke),
             );
         } else if response.hovered() {
-            painter.rect_filled(rect, Rounding::same(8.0), pal.row_hover_fill);
+            painter.rect_filled(bg, Rounding::same(9.0), pal.surface_hover);
         }
 
-        // 文件夹色块（与宫格组格 / 范围圆点共用同一画法）
-        let tile_rect = egui::Rect::from_min_size(
-            rect.min + Vec2::new(6.0, (ROW_H - 36.0) / 2.0),
-            Vec2::splat(36.0),
-        );
-        paint_folder_tile(&painter, tile_rect, pal);
-
-        // 主文字：父目录末两段；副文字：折叠计数（裁剪到箭头之前）
-        let text_x = rect.left() + 50.0;
-        let text_clip = egui::Rect::from_min_max(
-            egui::pos2(text_x, rect.top()),
-            egui::pos2(rect.right() - 34.0, rect.bottom()),
-        );
-        let painter = painter.with_clip_rect(text_clip);
-        let title_galley = painter.layout_no_wrap(
-            dir_tail(dir),
-            FontId::proportional(14.0),
-            pal.name_text,
-        );
-        painter.galley(
-            egui::pos2(text_x, rect.top() + 7.0),
-            title_galley,
-            pal.name_text,
-        );
-        let sub = if expanded {
-            format!("{count} 个同目录结果 · 已展开")
-        } else {
-            format!("{count} 个同目录结果已折叠")
-        };
-        let sub_galley = painter.layout_no_wrap(
-            sub,
-            FontId::proportional(11.5),
-            pal.path_text,
-        );
-        painter.galley(
-            egui::pos2(text_x, rect.top() + 30.0),
-            sub_galley,
-            pal.path_text,
-        );
-
-        // 右侧展开箭头：收起时向右（▸ 意象），展开后向下（▾ 意象），手绘三角
-        let c = egui::pos2(rect.right() - 18.0, rect.center().y);
+        // 三角字形：收起向右（▸）、展开向下（▾），手绘，TextLow
+        let c = egui::pos2(bg.left() + 18.0, bg.center().y);
         let tri = if expanded {
             vec![
-                egui::pos2(c.x - 5.0, c.y - 3.0),
-                egui::pos2(c.x + 5.0, c.y - 3.0),
-                egui::pos2(c.x, c.y + 4.0),
+                egui::pos2(c.x - 4.5, c.y - 2.5),
+                egui::pos2(c.x + 4.5, c.y - 2.5),
+                egui::pos2(c.x, c.y + 3.5),
             ]
         } else {
             vec![
-                egui::pos2(c.x - 3.0, c.y - 5.0),
-                egui::pos2(c.x - 3.0, c.y + 5.0),
-                egui::pos2(c.x + 4.0, c.y),
+                egui::pos2(c.x - 2.5, c.y - 4.5),
+                egui::pos2(c.x - 2.5, c.y + 4.5),
+                egui::pos2(c.x + 3.5, c.y),
             ]
         };
-        ui.painter_at(rect).add(egui::Shape::convex_polygon(
-            tri,
-            pal.path_text,
-            Stroke::NONE,
-        ));
+        painter.add(egui::Shape::convex_polygon(tri, pal.path_text, Stroke::NONE));
+
+        // 单行文字（裁剪到组行右内边距）
+        let text = format!(
+            "{} · {} 个同目录结果{}",
+            dir_tail(dir),
+            count,
+            if expanded { " · 已展开" } else { "" }
+        );
+        let text_x = bg.left() + 32.0;
+        let clip = egui::Rect::from_min_max(
+            egui::pos2(text_x, bg.top()),
+            egui::pos2(bg.right() - 14.0, bg.bottom()),
+        );
+        let tp = painter.with_clip_rect(clip);
+        let galley = tp.layout_no_wrap(text, serif(12.0), pal.text_mid);
+        tp.galley(
+            egui::pos2(text_x, bg.center().y - galley.size().y / 2.0),
+            galley,
+            pal.text_mid,
+        );
 
         if response.hovered() {
             self.hover_seen = Some(HoverTarget {
@@ -3292,47 +3761,99 @@ impl ShunSeekApp {
             None
         }
     }
-
+    /// 页脚（原版 Footer）：顶部发丝线，其下左 = 状态文字（Sans 10
+    /// TextLow，限宽 340、超长省略——索引长摘要只在设置里，状态栏
+    /// 永远短格式）、中 = 结果计数「{n} 项 · {ms} ms」、右 = 设置
+    /// 按钮（齿轮 11 + 「设置」Sans 10.5 TextMid，悬停 SurfaceHover
+    /// 圆角 7）。右侧控件位置恒定，永不被左侧文字挤压重叠（v0.1.5
+    /// 真机「状态栏挤成一团」的根治）。主题切换在书眉，不在这里。
     fn draw_status_bar(&mut self, ui: &mut egui::Ui) {
         let pal = self.theme.palette();
-        ui.horizontal(|ui| {
-            // 左侧状态圆点：就绪绿 / 警戒红（空索引护栏）
-            let (dot_rect, _) =
-                ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
-            let dot_color = if self.status_alert {
-                pal.alert_text
-            } else {
-                pal.dot_ok
-            };
-            ui.painter_at(dot_rect)
-                .circle_filled(dot_rect.center(), 3.0, dot_color);
-            let text_color = if self.status_alert {
-                pal.alert_text
-            } else {
-                pal.status_text
-            };
-            ui.label(RichText::new(&self.status).size(11.0).color(text_color));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new("↑↓ 选择 · Enter 打开 · Ctrl+Enter 打开所在文件夹")
-                        .size(11.0)
-                        .color(pal.status_hint),
-                );
-                // 主题切换（主界面快捷切换，保留）：图标按「目标主题」
-                // 画（去浅色画太阳、去深色画月亮）+ 目标名文字，玻璃
-                // 小片与 ESC 徽标同款；切换走 set_theme（同步 settings.txt）。
-                ui.add_space(10.0);
-                if theme_icon_button(ui, pal, self.theme).clicked() {
-                    let next = self.theme.toggled();
-                    self.set_theme(ui.ctx(), next);
-                }
-                // 设置按钮（齿轮图形）：打开独立设置窗口
-                ui.add_space(6.0);
-                if gear_button(ui, pal).clicked() {
-                    self.open_settings();
-                }
-            });
-        });
+        // 顶部发丝线（其下留 7px，合计近似原版 Margin 上 11）
+        let (line_rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter_at(line_rect)
+            .rect_filled(line_rect, Rounding::ZERO, pal.hairline);
+        ui.add_space(7.0);
+
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        // 右：设置按钮（固定宽，先占位，位置恒定）
+        let set_w = 62.0;
+        let set_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - set_w, rect.center().y - 10.0),
+            Vec2::new(set_w, 20.0),
+        );
+        let set_resp = ui.interact(set_rect, ui.id().with("footer_settings"), egui::Sense::click());
+        if set_resp.is_pointer_button_down_on() {
+            painter.rect_filled(set_rect, Rounding::same(7.0), pal.surface_sel);
+        } else if set_resp.hovered() {
+            painter.rect_filled(set_rect, Rounding::same(7.0), pal.surface_hover);
+        }
+        paint_gear(
+            &painter,
+            egui::pos2(set_rect.left() + 13.0, set_rect.center().y),
+            11.0,
+            pal.text_mid,
+        );
+        painter.text(
+            egui::pos2(set_rect.left() + 25.0, set_rect.center().y),
+            Align2::LEFT_CENTER,
+            "设置",
+            FontId::proportional(10.5),
+            pal.text_mid,
+        );
+        // 中：结果计数（居中于左右之间；先量宽给左侧截断让位）
+        let res_g = if self.result_text.is_empty() {
+            None
+        } else {
+            let g = painter.layout_no_wrap(
+                self.result_text.clone(),
+                FontId::proportional(10.0),
+                pal.status_text,
+            );
+            painter.galley(
+                egui::pos2(
+                    rect.center().x - g.size().x / 2.0,
+                    rect.center().y - g.size().y / 2.0,
+                ),
+                g.clone(),
+                pal.status_text,
+            );
+            Some(g)
+        };
+        // 左：状态文字（限宽 340 且不压中央计数，layout_no_wrap + clip）
+        let text_color = if self.status_alert {
+            pal.alert_text
+        } else {
+            pal.status_text
+        };
+        let status_g = painter.layout_no_wrap(
+            self.status.clone(),
+            FontId::proportional(10.0),
+            text_color,
+        );
+        let center_left = res_g
+            .map(|g| rect.center().x - g.size().x / 2.0 - 8.0)
+            .unwrap_or(rect.right() - set_w - 8.0);
+        let left_limit = (rect.left() + 340.0).min(center_left).max(rect.left());
+        let clip = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(left_limit, rect.bottom()),
+        );
+        painter.with_clip_rect(clip).galley(
+            egui::pos2(rect.left(), rect.center().y - status_g.size().y / 2.0),
+            status_g,
+            text_color,
+        );
+        if set_resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("设置")
+            .clicked()
+        {
+            self.open_settings();
+        }
     }
 }
 
@@ -3344,53 +3865,54 @@ impl ShunSeekApp {
 /// 漏斗（类型筛选）：上宽下窄 + 下方小竖管，闭合描线。
 fn paint_funnel(painter: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
     let s = size / 2.0;
+    // 比例复核（v0.1.6）：上口全宽、颈宽 0.28、管直到底——26px
+    // 圆点里一眼是漏斗，不糊成三角块。
     let pts = [
-        egui::pos2(c.x - s, c.y - s * 0.8),
-        egui::pos2(c.x + s, c.y - s * 0.8),
-        egui::pos2(c.x + s * 0.3, c.y + s * 0.05),
-        egui::pos2(c.x + s * 0.3, c.y + s * 0.9),
-        egui::pos2(c.x - s * 0.3, c.y + s * 0.9),
-        egui::pos2(c.x - s * 0.3, c.y + s * 0.05),
-        egui::pos2(c.x - s, c.y - s * 0.8),
+        egui::pos2(c.x - s, c.y - s * 0.85),
+        egui::pos2(c.x + s, c.y - s * 0.85),
+        egui::pos2(c.x + s * 0.28, c.y + s * 0.02),
+        egui::pos2(c.x + s * 0.28, c.y + s * 0.85),
+        egui::pos2(c.x - s * 0.28, c.y + s * 0.85),
+        egui::pos2(c.x - s * 0.28, c.y + s * 0.02),
+        egui::pos2(c.x - s, c.y - s * 0.85),
     ];
     painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.8_f32, color)));
 }
 
-/// 文件夹色块（Folder 分类色 + 玻璃高光 + 白色文件夹图形）：
-/// 组行 / 宫格组格 / 范围圆点共用，按 tile 尺寸等比缩放
-///（36px 时的坐标与旧组行手绘逐值一致）。
-fn paint_folder_tile(painter: &egui::Painter, tile: egui::Rect, pal: Palette) {
-    let (r, g, b) = Category::Folder.tile_color();
-    let round = (tile.width() / 4.0).min(9.0);
-    painter.rect_filled(tile, Rounding::same(round), Color32::from_rgb(r, g, b));
-    let gloss = egui::Rect::from_min_size(
-        tile.min,
-        Vec2::new(tile.width(), tile.height() / 2.0),
+/// 文件夹字形（v0.1.6 按真实比例重画）：后片带梯形凸耳（左上
+/// 一截 tab + 斜切肩），前片矩形略矮盖住后片下部；填充用收了
+/// 饱和的文件夹黄（#F5C04A 系），描边 1.8px（按 26px 基准等比），
+/// 前片上沿一笔高光。旧版是「黄方块 + 两个白矩形」，在 16px 圆点
+/// 里糊成变形黄块，用户点名重画。范围圆点 / 宫格组格共用。
+fn paint_folder_glyph(painter: &egui::Painter, rect: egui::Rect) {
+    let (w, h) = (rect.width(), rect.height());
+    let (x0, y0) = (rect.left(), rect.top());
+    let p = |fx: f32, fy: f32| egui::pos2(x0 + w * fx, y0 + h * fy);
+    let back_fill = Color32::from_rgb(224, 169, 62); // 后片稍深
+    let front_fill = Color32::from_rgb(245, 192, 74); // 前片 #F5C04A
+    let stroke = Stroke::new((1.8 * (w / 26.0)).max(1.2), Color32::from_rgb(166, 116, 32));
+    // 后片：底边齐前片，顶部左侧凸耳 + 右侧斜肩
+    let back = vec![
+        p(0.06, 0.82),
+        p(0.06, 0.18),
+        p(0.40, 0.18),
+        p(0.52, 0.32),
+        p(0.94, 0.32),
+        p(0.94, 0.82),
+    ];
+    painter.add(egui::Shape::convex_polygon(back, back_fill, stroke));
+    // 前片：矩形，顶边比后片主体低一截，盖住后片下部
+    let front = egui::Rect::from_min_max(p(0.02, 0.40), p(0.98, 0.88));
+    painter.rect_filled(front, Rounding::same((w * 0.06).max(1.0)), front_fill);
+    painter.rect_stroke(front, Rounding::same((w * 0.06).max(1.0)), stroke);
+    // 前片上沿高光
+    painter.line_segment(
+        [p(0.06, 0.44), p(0.94, 0.44)],
+        Stroke::new(1.0_f32, Color32::from_white_alpha(110)),
     );
-    painter.rect_filled(
-        gloss,
-        Rounding {
-            nw: round,
-            ne: round,
-            sw: 0.0,
-            se: 0.0,
-        },
-        Color32::from_white_alpha(pal.tile_gloss_alpha),
-    );
-    let glyph = Color32::from_white_alpha(235);
-    let k = tile.width() / 36.0;
-    let back = egui::Rect::from_min_max(
-        tile.min + Vec2::new(7.0 * k, 11.0 * k),
-        tile.min + Vec2::new(29.0 * k, 26.0 * k),
-    );
-    painter.rect_filled(back, Rounding::same(2.0), glyph);
-    let tab = egui::Rect::from_min_max(
-        tile.min + Vec2::new(7.0 * k, 8.0 * k),
-        tile.min + Vec2::new(16.0 * k, 12.0 * k),
-    );
-    painter.rect_filled(tab, Rounding::same(1.0), glyph);
 }
 
+/// 宫格图形：2×2 四个小方块。
 /// 宫格图形：2×2 四个小方块。
 fn paint_grid_glyph(painter: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
     let sq = size * 0.42;
@@ -3460,15 +3982,97 @@ fn paint_moon(painter: &egui::Painter, c: egui::Pos2, size: f32, color: Color32,
     );
 }
 
-/// 玻璃小片骨架（与 ESC 徽标同款：填充 + 顶部 1px 高光线）。
+/// 窗口控制字形（原版 Segoe Fluent E921/E922/E923/E8BB 的手绘等价）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WinGlyph {
+    Min,
+    Max,
+    Restore,
+    Close,
+}
+
+/// 书眉工具按钮（原版 ToolButton）：34×30，圆角 8；悬停浮层
+/// SurfaceHover、按下 SurfaceSel，字形 TextMid → 悬停 TextHi
+/// （原版淡入 120/淡出 180ms，egui 无逐按钮不透明度管线，即时
+/// 换色近似）。关闭按钮走 CloseHover/ClosePressed/CloseText。
+fn header_tool_button(ui: &mut egui::Ui, pal: Palette, glyph: WinGlyph) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(34.0, 30.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let is_close = glyph == WinGlyph::Close;
+    let down = response.is_pointer_button_down_on();
+    let (fill, fg): (Option<Color32>, Color32) = if is_close {
+        if down {
+            (Some(pal.close_pressed), pal.close_text)
+        } else if response.hovered() {
+            (Some(pal.close_hover), pal.close_text)
+        } else {
+            (None, pal.text_mid)
+        }
+    } else if down {
+        (Some(pal.surface_sel), pal.name_text)
+    } else if response.hovered() {
+        (Some(pal.surface_hover), pal.name_text)
+    } else {
+        (None, pal.text_mid)
+    };
+    if let Some(f) = fill {
+        painter.rect_filled(rect, Rounding::same(8.0), f);
+    }
+    let c = rect.center();
+    let s = 10.0;
+    let stroke = Stroke::new(1.3_f32, fg);
+    match glyph {
+        WinGlyph::Min => {
+            painter.line_segment(
+                [egui::pos2(c.x - s / 2.0, c.y), egui::pos2(c.x + s / 2.0, c.y)],
+                stroke,
+            );
+        }
+        WinGlyph::Max => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(c, Vec2::splat(s)),
+                Rounding::ZERO,
+                stroke,
+            );
+        }
+        WinGlyph::Restore => {
+            let back = egui::Rect::from_center_size(
+                c + Vec2::new(2.0, -2.0),
+                Vec2::splat(s - 2.0),
+            );
+            let front = egui::Rect::from_center_size(
+                c + Vec2::new(-1.5, 1.5),
+                Vec2::splat(s - 2.0),
+            );
+            painter.rect_stroke(back, Rounding::ZERO, stroke);
+            // 前框填底色遮住后框的重叠段（底色取当前按钮浮层/面板底近似）
+            painter.rect_filled(front, Rounding::ZERO, fill.unwrap_or(pal.panel_fill));
+            painter.rect_stroke(front, Rounding::ZERO, stroke);
+        }
+        WinGlyph::Close => {
+            let d = s / 2.0;
+            painter.line_segment(
+                [egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + d, c.y - d), egui::pos2(c.x - d, c.y + d)],
+                stroke,
+            );
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 小芯片骨架（原版 ChipFill 语言：填充 + EdgeLine 1px 描边，
+/// 圆角 5；Enter 键帽与工具栏小片共用）。
 fn glass_pill(painter: &egui::Painter, rect: egui::Rect, pal: Palette) {
-    painter.rect_filled(rect, Rounding::same(4.0), pal.esc_fill);
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + 3.0, rect.top() + 0.5),
-            egui::pos2(rect.right() - 3.0, rect.top() + 0.5),
-        ],
-        Stroke::new(1.0_f32, pal.esc_highlight),
+    painter.rect_filled(rect, Rounding::same(5.0), pal.esc_fill);
+    painter.rect_stroke(
+        rect,
+        Rounding::same(5.0),
+        Stroke::new(1.0_f32, pal.edge_line),
     );
 }
 
@@ -3509,56 +4113,24 @@ fn view_toggle_button(
         })
 }
 
-/// 状态栏主题按钮：图标按目标主题画（将去浅色 → 太阳、将去
-/// 深色 → 月亮）+ 目标名文字，与旧版纯文字按钮同位置同尺寸感。
-fn theme_icon_button(ui: &mut egui::Ui, pal: Palette, theme: Theme) -> egui::Response {
-    let (label, to_light) = match theme {
-        Theme::Dark => ("浅色模式", true),
-        Theme::Light => ("深色模式", false),
-    };
-    let font = FontId::proportional(11.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, pal.esc_text));
-    let size = Vec2::new(16.0 + 5.0 + galley.size().x + 12.0, galley.size().y + 4.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let painter = ui.painter_at(rect);
-    glass_pill(&painter, rect, pal);
-    let c = egui::pos2(rect.left() + 6.0 + 8.0, rect.center().y);
-    if to_light {
-        paint_sun(&painter, c, 14.0, pal.esc_text);
-    } else {
-        paint_moon(&painter, c, 14.0, pal.esc_text, pal.panel_fill);
-    }
-    painter.galley(
-        egui::pos2(
-            rect.left() + 16.0 + 5.0 + 6.0,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        pal.esc_text,
-    );
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(label)
-}
 
-/// 状态栏设置按钮：纯齿轮图形 + 悬浮文字兜底。
-fn gear_button(ui: &mut egui::Ui, pal: Palette) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(22.0, 19.0), egui::Sense::click());
-    let painter = ui.painter_at(rect);
-    glass_pill(&painter, rect, pal);
-    paint_gear(&painter, rect.center(), 14.0, pal.esc_text);
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("设置")
-}
 
+/// 类型 chip（原版 FilterChip 选中语言）：未选 = 透明底 TextMid 字、
+/// hover = MenuHover 淡填充；选中 = PillFill 淡填充 + PillStroke
+/// 1px 描边 + AccentText 字——不用勾选符号、不用白填充（用户钉死：
+/// 选中靠胶囊填充高亮，白贴白看不见）。选中过渡 ~0.15s 插值填充
+/// 与字色，过渡期间 repaint_after(16ms) 续命，静止即停。高 24 是
+/// 为了塞进 26px 的展开胶囊（原版面板内芯片高 30，此处近似）。
 fn glass_chip(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> egui::Response {
-    let font = FontId::proportional(12.5);
+    let font = FontId::proportional(11.5);
     // 选中进度 v：0=未选中，1=完全选中，切换时平滑过渡
     let v = ui
         .ctx()
-        .animate_bool_with_time(ui.make_persistent_id(("glass_chip_sel", label)), selected, 0.18);
+        .animate_bool_with_time(ui.make_persistent_id(("glass_chip_sel", label)), selected, 0.15);
+    if (0.0..1.0).contains(&v) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(16));
+    }
     let (tr, tg, tb) = pal.chip_text_rgb;
     let (sr, sg, sb) = pal.chip_sel_text_rgb;
     let text_color = Color32::from_rgb(
@@ -3568,44 +4140,21 @@ fn glass_chip(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> e
     );
     let galley = ui
         .fonts(|f| f.layout_no_wrap(label.to_string(), font.clone(), text_color));
-    let size = Vec2::new(galley.size().x + 24.0, 26.0);
+    let size = Vec2::new(galley.size().x + 18.0, 24.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter_at(rect);
-    let rounding = Rounding::same(13.0);
+    let rounding = Rounding::same(8.0);
     if v > 0.01 {
-        // 柔和投影（向下 1px 的黑影，随选中进度淡入）
-        painter.rect_filled(
-            rect.translate(Vec2::new(0.0, 1.0)),
-            rounding,
-            Color32::from_black_alpha((pal.chip_sel_shadow_alpha as f32 * v) as u8),
-        );
-        // 磨砂白填充
-        painter.rect_filled(
-            rect,
-            rounding,
-            Color32::from_white_alpha((pal.chip_sel_fill_alpha as f32 * v) as u8),
-        );
-        // 描边圈（只有浅色，深色 TRANSPARENT 跳过）
-        if pal.chip_sel_ring.a() > 0 {
-            painter.rect_stroke(
-                rect,
-                rounding,
-                Stroke::new(1.0_f32, pal.chip_sel_ring.gamma_multiply(v)),
-            );
-        }
-        // 顶部高光线（浅色 alpha 为 0，自动不画）
-        if pal.chip_sel_highlight_alpha > 0 {
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left() + 10.0, rect.top() + 0.5),
-                    egui::pos2(rect.right() - 10.0, rect.top() + 0.5),
-                ],
-                Stroke::new(
-                    1.0_f32,
-                    Color32::from_white_alpha((pal.chip_sel_highlight_alpha as f32 * v) as u8),
-                ),
-            );
-        }
+        let fade = |c: Color32| {
+            Color32::from_rgba_unmultiplied(
+                c.r(),
+                c.g(),
+                c.b(),
+                (c.a() as f32 * v) as u8,
+            )
+        };
+        painter.rect_filled(rect, rounding, fade(pal.pill_fill));
+        painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, fade(pal.pill_stroke)));
     } else if response.hovered() {
         painter.rect_filled(rect, rounding, pal.chip_hover_fill);
     }
@@ -3619,7 +4168,6 @@ fn glass_chip(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> e
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
-
 impl ShunSeekApp {
     /// 设置窗口（独立 viewport，标题「瞬觅 设置」，约 480×540，
     /// 不置顶、可关）。入口：状态栏齿轮按钮 + 托盘「设置」项。
@@ -3669,21 +4217,12 @@ impl ShunSeekApp {
             self.settings_autostart = autostart::is_enabled();
         }
         ui.add_space(6.0);
-        // 关闭窗口后：二选一分段控件（胶囊选中样式，与筛选控件同语言）
-        ui.label(RichText::new("关闭窗口后").color(pal.name_text));
-        self.close_action_card(
-            ui,
-            pal,
-            CloseAction::Tray,
-            "最小化到托盘",
-            "程序继续在托盘运行，热键可随时唤出；从托盘菜单退出才真正结束。",
-        );
-        self.close_action_card(
-            ui,
-            pal,
-            CloseAction::Exit,
-            "退出程序",
-            "关闭窗口即完全退出，托盘图标一并消失，下次使用需重新启动。",
+        // 关窗行为（v0.1.6 用户钉死，不再是设置项）：✕ 恒最小化到
+        // 托盘，进程的唯一正常退出 = 托盘菜单「退出」。只放说明。
+        ui.label(
+            RichText::new("关闭窗口（✕）将最小化到托盘；退出程序请用托盘菜单的「退出」。")
+                .size(11.0)
+                .color(pal.path_text),
         );
         ui.add_space(6.0);
         // 唤醒热键：显示当前组合 +「修改」进捕获态；候选立即跑
@@ -3809,6 +4348,16 @@ impl ShunSeekApp {
             format!("共 {} 条 · {}", self.index_count, self.index_summary)
         };
         ui.label(RichText::new(status).size(11.5).color(pal.path_text));
+        // 图标管线健康度（v0.1.6 可观测性）：真机排障时看这一行就
+        // 知道 Shell 取图是全灭还是个别失败，不用再猜。
+        let (icon_req, icon_ok, icon_fail) = self.icons.stats();
+        ui.label(
+            RichText::new(format!(
+                "图标：已加载 {icon_ok} · 失败 {icon_fail}（已请求 {icon_req}）"
+            ))
+            .size(11.5)
+            .color(pal.path_text),
+        );
         ui.horizontal(|ui| {
             let rebuild_label = if self.rebuilding {
                 "正在建立索引…"
@@ -3840,7 +4389,7 @@ impl ShunSeekApp {
             ui.horizontal(|ui| {
                 if ui.button("确认清除？").clicked() {
                     {
-                        let mut u = self.usage.lock().unwrap();
+                        let mut u = lock_rec(&self.usage);
                         u.clear();
                         let _ = u.save();
                     }
@@ -3870,67 +4419,6 @@ impl ShunSeekApp {
         ui.add_space(12.0);
     }
 
-    /// 「关闭窗口后」的一个选项卡：标题 + 小字描述；选中 = 胶囊
-    /// 填充（与筛选控件同一选中语言），不用勾选框。
-    fn close_action_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        pal: Palette,
-        action: CloseAction,
-        title: &str,
-        desc: &str,
-    ) {
-        let selected = self.close_action == action;
-        let (rect, response) = ui
-            .allocate_exact_size(Vec2::new(ui.available_width(), 46.0), egui::Sense::click());
-        let painter = ui.painter_at(rect);
-        if selected {
-            painter.rect_filled(
-                rect,
-                Rounding::same(9.0),
-                Color32::from_white_alpha(pal.chip_sel_fill_alpha),
-            );
-            if pal.chip_sel_ring.a() > 0 {
-                painter.rect_stroke(
-                    rect,
-                    Rounding::same(9.0),
-                    Stroke::new(1.0_f32, pal.chip_sel_ring),
-                );
-            }
-        } else if response.hovered() {
-            painter.rect_filled(rect, Rounding::same(9.0), pal.chip_hover_fill);
-        }
-        let (tr, tg, tb) = if selected {
-            pal.chip_sel_text_rgb
-        } else {
-            pal.chip_text_rgb
-        };
-        let title_color = Color32::from_rgb(tr, tg, tb);
-        let title_g = painter.layout_no_wrap(
-            title.to_string(),
-            FontId::proportional(12.5),
-            title_color,
-        );
-        painter.galley(rect.min + Vec2::new(10.0, 6.0), title_g, title_color);
-        let desc_color = if selected { title_color } else { pal.path_text };
-        let desc_g = painter.layout_no_wrap(
-            desc.to_string(),
-            FontId::proportional(10.5),
-            desc_color,
-        );
-        let desc_clip = egui::Rect::from_min_max(
-            rect.min + Vec2::new(10.0, 24.0),
-            rect.max - Vec2::new(8.0, 2.0),
-        );
-        painter
-            .with_clip_rect(desc_clip)
-            .galley(rect.min + Vec2::new(10.0, 26.0), desc_g, desc_color);
-        if response.clicked() && !selected {
-            self.close_action = action;
-            self.save_settings();
-        }
-        ui.add_space(4.0);
-    }
 
     /// 热键捕获态轮询：读设置窗口这一帧的原始按键事件。Esc 取消；
     /// 修饰键 + 主键成组合后立即跑冲突检测，通过（可用 / 共用）
@@ -4207,27 +4695,70 @@ impl eframe::App for ShunSeekApp {
                 }
             }
         }
-        // 关窗行为走设置 close_action：tray = 隐藏到托盘（退出走
-        // 托盘菜单）；exit = 关窗即真退出（同样先撤托盘图标）。
+        // ✕ 恒隐藏到托盘（v0.1.6 用户钉死，无条件）：窗口 ✕ 按钮、
+        // 系统 WM_CLOSE、任务栏右键「关闭窗口」都到这里，一律取消
+        // 关闭并隐藏；进程的唯一正常退出 = 托盘菜单「退出」
+        // （allow_exit 只由那条路径置位，它随后自己发 Close）。
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_exit {
-            if self.close_action == CloseAction::Tray {
-                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.hide(ctx);
+        }
+
+        // 筛选面板点外关闭（第三条关闭路径，与圆点再点切换、Esc
+        // 独立生效）：用上一帧记下的面板/圆点 Rect 判定本帧的
+        // primary 按下点，落在两者之外就收起。
+        if self.expanded_filter.is_some() {
+            let press = ctx.input(|i| {
+                if i.pointer.primary_pressed() {
+                    i.pointer
+                        .press_origin()
+                        .or_else(|| i.pointer.interact_pos())
+                } else {
+                    None
+                }
+            });
+            if let Some(p) = press {
+                let in_panel = self
+                    .filter_panel_rect
+                    .map(|r| r.contains(p))
+                    .unwrap_or(false);
+                let in_dot = self
+                    .filter_dot_rect
+                    .map(|r| r.contains(p))
+                    .unwrap_or(false);
+                if !in_panel && !in_dot {
+                    self.expanded_filter = None;
+                    ctx.memory_mut(|m| m.close_popup());
+                }
+            }
+        } else {
+            self.filter_dot_rect = None;
+            self.filter_panel_rect = None;
+        }
+
+        // 失焦自动隐藏（呼出式工具的标准行为，也是不再置顶后的
+        // 配套）：主窗口焦点 true→false 跳变时隐藏到托盘。例外不
+        // 隐藏：设置窗口开着时；筛选面板展开时（点外先收面板，
+        // 见上）；刚关掉系统文件对话框的一帧（suppress 标志）。
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if self.visible && self.was_focused && !focused {
+            if self.suppress_focus_hide {
+                self.suppress_focus_hide = false;
+            } else if !self.settings_open && self.expanded_filter.is_none() {
+                self.focus_hide_at = Some(Instant::now());
                 self.hide(ctx);
-            } else {
-                self.tray.shutdown();
-                self.allow_exit = true;
-                spawn_exit_watchdog();
             }
         }
+        self.was_focused = focused;
 
         self.poll_channels(ctx);
         if self.visible {
             self.handle_keys(ctx);
         }
 
-        // 悬浮窗背景：手工竖向渐变（深色 #252A35→#16181D / 浅色
-        // #FFFFFF→#F6F7F9，v0.1.5 去灰）画在背景层，面板本身透明，
-        // 靠 Frame 的投影 + 淡描边撑出 Fluent 悬浮感。取色全走 palette。
+        // 悬浮窗背景：原版 InkFill 三段渐变（单个 Mesh，见
+        // paint_vertical_gradient）画在背景层，面板本身透明，
+        // 靠 Frame 的 ShellStroke 描边定义外壳。取色全走 palette。
         let pal = self.theme.palette();
         let bg_painter = ctx.layer_painter(egui::LayerId::background());
         let screen = ctx.screen_rect();
@@ -4236,16 +4767,11 @@ impl eframe::App for ShunSeekApp {
             screen,
             12.0,
             pal.grad_top,
+            pal.grad_mid,
             pal.grad_bottom,
         );
-        // 玻璃/冰霜质感：顶部 90px 高光带（峰值 alpha 走 palette）+ 内层描边，
-        // 与面板 Frame 的外层描边组成双层玻璃边缘。
-        paint_top_glass_highlight(&bg_painter, screen, pal.top_highlight_peak);
-        bg_painter.rect_stroke(
-            screen.shrink(1.0),
-            Rounding::same(11.0),
-            Stroke::new(1.0_f32, pal.panel_inner_stroke),
-        );
+        // 顶部光晕（原版 TopGlow：顶部 220px 白色渐隐层，单个 Mesh）
+        paint_top_glow(&bg_painter, screen, 12.0, pal.top_highlight_peak);
         // 注意：这里绝不能给 Frame 加 shadow。面板填充是透明的，egui 的
         // 阴影画在面板形状之后、内容之前，会整片透过透明面板压在渐变上
         // ——浅色下就是一层均匀的灰幕（v0.1.3 浅色「太灰」的真凶，深色下
@@ -4255,23 +4781,39 @@ impl eframe::App for ShunSeekApp {
             .fill(Color32::TRANSPARENT)
             .rounding(Rounding::same(12.0))
             .stroke(Stroke::new(1.0_f32, pal.panel_stroke))
-            .inner_margin(egui::Margin::symmetric(14.0, 10.0));
+            // 内容 Margin 对齐原版：左 26 / 右 18（右侧少 8 给滚动条）
+            .inner_margin(egui::Margin {
+                left: 26.0,
+                right: 18.0,
+                top: 12.0,
+                bottom: 12.0,
+            });
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(ctx, |ui| {
-                // 宽度护栏：内容宽 = 屏宽 - 左右边距（各 14）。某些环境下
-                // （虚拟屏 DPI 不一致等）面板给到的可用宽会多出一截，右侧
-                // 内容被窗口边缘切掉（v0.1.3 预览里分类胶囊/状态栏文字
-                // 被切就是这个），这里按屏宽显式收住，正常环境下是空操作。
-                let content_w = (ctx.screen_rect().width() - 28.0).max(200.0);
+                // 宽度护栏：内容宽 = 屏宽 - 左右 Margin（26+18）。某些
+                // 环境下（虚拟屏 DPI 不一致等）面板给到的可用宽会多出
+                // 一截，右侧内容被窗口边缘切掉（v0.1.3 预览里分类胶囊/
+                // 状态栏文字被切就是这个），按屏宽显式收住。
+                let content_w = (ctx.screen_rect().width() - 44.0).max(200.0);
                 ui.set_max_width(content_w);
+                self.draw_header(ui);
+                ui.add_space(12.0);
                 self.draw_search_box(ui);
-                ui.add_space(8.0);
+                ui.add_space(16.0);
+                // 搜索框下发丝线（原版：高 1、HairLine）
+                let (line_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter_at(line_rect)
+                    .rect_filled(line_rect, Rounding::ZERO, pal.hairline);
+                ui.add_space(10.0);
                 self.draw_toolbar(ui);
-                ui.add_space(6.0);
-                let status_h = 22.0;
+                ui.add_space(8.0);
+                let footer_h = 28.0;
                 let results_h =
-                    (ui.available_height() - status_h - 6.0).max(60.0);
+                    (ui.available_height() - footer_h - 6.0).max(60.0);
                 ui.allocate_ui(Vec2::new(ui.available_width(), results_h), |ui| {
                     self.draw_results(ui);
                 });
@@ -4294,11 +4836,9 @@ fn about_text() -> String {
 }
 
 /// 全局 Visuals 微调：以主题对应的 egui 基础 Visuals（dark/light）打底，
-/// 再套本应用的参数——控件圆角统一 8、选中态强调蓝半透明、弹窗走玻璃
-/// （填充/描边/投影取 palette）。启动时按 theme.txt 调一次，切换主题时
-/// 由状态栏按钮再调。注意深色下 window_rounding 的有效值是 8：
-/// v0.1.2 的 install_visuals 先写 10 又被后面的统一圆角覆盖回 8，
-/// 这里保留这个实际效果，不动深色观感；浅色按新规用 10。
+/// 再套本应用的参数——控件圆角统一 8、选中态朱砂半透明、弹窗/菜单走
+/// 原版 MenuFill/MenuStroke + 投影（ blur 22 / depth 5）。启动时按
+/// settings 的主题调一次，切换主题时由 set_theme 再调。
 fn install_visuals(ctx: &egui::Context, theme: Theme) {
     let pal = theme.palette();
     let mut visuals = match theme {
@@ -4306,17 +4846,23 @@ fn install_visuals(ctx: &egui::Context, theme: Theme) {
         Theme::Light => egui::Visuals::light(),
     };
     visuals.panel_fill = pal.panel_fill;
-    // 弹窗（「更多」菜单等）走玻璃：微透填充 + 淡描边 + 柔和投影。
+    // 弹窗/右键菜单/筛选面板：MenuFill 底 + MenuStroke 边 + 柔和
+    // 投影，与窗口 InkFill 底拉开层次（v0.1.5 浅色白贴白的根治）。
     visuals.window_fill = pal.popup_fill;
     visuals.window_stroke = Stroke::new(1.0_f32, pal.popup_stroke);
     visuals.popup_shadow = egui::epaint::Shadow {
-        offset: Vec2::new(0.0, 4.0),
-        blur: 16.0,
+        offset: Vec2::new(0.0, 5.0),
+        blur: 22.0,
         spread: 0.0,
         color: pal.popup_shadow_color,
     };
     visuals.extreme_bg_color = pal.extreme_bg;
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(37, 99, 235, 120);
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(
+        pal.accent.r(),
+        pal.accent.g(),
+        pal.accent.b(),
+        120,
+    );
     visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     let r = Rounding::same(8.0);
     visuals.widgets.noninteractive.rounding = r;
@@ -4324,10 +4870,7 @@ fn install_visuals(ctx: &egui::Context, theme: Theme) {
     visuals.widgets.hovered.rounding = r;
     visuals.widgets.active.rounding = r;
     visuals.widgets.open.rounding = r;
-    visuals.window_rounding = match theme {
-        Theme::Dark => Rounding::same(8.0),
-        Theme::Light => Rounding::same(10.0),
-    };
+    visuals.window_rounding = Rounding::same(10.0);
     ctx.set_visuals(visuals);
 }
 
@@ -4339,13 +4882,16 @@ fn main() -> eframe::Result<()> {
             width: 64,
             height: 64,
         })
-        .with_inner_size([700.0, 500.0])
-        .with_min_inner_size([700.0, 500.0])
-        .with_resizable(false)
+        // 尺寸对齐原版：默认 780×540、最小 600×400、可拉伸
+        .with_inner_size([780.0, 540.0])
+        .with_min_inner_size([600.0, 400.0])
+        .with_resizable(true)
         .with_decorations(false)
-        .with_transparent(true)
-        .with_window_level(egui::WindowLevel::AlwaysOnTop)
-        .with_taskbar(false); // 不进任务栏（0.29 里是 with_taskbar(是否显示)）
+        .with_transparent(true);
+    // v0.1.6：不再置顶（默认普通 WindowLevel，别的窗口能盖住它）、
+    // 进任务栏（默认显示）。v0.1.5 的 AlwaysOnTop + with_taskbar(false)
+    // 让窗口霸屏且在任务栏找不到、托盘又退不出，只能任务管理器
+    // 强杀——改回原版行为（Topmost=False、ShowInTaskbar=True）。
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()

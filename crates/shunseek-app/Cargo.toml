@@ -1,6 +1,6 @@
 [package]
 name = "shunseek-app"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "瞬觅 ShunSeek 界面（Rust 版，egui 重绘）：DeskBox 式小悬浮窗 + 全局热键 + 托盘"
 
@@ -16,21 +16,23 @@ egui = "0.29"
 [build-dependencies]
 winresource = "0.1"
 
-# 托盘：只在 Windows 目标启用。
-# tray-icon 在 Linux 上要拉 GTK / appindicator 系统库，无头构建机上没有，
-# 所以非 Windows 目标不引入这个依赖，托盘模块退化为骨架（见 src/tray.rs）。
-# windows-sys：icons.rs 取系统图标（Shell/Gdi）、悬停卡本地时间转换
-# （System_Time）、开机自启动注册表（System_Registry）、热键占用
-# 探测 RegisterHotKey（UI_Input_KeyboardAndMouse）。
-# rfd：范围面板「添加文件夹…」的系统文件夹选择框（仅 Windows 引入，
-# 非 Windows 目标不编译此依赖、按钮置灰）。
+# 托盘（v0.1.6 起）：专职线程 + 原生 Win32（隐藏消息窗口 + Shell_NotifyIconW
+# + CreatePopupMenu），不再用 tray-icon/muda 的事件分发——v0.1.5 真机上
+# 窗口隐藏时菜单动作到不了 UI 线程，托盘退不出。见 src/tray.rs。
+# windows-sys：icons.rs 取系统图标（Shell/Gdi）与 COM 初始化（System_Com）、
+# 悬停卡本地时间转换（System_Time）、开机自启动注册表（System_Registry）、
+# 热键占用探测 RegisterHotKey（UI_Input_KeyboardAndMouse）、托盘线程的
+# 窗口类注册 GetModuleHandleW（System_LibraryLoader）。
+# rfd：范围面板「添加文件夹…」与首页「＋ 添加」的系统文件/文件夹选择框
+# （仅 Windows 引入，非 Windows 目标不编译此依赖、按钮置灰）。
 [target.'cfg(windows)'.dependencies]
-tray-icon = "0.19"
 rfd = "0.15"
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Time",
     "Win32_UI_Input_KeyboardAndMouse",

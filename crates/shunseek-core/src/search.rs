@@ -22,6 +22,10 @@ use crate::usage::UsageStore;
 
 /// 一条搜索命中。match_start 是命中点在名字中的**字节**偏移（供 UI 高亮切分用；
 /// C# 版是 char 偏移，语义相同、单位不同，README 有注）。
+/// 语义钉死（v0.1.6）：match_start 相对**原始 name 字符串**（store 里存的原名，
+/// 未小写化、未拼首字母串）的字节偏移。UI 切片前必须先把偏移收敛到字符边界
+/// （is_char_boundary 回退）再切——偏移理论上总落在字符边界上，但 UI 不得
+/// 依赖这一点直接切片（v0.1.5 真机曾因此 panic 并毒化互斥锁）。
 #[derive(Clone, Copy, Debug)]
 pub struct SearchHit {
     pub index: u32,
@@ -359,10 +363,12 @@ impl<'a> SearchEngine<'a> {
         let initials_eligible = !pq.name_q.is_empty()
             && pq.name_q.bytes().all(|b| b.is_ascii_alphanumeric());
         let count = self.store.count();
+        // 并行度封顶 4（v0.1.6）：搜索是前台交互，全核狂奔会和索引构建
+        // 叠加抢满 CPU、拖垮整机流畅度；4 分区对当前索引规模已足够。
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(8);
+            .min(4);
         let partitions = threads.max(1);
 
         // 注意：thread::scope 的闭包参数也叫 scope，会遮蔽范围参数，先存别名

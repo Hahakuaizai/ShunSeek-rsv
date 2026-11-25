@@ -21,8 +21,8 @@ use shunseek_core::Category;
 
 /// 图标缓存上限（个 key）：一屏结果最多牵涉百来个 key，256 足够。
 const MAX_ICON_KEYS: usize = 256;
-/// 图标在行内的绘制边长（色块位是 36×36，图标 28 居中，留一圈呼吸）。
-pub const ICON_SIZE: f32 = 28.0;
+/// 图标在结果行内的绘制边长（原版行图标 24×24，占位盘 IconPlate 同尺寸）。
+pub const ICON_SIZE: f32 = 24.0;
 
 /// 一个结果行该用什么 key 取图标：
 ///  - 文件夹 / 安装目录 → "folder"（全系统共用一个通用文件夹图标）
@@ -52,6 +52,10 @@ pub struct IconCache {
     requested: HashSet<String>,
     tx: Option<Sender<String>>,
     rx: Option<Receiver<(String, Option<Pixels>)>>,
+    /// 可观测性计数（v0.1.6）：收割结果时累计，设置窗口「索引」区展示
+    /// 「图标：已加载 X · 失败 Y」，真机排障时一眼定位取图是否全灭。
+    loaded_count: usize,
+    failed_count: usize,
 }
 
 impl IconCache {
@@ -62,7 +66,15 @@ impl IconCache {
             requested: HashSet::new(),
             tx,
             rx,
+            loaded_count: 0,
+            failed_count: 0,
         }
+    }
+
+    /// 计数三元组：(已发出请求数, 已加载成功数, 已知失败数)。
+    /// 设置窗口「索引」区用它显示图标管线健康度。
+    pub fn stats(&self) -> (usize, usize, usize) {
+        (self.requested.len(), self.loaded_count, self.failed_count)
     }
 
     /// 查 key 的图标纹理：命中（含已知失败）直接返回；未命中则发请求
@@ -75,6 +87,10 @@ impl IconCache {
                 arrived.push(item);
             }
             for (k, px) in arrived {
+                match &px {
+                    Some(_) => self.loaded_count += 1,
+                    None => self.failed_count += 1,
+                }
                 let handle = px.map(|(w, h, rgba)| {
                     let img = egui::ColorImage::from_rgba_unmultiplied(
                         [w as usize, h as usize],
@@ -126,6 +142,19 @@ mod win {
         let spawned = std::thread::Builder::new()
             .name("shunseek-icons".into())
             .spawn(move || {
+                // v0.1.6：worker 线程先初始化 COM（STA）。SHGetFileInfoW 对
+                // .lnk 解析、部分图标提取走 Shell 命名空间对象，未初始化
+                // COM 时会整批无声失败——v0.1.5 真机「图标全灭」的最可疑
+                // 根因。初始化失败也不中断线程（取图本身仍可尝试）。
+                unsafe {
+                    use windows_sys::Win32::System::Com::{
+                        CoInitializeEx, COINIT_APARTMENTTHREADED,
+                    };
+                    let _ = CoInitializeEx(
+                        std::ptr::null(),
+                        COINIT_APARTMENTTHREADED as u32,
+                    );
+                }
                 while let Ok(key) = req_rx.recv() {
                     // FFI 全程已判空判错，这里再套一层 catch_unwind：
                     // 就算 Shell 那边出了意料外的状况，也只丢这一张图。
@@ -138,6 +167,9 @@ mod win {
                     }
                     ctx.request_repaint();
                 }
+                unsafe {
+                    windows_sys::Win32::System::Com::CoUninitialize();
+                }
             });
         match spawned {
             Ok(_) => (Some(req_tx), Some(res_rx)),
@@ -146,13 +178,10 @@ mod win {
     }
 
     /// 按 key 取系统图标并转成 RGBA。任何一步失败都返回 None。
+    /// v0.1.6：`path:` 类 key 首次按真实路径取失败时，再带
+    /// SHGFI_USEFILEATTRIBUTES 按文件属性重试一次（不解析 .lnk 目标、
+    /// 不落盘打开文件），至少拿到该扩展名的通用图标而不是回退色块。
     fn fetch(key: &str) -> Option<Pixels> {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::UI::Shell::{
-            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_USEFILEATTRIBUTES,
-        };
-
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
@@ -169,7 +198,25 @@ mod win {
                 (format!("file{key}"), FILE_ATTRIBUTE_NORMAL, true)
             };
 
-        let wide: Vec<u16> = OsStr::new(&path_str)
+        if let Some(px) = fetch_once(&path_str, attrs, use_attrs) {
+            return Some(px);
+        }
+        if key.starts_with("path:") && !use_attrs {
+            // 真实路径取图失败 → 按属性问法重试（通用图标兜底）
+            return fetch_once(&path_str, FILE_ATTRIBUTE_NORMAL, true);
+        }
+        None
+    }
+
+    /// 单次 SHGetFileInfoW 问图：给定路径/属性/问法，成功返回 RGBA。
+    fn fetch_once(path_str: &str, attrs: u32, use_attrs: bool) -> Option<Pixels> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::{
+            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_USEFILEATTRIBUTES,
+        };
+
+        let wide: Vec<u16> = OsStr::new(path_str)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();

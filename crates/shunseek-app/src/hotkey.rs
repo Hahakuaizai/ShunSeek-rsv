@@ -360,7 +360,9 @@ mod platform {
                         ctx.request_repaint();
                     }
                     prev_main = down;
-                    std::thread::sleep(Duration::from_millis(20));
+                    // 轮询间隔 30ms（v0.1.6 帧率纪律：只在按下边沿
+                    // request_repaint，间隔不小于 30ms，空转不唤醒 UI）
+                    std::thread::sleep(Duration::from_millis(30));
                 }
             })
             .ok();
