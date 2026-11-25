@@ -10,6 +10,9 @@
 //!  - 视觉语言（v0.1.2）：借 LeiBox 的玻璃/光束设计——搜索框光束游走
 //!    描边、分类玻璃标签栏 + 亮色磨砂胶囊、窗口顶部高光带与双层描边、
 //!    色块玻璃高光、弹窗深色玻璃；粒子/折射类重动效 egui 做不到，未移植。
+//!  - 主题（v0.1.3）：全部取色收进 Palette（深/浅两套），深色数值与
+//!    v0.1.2 逐项一致；浅色按 LeiBox 原作的浅色磨砂感另定。状态栏右侧
+//!    按钮切换，选择存数据目录 theme.txt，启动时读回。
 //!  - 单实例：C# 版用命名 Mutex；Rust 版 TODO（需要 Windows 命名互斥 FFI
 //!    或单实例 socket），当前不做，重复启动会开两个窗口。
 //!  - 全局热键：轮询实现，见 hotkey.rs；非 Windows 无全局热键。
@@ -43,6 +46,242 @@ const ROW_H: f32 = 52.0;
 const ACCENT: Color32 = Color32::from_rgb(37, 99, 235);
 /// 空索引护栏文案：数据源全灭时亮红字，让用户能原样转达给开发者。
 const ALERT_EMPTY_INDEX: &str = "索引为空（0 条）——数据源都没拿到数据，把这行字发给开发者";
+
+// ---------------------------------------------------------------- 主题
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Theme {
+    Dark,
+    Light,
+}
+
+impl Theme {
+    fn palette(self) -> Palette {
+        match self {
+            Theme::Dark => Palette::dark(),
+            Theme::Light => Palette::light(),
+        }
+    }
+
+    fn toggled(self) -> Theme {
+        match self {
+            Theme::Dark => Theme::Light,
+            Theme::Light => Theme::Dark,
+        }
+    }
+}
+
+/// 全套界面取色。v0.1.2 时这些颜色硬编码散落在各绘制函数里，v0.1.3
+/// 全部收进这里：绘制代码只从 Palette 取色，不再写字面量。
+/// Palette::dark() 的每个数值都与 v0.1.2 的硬编码逐项对齐，深色外观
+/// 零变化；Palette::light() 按 LeiBox 原作（流光描边 / 玻璃标签栏本就是
+/// 浅色设计）的浅色磨砂感另定，不是深色反色。
+/// 用构造函数而非 const：from_white_alpha 等在 egui 0.29 不是 const fn。
+#[derive(Clone, Copy)]
+struct Palette {
+    /// 窗口竖向渐变的上 / 下色。
+    grad_top: Color32,
+    grad_bottom: Color32,
+    /// 顶部玻璃高光带的峰值 alpha（纵向渐隐到 0）。
+    top_highlight_peak: u8,
+    /// 面板描边：外层（Frame stroke）/ 内层（背景层内缩 1px 手绘）。
+    panel_stroke: Color32,
+    panel_inner_stroke: Color32,
+    /// 面板投影色（offset/blur 在 update() 里固定，只换颜色）。
+    shadow_color: Color32,
+    /// 全局 Visuals 的 panel_fill / extreme_bg_color。
+    panel_fill: Color32,
+    extreme_bg: Color32,
+    /// 弹窗（「更多」菜单等）填充 / 描边 / 投影色。
+    popup_fill: Color32,
+    popup_stroke: Color32,
+    popup_shadow_color: Color32,
+    /// 搜索框填充 / 流光描边的底圈淡边。
+    search_fill: Color32,
+    search_faint: Color32,
+    /// 放大镜未聚焦色（聚焦色两主题同为 #3B82F6，见 draw_search_box）。
+    search_icon: Color32,
+    /// 输入文字色。深色取 egui 0.29 深色 Visuals 下 TextEdit 的默认
+    /// widgets.inactive 文字色 gray(180)，显式写出与不写效果一致。
+    search_text: Color32,
+    /// hint 色。None = 不指定（egui 用它自算的 weak 色）——深色保持
+    /// v0.1.2 原样；浅色给 Some(#9AA3B2)，靠带色 RichText 精确落色。
+    hint: Option<Color32>,
+    /// ESC 徽标与主题切换按钮共用的玻璃小片：填充 / 顶部高光 / 文字。
+    esc_fill: Color32,
+    esc_highlight: Color32,
+    esc_text: Color32,
+    /// 玻璃标签栏：填充 / 顶部高光 / 描边（深色无描边，TRANSPARENT）。
+    bar_fill: Color32,
+    bar_highlight: Color32,
+    bar_stroke: Color32,
+    /// chip 未选文字 RGB / 选中文字 RGB（选中态切换要按进度插值，
+    /// 所以存 RGB 三元组而不是 Color32）。
+    chip_text_rgb: (u8, u8, u8),
+    chip_sel_text_rgb: (u8, u8, u8),
+    /// 选中胶囊：白色填充的满格 alpha（按选中进度 v 缩放）。
+    chip_sel_fill_alpha: u8,
+    /// 选中胶囊脚下投影（向下 1px 黑影）的满格 alpha。
+    chip_sel_shadow_alpha: u8,
+    /// 选中胶囊顶部高光线的满格 alpha；浅色为 0（改走投影 + 描边圈）。
+    chip_sel_highlight_alpha: u8,
+    /// 选中胶囊描边圈（深色 TRANSPARENT 不画；浅色黑 alpha 10）。
+    chip_sel_ring: Color32,
+    /// 未选 chip 的 hover 填充。
+    chip_hover_fill: Color32,
+    /// 结果行 hover 填充 / 选中填充 / 选中行顶部高光线。
+    row_hover_fill: Color32,
+    row_sel_fill: Color32,
+    row_sel_highlight: Color32,
+    /// 分类色块上半部的玻璃高光 alpha。
+    tile_gloss_alpha: u8,
+    /// 名字 / 路径 / 空列表提示的文字色。
+    name_text: Color32,
+    path_text: Color32,
+    empty_text: Color32,
+    /// 名字命中段高亮色（兼下划线色）。
+    highlight: Color32,
+    /// 状态栏文字 / 右侧快捷键提示文字。
+    status_text: Color32,
+    status_hint: Color32,
+    /// 警戒态文字与圆点色（空索引护栏）。
+    alert_text: Color32,
+    /// 就绪圆点色。
+    dot_ok: Color32,
+    /// 分类胶囊文字的调色方向：false=深色做法（各通道提亮，下限 165）；
+    /// true=浅色做法（各通道压暗 ×0.62）。胶囊底两主题同为分类色 alpha 40。
+    cat_text_darken: bool,
+}
+
+impl Palette {
+    /// 分类胶囊文字色：由分类色按主题方向调出（见 cat_text_darken）。
+    fn cat_text_color(&self, r: u8, g: u8, b: u8) -> Color32 {
+        if self.cat_text_darken {
+            Color32::from_rgb(
+                (r as f32 * 0.62) as u8,
+                (g as f32 * 0.62) as u8,
+                (b as f32 * 0.62) as u8,
+            )
+        } else {
+            Color32::from_rgb(r.max(165), g.max(165), b.max(165))
+        }
+    }
+
+    /// 深色：v0.1.2 全部硬编码数值原样。
+    fn dark() -> Self {
+        Self {
+    grad_top: Color32::from_rgb(37, 42, 53), // #252A35
+    grad_bottom: Color32::from_rgb(22, 24, 29), // #16181D
+    top_highlight_peak: 26,
+    panel_stroke: Color32::from_white_alpha(22),
+    panel_inner_stroke: Color32::from_white_alpha(10),
+    shadow_color: Color32::from_black_alpha(140),
+    panel_fill: Color32::from_rgb(22, 24, 29),
+    extreme_bg: Color32::from_rgb(10, 11, 14),
+    popup_fill: Color32::from_rgba_unmultiplied(30, 34, 43, 235),
+    popup_stroke: Color32::from_white_alpha(24),
+    popup_shadow_color: Color32::from_black_alpha(120),
+    search_fill: Color32::from_white_alpha(22),
+    search_faint: Color32::from_white_alpha(26),
+    search_icon: Color32::from_rgb(139, 148, 158),
+    search_text: Color32::from_gray(180),
+    hint: None,
+    esc_fill: Color32::from_white_alpha(10),
+    esc_highlight: Color32::from_white_alpha(50),
+    esc_text: Color32::from_rgb(110, 118, 129),
+    bar_fill: Color32::from_white_alpha(14),
+    bar_highlight: Color32::from_white_alpha(60),
+    bar_stroke: Color32::TRANSPARENT,
+    chip_text_rgb: (201, 209, 217),     // #C9D1D9
+    chip_sel_text_rgb: (26, 29, 35),    // #1A1D23
+    chip_sel_fill_alpha: 225,
+    chip_sel_shadow_alpha: 80,
+    chip_sel_highlight_alpha: 200,
+    chip_sel_ring: Color32::TRANSPARENT,
+    chip_hover_fill: Color32::from_white_alpha(10),
+    row_hover_fill: Color32::from_white_alpha(8),
+    row_sel_fill: Color32::from_rgba_unmultiplied(37, 99, 235, 46),
+    row_sel_highlight: Color32::from_white_alpha(50),
+    tile_gloss_alpha: 46,
+    name_text: Color32::from_rgb(242, 242, 242),
+    path_text: Color32::from_rgb(139, 148, 158),
+    empty_text: Color32::from_rgb(154, 154, 154),
+    highlight: Color32::from_rgb(251, 191, 36), // #FBBF24
+    status_text: Color32::from_rgb(154, 154, 154),
+    status_hint: Color32::from_rgb(110, 110, 110),
+    alert_text: Color32::from_rgb(248, 113, 113), // #F87171
+    dot_ok: Color32::from_rgb(52, 211, 153),      // #34D399
+    cat_text_darken: false,
+        }
+    }
+
+    /// 浅色：LeiBox 原作的浅色磨砂感——近白渐变底、白卡片浮起、
+    /// 深字、强调蓝只出现在选中行与聚焦处。
+    fn light() -> Self {
+        Self {
+    grad_top: Color32::from_rgb(247, 248, 250), // #F7F8FA
+    grad_bottom: Color32::from_rgb(233, 236, 241), // #E9ECF1
+    top_highlight_peak: 90,
+    panel_stroke: Color32::from_white_alpha(160),
+    panel_inner_stroke: Color32::from_black_alpha(10),
+    shadow_color: Color32::from_black_alpha(70),
+    panel_fill: Color32::from_rgb(247, 248, 250),
+    extreme_bg: Color32::from_rgb(255, 255, 255),
+    popup_fill: Color32::from_rgba_unmultiplied(250, 250, 252, 242),
+    popup_stroke: Color32::from_black_alpha(12),
+    popup_shadow_color: Color32::from_black_alpha(60),
+    search_fill: Color32::from_white_alpha(190),
+    search_faint: Color32::from_black_alpha(28),
+    search_icon: Color32::from_rgb(138, 147, 163), // #8A93A3
+    search_text: Color32::from_rgb(23, 26, 33),    // #171A21
+    hint: Some(Color32::from_rgb(154, 163, 178)),  // #9AA3B2
+    esc_fill: Color32::from_black_alpha(6),
+    esc_highlight: Color32::from_white_alpha(120),
+    esc_text: Color32::from_rgb(107, 114, 128), // #6B7280
+    bar_fill: Color32::from_white_alpha(150),
+    bar_highlight: Color32::from_white_alpha(200),
+    bar_stroke: Color32::from_black_alpha(8),
+    chip_text_rgb: (74, 85, 104),      // #4A5568
+    chip_sel_text_rgb: (23, 26, 33),   // #171A21
+    chip_sel_fill_alpha: 255,
+    chip_sel_shadow_alpha: 28,
+    chip_sel_highlight_alpha: 0,
+    chip_sel_ring: Color32::from_black_alpha(10),
+    chip_hover_fill: Color32::from_black_alpha(6),
+    row_hover_fill: Color32::from_black_alpha(5),
+    row_sel_fill: Color32::from_rgba_unmultiplied(37, 99, 235, 26),
+    row_sel_highlight: Color32::from_white_alpha(160),
+    tile_gloss_alpha: 46,
+    name_text: Color32::from_rgb(23, 26, 33),
+    path_text: Color32::from_rgb(122, 132, 148), // #7A8494
+    empty_text: Color32::from_rgb(122, 132, 148),
+    highlight: Color32::from_rgb(217, 119, 6), // #D97706
+    status_text: Color32::from_rgb(122, 132, 148),
+    status_hint: Color32::from_rgb(154, 163, 178),
+    alert_text: Color32::from_rgb(220, 38, 38), // #DC2626
+    dot_ok: Color32::from_rgb(52, 211, 153),    // #34D399，浅色下仍可读
+    cat_text_darken: true,
+        }
+    }
+}
+
+/// 主题持久化：数据目录 theme.txt，内容 "light" / "dark"。
+/// 文件不存在或内容不认识都默认深色（v0.1.2 的老用户无感升级）。
+fn load_theme() -> Theme {
+    match std::fs::read_to_string(data_dir().join("theme.txt")) {
+        Ok(s) if s.trim() == "light" => Theme::Light,
+        _ => Theme::Dark,
+    }
+}
+
+/// 切换时写回；写失败忽略（下次启动回默认深色，不值得打扰用户）。
+fn save_theme(theme: Theme) {
+    let text = match theme {
+        Theme::Light => "light",
+        Theme::Dark => "dark",
+    };
+    let _ = std::fs::write(data_dir().join("theme.txt"), text);
+}
 
 // ---------------------------------------------------------------- 字体
 
@@ -250,6 +489,8 @@ enum SearchMsg {
 struct ShunSeekApp {
     query: String,
     category: Option<Category>,
+    /// 当前主题（深/浅）；全部绘制取色走 theme.palette()。
+    theme: Theme,
     rows: Vec<ResultRow>,
     selected: usize,
     status: String,
@@ -300,6 +541,7 @@ impl ShunSeekApp {
         let mut app = ShunSeekApp {
             query: String::new(),
             category: None,
+            theme: load_theme(),
             rows: Vec::new(),
             selected: 0,
             status,
@@ -734,7 +976,8 @@ fn rounded_rect_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
     pts
 }
 
-/// 【LeiBox 光束游走描边】底圈是一整圈 white alpha 26 的 1px 淡边；
+/// 【LeiBox 光束游走描边】底圈是一整圈淡边（深色 white alpha 26 /
+/// 浅色黑 alpha 28，由 faint 参数传入）；
 /// beam_phase 有值时，一束约 1/4 周长的光沿周界游走：束头最亮、向尾
 /// 按距离渐隐到 0，颜色沿段内位置走青→蓝→紫→粉彩虹带；每小段先画
 /// 一层线宽 4、alpha 约 1/3 的同色辉光，再画线宽 1.5 的亮芯。
@@ -744,13 +987,14 @@ fn paint_flow_border(
     rect: egui::Rect,
     radius: f32,
     beam_phase: Option<f32>,
+    faint_color: Color32,
 ) {
     let pts = rounded_rect_outline(rect, radius);
     if pts.len() < 2 {
         return;
     }
     // 底圈淡边
-    let faint = Stroke::new(1.0_f32, Color32::from_white_alpha(26));
+    let faint = Stroke::new(1.0_f32, faint_color);
     let n = pts.len();
     for i in 0..n {
         painter.line_segment([pts[i], pts[(i + 1) % n]], faint);
@@ -810,11 +1054,11 @@ fn paint_flow_border(
     }
 }
 
-/// 窗口顶部玻璃高光带：顶部 90px 内 white alpha 自 26 渐隐到 0，
-/// 且横向偏左上加强（每片横向分 4 段、权重 1.0→0.35 递减，模拟光从
-/// 左上打在玻璃面上；玻璃透镜的折射 egui 做不了，只取这点受光感）。
+/// 窗口顶部玻璃高光带：顶部 90px 内白色 alpha 自峰值（深色 26 / 浅色 90）
+/// 渐隐到 0，且横向偏左上加强（每片横向分 4 段、权重 1.0→0.35 递减，
+/// 模拟光从左上打在玻璃面上；玻璃透镜的折射 egui 做不了，只取这点受光感）。
 /// 纵向切片叠画，首片带上圆角，贴合面板圆角轮廓。
-fn paint_top_glass_highlight(painter: &egui::Painter, rect: egui::Rect) {
+fn paint_top_glass_highlight(painter: &egui::Painter, rect: egui::Rect, peak: u8) {
     const BAND_H: f32 = 90.0;
     const SLICES: usize = 18;
     const X_WEIGHTS: [f32; 4] = [1.0, 0.8, 0.55, 0.35];
@@ -823,7 +1067,7 @@ fn paint_top_glass_highlight(painter: &egui::Painter, rect: egui::Rect) {
     let seg_w = inner.width() / X_WEIGHTS.len() as f32;
     for i in 0..SLICES {
         let t = i as f32 / SLICES as f32;
-        let alpha = 26.0 * (1.0 - t);
+        let alpha = peak as f32 * (1.0 - t);
         if alpha < 1.0 {
             continue;
         }
@@ -900,17 +1144,18 @@ enum RowAction {
 
 impl ShunSeekApp {
     fn draw_search_box(&mut self, ui: &mut egui::Ui) {
+        let pal = self.theme.palette();
         // Frame 本身不再描边：边框由 paint_flow_border 手工画——
         // 一圈淡边 + 一束沿周界游走的彩虹光（LeiBox 光束描边）。
         // 聚焦/悬停时光束游走，未聚焦只留静态淡边（不请求重绘，省电）。
         let frame = egui::Frame::none()
-            .fill(Color32::from_white_alpha(22))
+            .fill(pal.search_fill)
             .rounding(Rounding::same(10.0))
             .inner_margin(egui::Margin::symmetric(12.0, 10.0));
         let frame_resp = frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 // 左侧放大镜：手绘圆 + 斜线两笔，不用 emoji；
-                // 聚焦时换成流光蓝 #3B82F6，未聚焦是中性灰。
+                // 聚焦时换成流光蓝 #3B82F6（两主题同值），未聚焦走 palette。
                 let (icon_rect, _) = ui.allocate_exact_size(
                     Vec2::new(22.0, 22.0),
                     egui::Sense::hover(),
@@ -920,7 +1165,7 @@ impl ShunSeekApp {
                 let icon_color = if self.search_focused {
                     Color32::from_rgb(59, 130, 246)
                 } else {
-                    Color32::from_rgb(139, 148, 158)
+                    pal.search_icon
                 };
                 let icon_stroke = Stroke::new(1.6_f32, icon_color);
                 painter.circle_stroke(c, 5.5, icon_stroke);
@@ -931,9 +1176,16 @@ impl ShunSeekApp {
                     ],
                     icon_stroke,
                 );
+                // hint：浅色带显式色（#9AA3B2）；深色不带色，
+                // 让 egui 沿用它自算的 weak 色，与 v0.1.2 逐像素一致。
+                let hint_text = match pal.hint {
+                    Some(c) => RichText::new("搜索应用、文件、文件夹…").color(c),
+                    None => RichText::new("搜索应用、文件、文件夹…"),
+                };
                 let edit = egui::TextEdit::singleline(&mut self.query)
                     .desired_width(f32::INFINITY)
-                    .hint_text("搜索应用、文件、文件夹…")
+                    .hint_text(hint_text)
+                    .text_color(pal.search_text)
                     .frame(false)
                     .font(FontId::proportional(17.0));
                 let out = edit.show(ui);
@@ -946,16 +1198,16 @@ impl ShunSeekApp {
                     self.schedule_search();
                 }
                 // 右侧 ESC 徽标（不可点，纯提示，与 WPF 版一致）：
-                // 玻璃小片——半透填充 + 顶部 1px 高光线。
+                // 玻璃小片——半透填充 + 顶部 1px 高光线，取色与主题切换按钮共用。
                 let badge = egui::Frame::none()
-                    .fill(Color32::from_white_alpha(10))
+                    .fill(pal.esc_fill)
                     .rounding(Rounding::same(4.0))
                     .inner_margin(egui::Margin::symmetric(6.0, 1.0))
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new("ESC")
                                 .size(10.0)
-                                .color(Color32::from_rgb(110, 118, 129)),
+                                .color(pal.esc_text),
                         );
                     });
                 let br = badge.response.rect;
@@ -964,7 +1216,7 @@ impl ShunSeekApp {
                         egui::pos2(br.left() + 3.0, br.top() + 0.5),
                         egui::pos2(br.right() - 3.0, br.top() + 0.5),
                     ],
-                    Stroke::new(1.0_f32, Color32::from_white_alpha(50)),
+                    Stroke::new(1.0_f32, pal.esc_highlight),
                 );
             });
         });
@@ -980,7 +1232,7 @@ impl ShunSeekApp {
         } else {
             None
         };
-        paint_flow_border(&ui.painter_at(rect), rect, 10.0, beam_phase);
+        paint_flow_border(&ui.painter_at(rect), rect, 10.0, beam_phase, pal.search_faint);
         // 只在窗口可见且处于游走态时才请求重绘驱动动画
         if animated && self.visible {
             ctx.request_repaint();
@@ -988,10 +1240,12 @@ impl ShunSeekApp {
     }
 
     fn draw_chips(&mut self, ui: &mut egui::Ui) {
-        // 【LeiBox 玻璃标签栏】整行 chips 坐一条玻璃长条上：半透浅色填充 +
-        // 圆角 16，顶部再补一条 1px 高光线，模拟玻璃上缘的受光。
+        let pal = self.theme.palette();
+        // 【LeiBox 玻璃标签栏】整行 chips 坐一条玻璃长条上：半透填充 +
+        // 圆角 16，顶部再补一条 1px 高光线，模拟玻璃上缘的受光；
+        // 浅色另有一圈极淡描边（黑 alpha 8）把白栏从浅底上勾出来。
         let bar = egui::Frame::none()
-            .fill(Color32::from_white_alpha(14))
+            .fill(pal.bar_fill)
             .rounding(Rounding::same(16.0))
             .inner_margin(egui::Margin::symmetric(10.0, 6.0));
         let bar_resp = bar.show(ui, |ui| {
@@ -1004,7 +1258,7 @@ impl ShunSeekApp {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         for &cat in CHIP_CATS {
                             let selected = self.category == cat;
-                            if glass_chip(ui, &chip_label(cat), selected).clicked() {
+                            if glass_chip(ui, pal, &chip_label(cat), selected).clicked() {
                                 self.category = cat;
                                 self.schedule_search();
                             }
@@ -1012,7 +1266,7 @@ impl ShunSeekApp {
                         // 「更多」：玻璃胶囊 + 玻璃弹窗（原版是占位按钮，这里是真筛选）
                         let more_selected =
                             MORE_CATS.iter().any(|c| Some(*c) == self.category);
-                        let more_resp = glass_chip(ui, "更多 ▾", more_selected);
+                        let more_resp = glass_chip(ui, pal, "更多 ▾", more_selected);
                         let popup_id = ui.make_persistent_id("more_cats_popup");
                         let mut picked: Option<Category> = None;
                         egui::containers::popup::popup_below_widget(
@@ -1045,12 +1299,21 @@ impl ShunSeekApp {
                 egui::pos2(br.left() + 16.0, br.top() + 0.5),
                 egui::pos2(br.right() - 16.0, br.top() + 0.5),
             ],
-            Stroke::new(1.0_f32, Color32::from_white_alpha(60)),
+            Stroke::new(1.0_f32, pal.bar_highlight),
         );
+        // 玻璃栏描边（只有浅色有，深色 TRANSPARENT 跳过，保持原样）
+        if pal.bar_stroke.a() > 0 {
+            ui.painter().rect_stroke(
+                br,
+                Rounding::same(16.0),
+                Stroke::new(1.0_f32, pal.bar_stroke),
+            );
+        }
     }
 
     fn draw_results(&mut self, ui: &mut egui::Ui) {
         if self.rows.is_empty() {
+            let pal = self.theme.palette();
             ui.centered_and_justified(|ui| {
                 ui.label(
                     RichText::new(if self.query.trim().is_empty() {
@@ -1059,7 +1322,7 @@ impl ShunSeekApp {
                         "没有找到结果"
                     })
                     .size(13.0)
-                    .color(Color32::from_rgb(154, 154, 154)),
+                    .color(pal.empty_text),
                 );
             });
             return;
@@ -1091,6 +1354,7 @@ impl ShunSeekApp {
     /// 手绘一行：分类色块 + 首字 / 名字（命中段高亮）/ 路径 / 分类胶囊。
     /// 手绘而不用子控件拼装，是为了 show_rows 虚拟化下每行开销恒定。
     fn draw_row(&self, ui: &mut egui::Ui, idx: usize) -> Option<RowAction> {
+        let pal = self.theme.palette();
         let row = self.rows.get(idx)?.clone();
         let (rect, response) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), ROW_H),
@@ -1102,9 +1366,9 @@ impl ShunSeekApp {
             painter.rect_filled(
                 rect,
                 Rounding::same(8.0),
-                Color32::from_rgba_unmultiplied(37, 99, 235, 46),
+                pal.row_sel_fill,
             );
-            // 左侧 3px 强调蓝竖条（内缩，带圆角）
+            // 左侧 3px 强调蓝竖条（内缩，带圆角；#2563EB 两主题同值）
             let bar = egui::Rect::from_min_size(
                 rect.min + Vec2::new(1.0, 10.0),
                 Vec2::new(3.0, ROW_H - 20.0),
@@ -1116,10 +1380,10 @@ impl ShunSeekApp {
                     egui::pos2(rect.left() + 8.0, rect.top() + 0.5),
                     egui::pos2(rect.right() - 8.0, rect.top() + 0.5),
                 ],
-                Stroke::new(1.0_f32, Color32::from_white_alpha(50)),
+                Stroke::new(1.0_f32, pal.row_sel_highlight),
             );
         } else if response.hovered() {
-            painter.rect_filled(rect, Rounding::same(8.0), Color32::from_white_alpha(8));
+            painter.rect_filled(rect, Rounding::same(8.0), pal.row_hover_fill);
         }
 
         // 分类色块 36×36 + display_name 首字
@@ -1142,7 +1406,7 @@ impl ShunSeekApp {
                 sw: 0.0,
                 se: 0.0,
             },
-            Color32::from_white_alpha(46),
+            Color32::from_white_alpha(pal.tile_gloss_alpha),
         );
         let tile_char = row
             .category
@@ -1159,11 +1423,12 @@ impl ShunSeekApp {
             Color32::WHITE,
         );
 
-        // 右侧分类胶囊：分类色低透明底（alpha 40）+ 同色提亮文字，先量宽，
+        // 右侧分类胶囊：分类色低透明底（alpha 40）+ 分类色调出的文字
+        // （深色提亮 / 浅色压暗，见 Palette::cat_text_color），先量宽，
         // 名字区域要给它让位
         let cat_name = row.category.display_name();
         let cat_font = FontId::proportional(10.5);
-        let cat_text_color = Color32::from_rgb(r.max(165), g.max(165), b.max(165));
+        let cat_text_color = pal.cat_text_color(r, g, b);
         let cat_galley = painter.layout_no_wrap(
             cat_name.to_string(),
             cat_font.clone(),
@@ -1218,7 +1483,7 @@ impl ShunSeekApp {
         };
         let base_fmt = TextFormat {
             font_id: name_font,
-            color: Color32::from_rgb(242, 242, 242),
+            color: pal.name_text,
             ..Default::default()
         };
         match hl {
@@ -1229,8 +1494,8 @@ impl ShunSeekApp {
                     0.0,
                     TextFormat {
                         font_id: FontId::proportional(14.0),
-                        color: Color32::from_rgb(251, 191, 36),
-                        underline: Stroke::new(1.0_f32, Color32::from_rgb(251, 191, 36)),
+                        color: pal.highlight,
+                        underline: Stroke::new(1.0_f32, pal.highlight),
                         ..Default::default()
                     },
                 );
@@ -1245,12 +1510,12 @@ impl ShunSeekApp {
         let path_galley = painter.layout_no_wrap(
             row.path.clone(),
             FontId::proportional(11.5),
-            Color32::from_rgb(139, 148, 158),
+            pal.path_text,
         );
         painter.galley(
             egui::pos2(text_x, rect.top() + 30.0),
             path_galley,
-            Color32::from_rgb(139, 148, 158),
+            pal.path_text,
         );
 
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1263,52 +1528,97 @@ impl ShunSeekApp {
         }
     }
 
-    fn draw_status_bar(&self, ui: &mut egui::Ui) {
+    fn draw_status_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = self.theme.palette();
         ui.horizontal(|ui| {
             // 左侧状态圆点：就绪绿 / 警戒红（空索引护栏）
             let (dot_rect, _) =
                 ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
             let dot_color = if self.status_alert {
-                Color32::from_rgb(248, 113, 113) // #F87171
+                pal.alert_text
             } else {
-                Color32::from_rgb(52, 211, 153) // #34D399
+                pal.dot_ok
             };
             ui.painter_at(dot_rect)
                 .circle_filled(dot_rect.center(), 3.0, dot_color);
             let text_color = if self.status_alert {
-                Color32::from_rgb(248, 113, 113)
+                pal.alert_text
             } else {
-                Color32::from_rgb(154, 154, 154)
+                pal.status_text
             };
             ui.label(RichText::new(&self.status).size(11.0).color(text_color));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
                     RichText::new("↑↓ 选择 · Enter 打开 · Ctrl+Enter 打开所在文件夹")
                         .size(11.0)
-                        .color(Color32::from_rgb(110, 110, 110)),
+                        .color(pal.status_hint),
                 );
+                // 主题切换按钮：坐在快捷键提示左侧（RTL 布局里后加的更靠左），
+                // 玻璃小片样式与 ESC 徽标同款；点下立即换 visuals 并写回 theme.txt。
+                ui.add_space(10.0);
+                let label = match self.theme {
+                    Theme::Dark => "浅色模式",
+                    Theme::Light => "深色模式",
+                };
+                if theme_toggle_button(ui, pal, label).clicked() {
+                    self.theme = self.theme.toggled();
+                    save_theme(self.theme);
+                    install_visuals(ui.ctx(), self.theme);
+                }
             });
         });
     }
 }
 
-/// 【LeiBox 亮色磨砂胶囊】手绘分类 chip：原作玻璃标签栏是浅色磨砂栏 +
-/// 选中项背后一块白色高亮胶囊，深色主题照此办理——
-/// 选中 = 近白色磨砂填充（white alpha 225）+ 深色字 #1A1D23 + 顶部高光线 +
-/// 脚下一点柔和投影；未选中 = 透明底、#C9D1D9 字，hover 垫 white alpha 10。
+/// 状态栏的主题切换小按钮：与 ESC 徽标共用玻璃小片取色
+/// （pal.esc_fill / esc_highlight / esc_text），11px 文字。
+fn theme_toggle_button(ui: &mut egui::Ui, pal: Palette, label: &str) -> egui::Response {
+    let font = FontId::proportional(11.0);
+    let galley =
+        ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, pal.esc_text));
+    let size = Vec2::new(galley.size().x + 12.0, galley.size().y + 4.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, Rounding::same(4.0), pal.esc_fill);
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + 3.0, rect.top() + 0.5),
+            egui::pos2(rect.right() - 3.0, rect.top() + 0.5),
+        ],
+        Stroke::new(1.0_f32, pal.esc_highlight),
+    );
+    painter.galley(
+        egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        pal.esc_text,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 【LeiBox 磨砂胶囊】手绘分类 chip：原作玻璃标签栏的选中项背后有一块
+/// 高亮胶囊，两主题同构、只是取色不同——
+/// 深色：近白色磨砂填充（white alpha 225）+ 深色字 #1A1D23 + 顶部高光线 +
+/// 脚下一点柔和投影；浅色：纯白填充 + 深色字 #171A21 + 更淡的投影 +
+/// 一圈极淡描边（顶部高光在纯白上看不见，故略去），是原作的白卡片浮起感。
+/// 未选中 = 透明底、palette 文字色，hover 垫一层淡填充。
 /// 选中态切换用 animate_bool_with_time 做 0.18 秒交叉淡入（填充与字色同步
 /// 插值）：原作的滑动指标要先量齐所有 chip 的位置再回绘一层，隔着
 /// ScrollArea 的裁剪层做起来绕，按简报许可在此降级为淡入，不做滑动。
-fn glass_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+fn glass_chip(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> egui::Response {
     let font = FontId::proportional(12.5);
     // 选中进度 v：0=未选中，1=完全选中，切换时平滑过渡
     let v = ui
         .ctx()
         .animate_bool_with_time(ui.make_persistent_id(("glass_chip_sel", label)), selected, 0.18);
+    let (tr, tg, tb) = pal.chip_text_rgb;
+    let (sr, sg, sb) = pal.chip_sel_text_rgb;
     let text_color = Color32::from_rgb(
-        lerp_u8(201, 26, v),
-        lerp_u8(209, 29, v),
-        lerp_u8(217, 35, v),
+        lerp_u8(tr, sr, v),
+        lerp_u8(tg, sg, v),
+        lerp_u8(tb, sb, v),
     );
     let galley = ui
         .fonts(|f| f.layout_no_wrap(label.to_string(), font.clone(), text_color));
@@ -1321,24 +1631,37 @@ fn glass_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response 
         painter.rect_filled(
             rect.translate(Vec2::new(0.0, 1.0)),
             rounding,
-            Color32::from_black_alpha((80.0 * v) as u8),
+            Color32::from_black_alpha((pal.chip_sel_shadow_alpha as f32 * v) as u8),
         );
-        // 近白色磨砂填充
+        // 磨砂白填充
         painter.rect_filled(
             rect,
             rounding,
-            Color32::from_white_alpha((225.0 * v) as u8),
+            Color32::from_white_alpha((pal.chip_sel_fill_alpha as f32 * v) as u8),
         );
-        // 顶部高光线
-        painter.line_segment(
-            [
-                egui::pos2(rect.left() + 10.0, rect.top() + 0.5),
-                egui::pos2(rect.right() - 10.0, rect.top() + 0.5),
-            ],
-            Stroke::new(1.0_f32, Color32::from_white_alpha((200.0 * v) as u8)),
-        );
+        // 描边圈（只有浅色，深色 TRANSPARENT 跳过）
+        if pal.chip_sel_ring.a() > 0 {
+            painter.rect_stroke(
+                rect,
+                rounding,
+                Stroke::new(1.0_f32, pal.chip_sel_ring.gamma_multiply(v)),
+            );
+        }
+        // 顶部高光线（浅色 alpha 为 0，自动不画）
+        if pal.chip_sel_highlight_alpha > 0 {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 10.0, rect.top() + 0.5),
+                    egui::pos2(rect.right() - 10.0, rect.top() + 0.5),
+                ],
+                Stroke::new(
+                    1.0_f32,
+                    Color32::from_white_alpha((pal.chip_sel_highlight_alpha as f32 * v) as u8),
+                ),
+            );
+        }
     } else if response.hovered() {
-        painter.rect_filled(rect, rounding, Color32::from_white_alpha(10));
+        painter.rect_filled(rect, rounding, pal.chip_hover_fill);
     }
     painter.galley(
         egui::pos2(
@@ -1377,34 +1700,36 @@ impl eframe::App for ShunSeekApp {
             self.handle_keys(ctx);
         }
 
-        // 悬浮窗背景：手工竖向渐变（上 #252A35 → 下 #16181D）画在背景层，
-        // 面板本身透明，靠 Frame 的投影 + 淡描边撑出 Fluent 悬浮感。
+        // 悬浮窗背景：手工竖向渐变（深色 #252A35→#16181D / 浅色
+        // #F7F8FA→#E9ECF1）画在背景层，面板本身透明，靠 Frame 的
+        // 投影 + 淡描边撑出 Fluent 悬浮感。取色全走 palette。
+        let pal = self.theme.palette();
         let bg_painter = ctx.layer_painter(egui::LayerId::background());
         let screen = ctx.screen_rect();
         paint_vertical_gradient(
             &bg_painter,
             screen,
             12.0,
-            Color32::from_rgb(37, 42, 53),
-            Color32::from_rgb(22, 24, 29),
+            pal.grad_top,
+            pal.grad_bottom,
         );
-        // 玻璃/冰霜质感：顶部 90px 高光带（alpha 26→0）+ 内层描边，
+        // 玻璃/冰霜质感：顶部 90px 高光带（峰值 alpha 走 palette）+ 内层描边，
         // 与面板 Frame 的外层描边组成双层玻璃边缘。
-        paint_top_glass_highlight(&bg_painter, screen);
+        paint_top_glass_highlight(&bg_painter, screen, pal.top_highlight_peak);
         bg_painter.rect_stroke(
             screen.shrink(1.0),
             Rounding::same(11.0),
-            Stroke::new(1.0_f32, Color32::from_white_alpha(10)),
+            Stroke::new(1.0_f32, pal.panel_inner_stroke),
         );
         let panel_frame = egui::Frame::central_panel(&ctx.style())
             .fill(Color32::TRANSPARENT)
             .rounding(Rounding::same(12.0))
-            .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(22)))
+            .stroke(Stroke::new(1.0_f32, pal.panel_stroke))
             .shadow(egui::epaint::Shadow {
                 offset: Vec2::new(0.0, 8.0),
                 blur: 24.0,
                 spread: 0.0,
-                color: Color32::from_black_alpha(140),
+                color: pal.shadow_color,
             })
             .inner_margin(egui::Margin::symmetric(14.0, 10.0));
         egui::CentralPanel::default()
@@ -1427,23 +1752,29 @@ impl eframe::App for ShunSeekApp {
     }
 }
 
-/// 全局 Visuals 微调：控件圆角统一 8、选中态强调蓝半透明、
-/// extreme 底色更深，往 DeskBox/WPF 深色 Fluent 的精致感靠。
-fn install_visuals(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(22, 24, 29);
-    // 弹窗（「更多」菜单等）走深色玻璃：#1E222B、alpha 235 微透，
-    // 描边淡白、圆角 10（LeiBox 玻璃语言在系统弹窗上的落点）。
-    visuals.window_fill = Color32::from_rgba_unmultiplied(30, 34, 43, 235);
-    visuals.window_stroke = Stroke::new(1.0_f32, Color32::from_white_alpha(24));
-    visuals.window_rounding = Rounding::same(10.0);
+/// 全局 Visuals 微调：以主题对应的 egui 基础 Visuals（dark/light）打底，
+/// 再套本应用的参数——控件圆角统一 8、选中态强调蓝半透明、弹窗走玻璃
+/// （填充/描边/投影取 palette）。启动时按 theme.txt 调一次，切换主题时
+/// 由状态栏按钮再调。注意深色下 window_rounding 的有效值是 8：
+/// v0.1.2 的 install_visuals 先写 10 又被后面的统一圆角覆盖回 8，
+/// 这里保留这个实际效果，不动深色观感；浅色按新规用 10。
+fn install_visuals(ctx: &egui::Context, theme: Theme) {
+    let pal = theme.palette();
+    let mut visuals = match theme {
+        Theme::Dark => egui::Visuals::dark(),
+        Theme::Light => egui::Visuals::light(),
+    };
+    visuals.panel_fill = pal.panel_fill;
+    // 弹窗（「更多」菜单等）走玻璃：微透填充 + 淡描边 + 柔和投影。
+    visuals.window_fill = pal.popup_fill;
+    visuals.window_stroke = Stroke::new(1.0_f32, pal.popup_stroke);
     visuals.popup_shadow = egui::epaint::Shadow {
         offset: Vec2::new(0.0, 4.0),
         blur: 16.0,
         spread: 0.0,
-        color: Color32::from_black_alpha(120),
+        color: pal.popup_shadow_color,
     };
-    visuals.extreme_bg_color = Color32::from_rgb(10, 11, 14);
+    visuals.extreme_bg_color = pal.extreme_bg;
     visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(37, 99, 235, 120);
     visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     let r = Rounding::same(8.0);
@@ -1452,7 +1783,10 @@ fn install_visuals(ctx: &egui::Context) {
     visuals.widgets.hovered.rounding = r;
     visuals.widgets.active.rounding = r;
     visuals.widgets.open.rounding = r;
-    visuals.window_rounding = r;
+    visuals.window_rounding = match theme {
+        Theme::Dark => Rounding::same(8.0),
+        Theme::Light => Rounding::same(10.0),
+    };
     ctx.set_visuals(visuals);
 }
 
@@ -1475,7 +1809,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             install_cjk_font(&cc.egui_ctx);
-            install_visuals(&cc.egui_ctx);
+            install_visuals(&cc.egui_ctx, load_theme());
             Ok(Box::new(ShunSeekApp::new(cc)))
         }),
     )
