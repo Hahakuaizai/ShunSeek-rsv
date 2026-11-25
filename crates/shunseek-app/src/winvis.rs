@@ -129,7 +129,8 @@ mod platform {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowPlacement,
-        IsIconic, IsZoomed, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+        GetWindowRect, IsIconic, IsZoomed, SetForegroundWindow, SetWindowLongPtrW,
+        SetWindowPos,
         ShowWindow, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
         SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_MAXIMIZE, SW_MINIMIZE,
         SW_RESTORE, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
@@ -137,7 +138,7 @@ mod platform {
     };
 
     /// 离屏坐标：远在任何多显示器布局之外（Win32 惯例值）。
-    const OFFSCREEN: i32 = -32000;
+    const OFFSCREEN_COORD: i32 = -32000;
 
     /// SW_SHOW 的裸值（windows-sys 的常量名在不同版本间变过，
     /// 直接用数值最稳：5 = SW_SHOW）。
@@ -285,8 +286,8 @@ mod platform {
             SetWindowPos(
                 h,
                 0,
-                OFFSCREEN,
-                OFFSCREEN,
+                OFFSCREEN_COORD,
+                OFFSCREEN_COORD,
                 0,
                 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
