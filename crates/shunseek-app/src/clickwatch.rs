@@ -24,6 +24,10 @@
 //!    armed 发成 false——宁可不藏，不可乱藏。
 //!  - 托盘菜单打开期间由 tray.rs 调 set_suspended(true) 挂起：
 //!    菜单本身在两个窗口矩形之外，点菜单条目不该顺带把主窗藏掉。
+//!  - 托盘图标矩形是第三个豁免区（v0.1.11）：点托盘图标本身
+//!    （左键 Toggle、右键开菜单）永远不算「点外」——否则图标
+//!    点击攒下的点外标志会在同一帧反杀托盘的显式呼出（真机
+//!    实测：托盘只有「退出」起作用，「打开」永远打不开）。
 //!
 //! 非 Windows：无钩子（演示环境），接口同形、恒无事件。
 
@@ -81,6 +85,8 @@ struct Shared {
     suspended: AtomicBool,
     main_rect: RectSlot,
     sub_rect: RectSlot,
+    /// 托盘图标矩形（v0.1.11 第三个豁免区，见模块头）。
+    tray_rect: RectSlot,
     outside_pending: AtomicBool,
 }
 
@@ -112,6 +118,7 @@ impl ClickWatch {
             suspended: AtomicBool::new(false),
             main_rect: RectSlot::new(),
             sub_rect: RectSlot::new(),
+            tray_rect: RectSlot::new(),
             outside_pending: AtomicBool::new(false),
         });
         // 只建一次：重复 start 直接复用既有共享（钩子线程不重开）
@@ -125,17 +132,21 @@ impl ClickWatch {
         ClickWatch { shared }
     }
 
-    /// UI 每帧发布：主窗口 / 设置窗口矩形（物理像素）+ 是否武装。
-    /// main 为 None（outer_rect 取不到）时强制不武装——判定失去
-    /// 依据就整体停用，绝不凭空藏窗口。
+    /// UI 每帧发布：主窗口 / 设置窗口 / 托盘图标矩形（物理像素）
+    /// + 是否武装。main 为 None（outer_rect 取不到）时强制不武装
+    /// ——判定失去依据就整体停用，绝不凭空藏窗口。tray 为 None
+    /// （图标矩形取不到，如图标暂未建成）时该豁免区自动失效，
+    /// 呼出链还有 update() 侧的 drain 兜底（见模块头）。
     pub fn publish(
         &self,
         main: Option<[i32; 4]>,
         sub: Option<[i32; 4]>,
+        tray: Option<[i32; 4]>,
         armed: bool,
     ) {
         self.shared.main_rect.publish(main);
         self.shared.sub_rect.publish(sub);
+        self.shared.tray_rect.publish(tray);
         self.shared
             .armed
             .store(armed && main.is_some(), Ordering::SeqCst);
@@ -160,7 +171,9 @@ fn is_outside(sh: &Shared, x: i32, y: i32) -> bool {
     if !sh.armed.load(Ordering::SeqCst) || sh.suspended.load(Ordering::SeqCst) {
         return false;
     }
-    !sh.main_rect.contains(x, y) && !sh.sub_rect.contains(x, y)
+    !sh.main_rect.contains(x, y)
+        && !sh.sub_rect.contains(x, y)
+        && !sh.tray_rect.contains(x, y)
 }
 
 #[cfg(windows)]
@@ -241,6 +254,7 @@ mod tests {
             suspended: AtomicBool::new(false),
             main_rect: RectSlot::new(),
             sub_rect: RectSlot::new(),
+            tray_rect: RectSlot::new(),
             outside_pending: AtomicBool::new(false),
         }
     }
@@ -260,6 +274,10 @@ mod tests {
         sh.sub_rect.publish(Some([600, 100, 900, 500]));
         assert!(!is_outside(&sh, 700, 300));
         assert!(is_outside(&sh, 950, 300));
+        // 托盘图标矩形内永不算点外（v0.1.11 豁免）
+        sh.tray_rect.publish(Some([1000, 740, 1024, 764]));
+        assert!(!is_outside(&sh, 1010, 750));
+        assert!(is_outside(&sh, 1030, 750));
         // 挂起（托盘菜单）时永不算点外
         sh.suspended.store(true, Ordering::SeqCst);
         assert!(!is_outside(&sh, 950, 300));

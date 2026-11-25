@@ -1875,9 +1875,6 @@ struct ShunSeekApp {
     /// 最近一次点外隐藏发生的时刻：点托盘图标本身也是一次
     /// 「点外」——钩子先 hide()，托盘 Toggle 紧接着投递到，
     /// 若 Toggle 再 show() 就成了同一次点击先藏后显的抖动。
-    /// toggle() 里 300ms 内刚点外隐藏过则视为同一次点击，
-    /// 不翻转（点托盘图标 = 收起，与原版托盘行为一致）。
-    outside_hide_at: Option<Instant>,
     /// 手判拖动/拉伸的控件矩形集：每帧绘制时把所有交互控件的
     /// rect 推进 _cur，帧末轮换为 _prev；下一帧按下判定读
     /// _prev——按下点落在任一控件上 → 绝不 StartDrag，微位移
@@ -2101,7 +2098,6 @@ impl ShunSeekApp {
             home_add_open: false,
             minimized: false,
             clickwatch: clickwatch::ClickWatch::start(cc.egui_ctx.clone()),
-            outside_hide_at: None,
             blockers_prev: Vec::new(),
             blockers_cur: Vec::new(),
             pending_drag: None,
@@ -2343,21 +2339,15 @@ impl ShunSeekApp {
         if self.visible && !self.minimized {
             self.hide(ctx);
         } else {
-            // 刚被点外隐藏（<300ms）又收到 Toggle：多半是同一次
-            // 托盘图标点击的双路触发（钩子先藏、Toggle 后到），
-            // 忽略这次，免得窗口藏好又弹出来。用户再点一次即可
-            // 正常呼出。
-            if let Some(t) = self.outside_hide_at {
-                if t.elapsed() < Duration::from_millis(300) {
-                    self.outside_hide_at = None;
-                    return;
-                }
-            }
+            // v0.1.11：旧版这里有 300ms 守卫（防同一次托盘点击
+            // 双路触发），其前提是图标点击会被钩子记成点外；
+            // 图标矩形豁免后该前提已消失，守卫只会误吃用户
+            // 「点外隐藏后立刻点托盘」的正当呼出，一并拆除。
             self.show(ctx);
         }
     }
 
-    /// 把主窗/设置窗的矩形（物理像素）发布给点外钩子（clickwatch）。
+    /// 把主窗/设置窗/托盘图标的矩形（物理像素）发布给点外钩子（clickwatch）。
     /// egui 的 outer_rect 是监控器空间的逻辑点，钩子拿到的是
     /// MSLLHOOKSTRUCT 的物理像素，必须乘 native_pixels_per_point
     /// 对齐。取不到主窗矩形 → publish 内部强制不武装。
@@ -2379,7 +2369,10 @@ impl ShunSeekApp {
         } else {
             None
         };
-        self.clickwatch.publish(main, sub, self.visible);
+        // 托盘图标矩形（v0.1.11 第三个豁免区）：现查现发，图标
+        // 位置随任务栏变化，不缓存；查不到 → None 自动失效。
+        let tray = self.tray.icon_rect();
+        self.clickwatch.publish(main, sub, tray, self.visible);
     }
 
     /// 主题交叉淡入推进（170ms）：display_pal 从旧板向目标板
@@ -6865,6 +6858,28 @@ impl eframe::App for ShunSeekApp {
         // 绘制中刚把面板打开，帧末若拿同一个 press 再判点外，
         // 会把刚开的面板当场关掉（回归实测：面板永远打不开）。
         let expanded_at_frame_start = self.expanded_filter;
+        // 全局点外隐藏（v0.1.10，原版 GlobalClickWatcher 机制；
+        // v0.1.11 起判定块前置到本帧最前）：先把本帧的窗口矩形
+        // （物理像素）发布给钩子线程，再消费它报上来的点外事件。
+        // 判定纯几何：点在主窗/设置窗/托盘图标矩形之外才藏，窗
+        // 内点击与焦点事件一概不参与——v0.1.6 起的失焦隐藏整套
+        // 已拆除（见 clickwatch 模块头）。
+        // 为什么必须排在托盘/热键之前（v0.1.11 真机战争）：旧
+        // 顺序托盘先行——Show 刚 show() 出窗口，排在后面的
+        // take_outside() 又拿托盘图标点击攒下的陈旧点外标志把
+        // 窗口当帧藏回，隐藏永远赢，托盘「打开」永远打不开。
+        // 前置后本帧先按当前可见性裁决点外（可见才藏、隐藏只
+        // 清账），随后的显式呼出（单实例唤醒/热键/托盘）再各
+        // 自 drain 兜底：陈旧标志不许活过一次显式呼出。
+        self.publish_click_bounds(ctx);
+        if self.visible {
+            if self.clickwatch.take_outside() {
+                self.hide(ctx);
+            }
+        } else {
+            // 隐藏期间攒下的点外标志直接丢弃，别坑下一次呼出
+            self.clickwatch.drain();
+        }
         // --tray 静默启动（v0.1.8）：首帧把窗口藏进托盘（窗口是
         // 先建成再隐藏的，ViewportBuilder 没有初始不可见选项）
         if START_HIDDEN.swap(false, Ordering::SeqCst) {
@@ -6874,14 +6889,23 @@ impl eframe::App for ShunSeekApp {
         // WAKE_FLAG 并 request_repaint，这里把已有窗口呼出来
         if WAKE_FLAG.swap(false, Ordering::SeqCst) {
             self.show(ctx);
+            // 显式呼出后清账（v0.1.11，同托盘/热键口径）
+            self.clickwatch.drain();
         }
         // 热键 / 托盘（都要在窗口隐藏时也能响应，靠各自线程 request_repaint 唤醒）
         if self.hotkey.take_fired() {
             self.toggle(ctx);
+            // 热键呼出后清账（v0.1.11）：钩子可能在本帧判定块
+            // 之后才投递点外标志，drain 保证它坑不到这次呼出
+            self.clickwatch.drain();
         }
         while let Some(action) = self.tray.poll() {
             match action {
-                tray::TrayAction::Toggle => self.toggle(ctx),
+                tray::TrayAction::Toggle => {
+                    self.toggle(ctx);
+                    // 同上：Toggle 呼出后不许陈旧点外标志反杀
+                    self.clickwatch.drain();
+                }
                 tray::TrayAction::Show => {
                     // 无条件走 show() 的三件套（v0.1.10 复查结论）：
                     // 旧分支「visible && !minimized 时只发 Focus」
@@ -6893,6 +6917,11 @@ impl eframe::App for ShunSeekApp {
                     // 对已可见窗口是无害空操作，Minimized(false) 对
                     // 未最小化窗口同理，所以不再分支，一律全发。
                     self.show(ctx);
+                    // 显式呼出后立即清账（v0.1.11）：右键菜单打开
+                    // 期间钩子虽被挂起，点图标那一下（挂起生效前）
+                    // 仍可能留下陈旧点外标志——不 drain 的话它会
+                    // 在下一帧把刚呼出的窗口又藏回去。
+                    self.clickwatch.drain();
                 }
                 tray::TrayAction::RebuildIndex => self.start_rebuild(),
                 tray::TrayAction::RefreshIndex => {
@@ -6909,6 +6938,8 @@ impl eframe::App for ShunSeekApp {
                         self.show(ctx);
                     }
                     self.open_settings();
+                    // 显式呼出后清账（v0.1.11，同 Show 口径）
+                    self.clickwatch.drain();
                 }
                 tray::TrayAction::About => {
                     if !self.visible || self.minimized {
@@ -6916,6 +6947,8 @@ impl eframe::App for ShunSeekApp {
                     }
                     // 版本信息临时显示在状态栏（下一次搜索完成会覆盖）
                     self.status = about_text();
+                    // 显式呼出后清账（v0.1.11，同 Show 口径）
+                    self.clickwatch.drain();
                 }
                 tray::TrayAction::AdminRestart => {
                     // 以管理员身份重启（v0.1.9）：runas 拉起同一
@@ -6957,21 +6990,8 @@ impl eframe::App for ShunSeekApp {
             self.minimized = m;
         }
 
-        // 全局点外隐藏（v0.1.10，原版 GlobalClickWatcher 机制）：
-        // 先把本帧的窗口矩形（物理像素）发布给钩子线程，再消费
-        // 它报上来的点外事件。判定纯几何：点在主窗/设置窗矩形
-        // 之外才藏，窗内点击与焦点事件一概不参与——v0.1.6 起的
-        // 失焦隐藏整套已拆除（见 clickwatch 模块头）。
-        self.publish_click_bounds(ctx);
-        if self.visible {
-            if self.clickwatch.take_outside() {
-                self.outside_hide_at = Some(Instant::now());
-                self.hide(ctx);
-            }
-        } else {
-            // 隐藏期间攒下的点外标志直接丢弃，别坑下一次呼出
-            self.clickwatch.drain();
-        }
+        // （点外判定块已前置到本帧最前，见 update() 开头——
+        // 必须排在托盘/热键呼出之前，v0.1.11。）
 
         self.poll_channels(ctx);
         if self.visible {

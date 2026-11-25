@@ -100,6 +100,21 @@ impl Tray {
         }
     }
 
+    /// 托盘图标的屏幕矩形（物理像素 [l, t, r, b]），供点外钩子
+    /// 做第三豁免区（v0.1.11）：点托盘图标永远不算「点外」。
+    /// 图标未建成 / 系统查不到（图标暂不可见等）→ None，该帧
+    /// 不豁免（呼出链另有 drain 兜底，见 clickwatch 模块头）。
+    pub fn icon_rect(&self) -> Option<[i32; 4]> {
+        #[cfg(windows)]
+        {
+            self.inner.as_ref().and_then(|inner| inner.icon_rect())
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
     /// 重建进行中：菜单项置灰 + 文案换成「正在建立索引…」，完成恢复。
     /// 只写共享原子量；菜单下次打开时读取，无需跨线程同步句柄。
     pub fn set_rebuild_enabled(&mut self, enabled: bool) {
@@ -204,6 +219,36 @@ mod win {
             match spawned {
                 Ok(_) => Some(WinTray { hwnd, rebuilding }),
                 Err(_) => None,
+            }
+        }
+
+        /// Shell_NotifyIconGetRect 按 (hWnd, uID=1) 查图标当前
+        /// 屏幕矩形——图标被拖动/任务栏重排后位置会变，故每帧
+        /// 现查现用，不缓存。API 允许任意线程调用（按标识符查，
+        /// 不依赖托盘线程）。失败（S_OK 以外）一律 None。
+        pub fn icon_rect(&self) -> Option<[i32; 4]> {
+            use windows_sys::Win32::Foundation::RECT;
+            use windows_sys::Win32::UI::Shell::{
+                Shell_NotifyIconGetRect, NOTIFYICONIDENTIFIER,
+            };
+            let hwnd = self.hwnd.load(Ordering::SeqCst);
+            if hwnd == 0 {
+                return None;
+            }
+            unsafe {
+                let mut id: NOTIFYICONIDENTIFIER = std::mem::zeroed();
+                id.cbSize = std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32;
+                id.hWnd = hwnd;
+                id.uID = 1;
+                let mut rc: RECT = std::mem::zeroed();
+                if Shell_NotifyIconGetRect(&id, &mut rc) == 0
+                    && rc.right > rc.left
+                    && rc.bottom > rc.top
+                {
+                    Some([rc.left, rc.top, rc.right, rc.bottom])
+                } else {
+                    None
+                }
             }
         }
 
