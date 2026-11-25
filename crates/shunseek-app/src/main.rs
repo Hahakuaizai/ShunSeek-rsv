@@ -825,52 +825,31 @@ fn paint_vertical_gradient(
             lerp_u8(top.b(), bottom.b(), t),
         )
     };
-    // 圆角轮廓点（顺时针，从右上弧开始，每 15° 一个点）
-    let mut outline: Vec<egui::Pos2> = Vec::new();
-    let corners: [(f32, f32, f32, f32); 4] = [
-        // (圆心 x, 圆心 y, 起始角°, 终止角°)
-        (rect.right() - radius, rect.top() + radius, -90.0, 0.0),
-        (rect.right() - radius, rect.bottom() - radius, 0.0, 90.0),
-        (rect.left() + radius, rect.bottom() - radius, 90.0, 180.0),
-        (rect.left() + radius, rect.top() + radius, 180.0, 270.0),
-    ];
-    for (cx, cy, a0, a1) in corners {
-        let mut a = a0;
-        while a < a1 {
-            let rad = a.to_radians();
-            outline.push(egui::pos2(
-                cx + radius * rad.cos(),
-                cy + radius * rad.sin(),
-            ));
-            a += 15.0;
+    // 用一摞水平色带（rect_filled）拼渐变，不用 Mesh：v0.1.3 的 Mesh 顶点色
+    // 在部分渲染栈上会被压暗（实测浅色底被压成灰 #ADADB2，而同期 rect_filled
+    // 的色块分毫不差），色带路径与普通形状同管线，颜色在哪都准。
+    // 每条带按其 y 在圆角轮廓内的横向跨度收边，圆角不缺角也不出界。
+    const STRIPS: i32 = 100;
+    let strip_h = rect.height() / STRIPS as f32;
+    let inset_at = |y: f32| -> f32 {
+        // 距上/下边的距离落进圆角区时，按圆方程给出左右内缩量
+        let dy = (y - rect.top()).min(rect.bottom() - y);
+        if dy >= radius {
+            0.0
+        } else {
+            radius - (radius * radius - (radius - dy) * (radius - dy)).max(0.0).sqrt()
         }
-        let rad = a1.to_radians();
-        outline.push(egui::pos2(
-            cx + radius * rad.cos(),
-            cy + radius * rad.sin(),
-        ));
+    };
+    for i in 0..STRIPS {
+        let y0 = rect.top() + strip_h * i as f32;
+        let y1 = y0 + strip_h + 0.5; // 轻微重叠，防带间露缝
+        let inset = inset_at(y0 + strip_h * 0.5);
+        let strip = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + inset, y0),
+            egui::pos2(rect.right() - inset, y1),
+        );
+        painter.rect_filled(strip, Rounding::ZERO, color_at(y0 + strip_h * 0.5));
     }
-    let center = rect.center();
-    let mut mesh = egui::epaint::Mesh::default();
-    mesh.vertices.push(egui::epaint::Vertex {
-        pos: center,
-        uv: egui::epaint::WHITE_UV,
-        color: color_at(center.y),
-    });
-    for p in &outline {
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: *p,
-            uv: egui::epaint::WHITE_UV,
-            color: color_at(p.y),
-        });
-    }
-    let n = outline.len() as u32;
-    for i in 0..n {
-        let a = 1 + i;
-        let b = 1 + (i + 1) % n;
-        mesh.indices.extend_from_slice(&[0, a, b]);
-    }
-    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// 光束彩虹带：青 #22D3EE → 蓝 #3B82F6 → 紫 #A855F7 → 粉 #EC4899，
@@ -1182,8 +1161,10 @@ impl ShunSeekApp {
                     Some(c) => RichText::new("搜索应用、文件、文件夹…").color(c),
                     None => RichText::new("搜索应用、文件、文件夹…"),
                 };
+                // 输入框宽度必须有界：右侧还要放 ESC 徽标，给 INFINITY 会把
+                // 徽标顶出框外被窗口切掉（v0.1.3 预览里徽标只剩「ES」）。
                 let edit = egui::TextEdit::singleline(&mut self.query)
-                    .desired_width(f32::INFINITY)
+                    .desired_width((ui.available_width() - 52.0).max(60.0))
                     .hint_text(hint_text)
                     .text_color(pal.search_text)
                     .frame(false)
@@ -1721,20 +1702,25 @@ impl eframe::App for ShunSeekApp {
             Rounding::same(11.0),
             Stroke::new(1.0_f32, pal.panel_inner_stroke),
         );
+        // 注意：这里绝不能给 Frame 加 shadow。面板填充是透明的，egui 的
+        // 阴影画在面板形状之后、内容之前，会整片透过透明面板压在渐变上
+        // ——浅色下就是一层均匀的灰幕（v0.1.3 浅色「太灰」的真凶，深色下
+        // 黑压黑看不出来）。本窗口与面板同尺寸，阴影本就没有可落的余地，
+        // 边缘靠双层描边定义。
         let panel_frame = egui::Frame::central_panel(&ctx.style())
             .fill(Color32::TRANSPARENT)
             .rounding(Rounding::same(12.0))
             .stroke(Stroke::new(1.0_f32, pal.panel_stroke))
-            .shadow(egui::epaint::Shadow {
-                offset: Vec2::new(0.0, 8.0),
-                blur: 24.0,
-                spread: 0.0,
-                color: pal.shadow_color,
-            })
             .inner_margin(egui::Margin::symmetric(14.0, 10.0));
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(ctx, |ui| {
+                // 宽度护栏：内容宽 = 屏宽 - 左右边距（各 14）。某些环境下
+                // （虚拟屏 DPI 不一致等）面板给到的可用宽会多出一截，右侧
+                // 内容被窗口边缘切掉（v0.1.3 预览里分类胶囊/状态栏文字
+                // 被切就是这个），这里按屏宽显式收住，正常环境下是空操作。
+                let content_w = (ctx.screen_rect().width() - 28.0).max(200.0);
+                ui.set_max_width(content_w);
                 self.draw_search_box(ui);
                 ui.add_space(8.0);
                 self.draw_chips(ui);
