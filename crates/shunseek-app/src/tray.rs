@@ -37,6 +37,9 @@ pub enum TrayAction {
     Show,
     /// 菜单「重新建立索引」。
     RebuildIndex,
+    /// 菜单「立即刷新索引」（v0.1.8）：请增量监视立即 flush 一次
+    ///（有 USN 监视时合并待处理变更；无监视时等效手动重建）。
+    RefreshIndex,
     /// 菜单「设置」：显示主窗口并打开设置窗口。
     OpenSettings,
     /// 菜单「关于瞬觅」。
@@ -131,6 +134,7 @@ mod win {
     const ID_SETTINGS: usize = 3;
     const ID_ABOUT: usize = 4;
     const ID_EXIT: usize = 5;
+    const ID_REFRESH: usize = 6;
 
     /// 托盘线程与 UI 的共享状态：动作队列 + 唤醒用的 Context + 重建标志。
     struct TrayShared {
@@ -442,6 +446,7 @@ mod win {
         };
         AppendMenuW(menu, MF_STRING, ID_SHOW, wide("打开瞬觅").as_ptr());
         AppendMenuW(menu, rebuild_flags, ID_REBUILD, wide(rebuild_text).as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_REFRESH, wide("立即刷新索引").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("设置").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_ABOUT, wide(&about_text).as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -471,6 +476,7 @@ mod win {
                     push_action(TrayAction::RebuildIndex);
                 }
             }
+            ID_REFRESH => push_action(TrayAction::RefreshIndex),
             ID_SETTINGS => push_action(TrayAction::OpenSettings),
             ID_ABOUT => push_action(TrayAction::About),
             ID_EXIT => {

@@ -10,13 +10,25 @@
 //!    最后合并排序。单片命中过多时按 C# 版同样的 16384 → 4096 截断防爆。
 //!  - 取消：调用方置位 AtomicBool，新输入到来时旧查询尽快退出并返回空。
 //!
-//! 打分（与 C# 版一致）：前缀 100 / 词首 70 / 子串 40；拼音通道 80/50；
-//! 减去命中位置 ×0.1 与名字长度 ×0.01；App/Shortcut +15，InstallDir/Folder +5；
-//! 再叠加 UsageStore 频次加分。
+//! 打分（v0.1.8 起与 C# 版 SearchIndex 逐项一致）：名字通道
+//! 前缀 100 / 词首 70 / 子串 40，全等（命中 0 位且名长 == 查询长）
+//! +30，短名（≤6 字）+8；首字母通道 80/50；全拼通道 72/45（仅在
+//! 前两通道命中不足 limit 时才扫，与名字命中去重）；类别加权
+//! App/Shortcut +38、InstallDir +10、Folder +5；路径惩罚（深度
+//! 超 3 每层 −3 封顶 −15、\AppData\ −6、\$Recycle.Bin\ −10）；
+//! 纯十六进制名（≥8 字、全 hex、含数字）−30；再叠加 UsageStore
+//! 频次加分。demoted 标志仍走 Rust 侧的垃圾启发式（哈希名/垃圾
+//! 路径段），只决定 UI 折叠分组、不再扣分。
+//!
+//! 增量搜索（v0.1.8）：SearchEngine 可带墓碑（Tombstones）过滤主
+//! 索引的失效条目；search_merged 把主索引与增量小索引两路结果
+//! 合并排序（增量下标偏移到主索引之后）。
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::category::Category;
+use crate::delta::Tombstones;
 use crate::store::IndexStore;
 use crate::usage::UsageStore;
 
@@ -36,6 +48,9 @@ pub struct SearchHit {
     /// query 长度。通配 / 目录本身命中时为 0（不高亮）。
     pub match_len: u32,
     pub via_initials: bool,
+    /// 是否全拼通道命中（v0.1.8 第三通道）：与 via_initials 一样，
+    /// UI 不得拿它切名字高亮（match_start 是全拼串内偏移）。
+    pub via_pinyin: bool,
     /// 是否被垃圾降权（哈希名 / 垃圾路径段任一命中）。UI 据此把结果
     /// 归类到尾部折叠区，重要结果优先展示。
     pub demoted: bool,
@@ -307,15 +322,42 @@ const FUZZY_FILL_THRESHOLD: usize = 30;
 pub struct SearchEngine<'a> {
     store: &'a IndexStore,
     usage: Option<&'a UsageStore>,
+    /// 墓碑（v0.1.8 增量索引）：主索引里已删除/移动的条目在所有
+    /// 通道的扫描命中处被过滤掉。
+    dead: Option<&'a Tombstones>,
 }
 
 impl<'a> SearchEngine<'a> {
     pub fn new(store: &'a IndexStore, usage: Option<&'a UsageStore>) -> SearchEngine<'a> {
-        SearchEngine { store, usage }
+        SearchEngine {
+            store,
+            usage,
+            dead: None,
+        }
+    }
+
+    /// 带墓碑的引擎（增量搜索时主索引用这个构造）。
+    pub fn with_tombstones(
+        store: &'a IndexStore,
+        usage: Option<&'a UsageStore>,
+        dead: &'a Tombstones,
+    ) -> SearchEngine<'a> {
+        SearchEngine {
+            store,
+            usage,
+            dead: Some(dead),
+        }
     }
 
     pub fn store(&self) -> &'a IndexStore {
         self.store
+    }
+
+    fn is_dead(&self, i: usize) -> bool {
+        match self.dead {
+            Some(d) => d.is_dead(self.store, i),
+            None => false,
+        }
     }
 
     /// category 为 None = 全部分类；limit 为最多返回条数（UI 传 100）。
@@ -415,7 +457,50 @@ impl<'a> SearchEngine<'a> {
             return Vec::new();
         }
         let first_total: usize = locals.iter().map(|l| l.len()).sum();
-        if first_total < FUZZY_FILL_THRESHOLD
+
+        // ---- 全拼通道（v0.1.8 第三通道，对齐原版口径）----
+        // 仅当前两通道（名字 + 首字母）命中总数 < limit 时才扫全拼
+        // 池；与已命中条目按下标去重（名字通道命中优先保留）。
+        // 目录本身 / 通配模式不走拼音（原版同理：那两种模式的名字
+        // 段语义不是拼音查询）。
+        let mut pinyin_seen: HashSet<u32> = HashSet::new();
+        if initials_eligible && first_total < limit && !pq.dir_only && !pq.wildcard {
+            let seen: HashSet<u32> = locals
+                .iter()
+                .flat_map(|l| l.iter().map(|h| h.index))
+                .collect();
+            let pin_locals = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(partitions);
+                for p in 0..partitions {
+                    let start = count * p / partitions;
+                    let end = count * (p + 1) / partitions;
+                    let pq = &pq;
+                    handles.push(scope.spawn(move || {
+                        self.scan_partition_pinyin(
+                            start, end, pq, cat_mask, cancelled, scope_filter,
+                        )
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_default())
+                    .collect::<Vec<Vec<SearchHit>>>()
+            });
+            if cancelled.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            for (dst, extra) in locals.iter_mut().zip(pin_locals) {
+                for h in extra {
+                    if !seen.contains(&h.index) {
+                        pinyin_seen.insert(h.index);
+                        dst.push(h);
+                    }
+                }
+            }
+        }
+
+        let combined_total: usize = locals.iter().map(|l| l.len()).sum();
+        if combined_total < FUZZY_FILL_THRESHOLD
             && pq.name_q.chars().count() >= 2
             && !pq.dir_only
             && !pq.wildcard
@@ -423,14 +508,19 @@ impl<'a> SearchEngine<'a> {
             // 第二遍的名字 / 首字母通道会重演第一遍的命中，但子序列
             // 通道在 scan_partition 内部本就只对其余通道未命中者跑
             //（matched 判定，与第一遍同一套谓词），所以合并时只需
-            // 取回第二遍的 fuzzy 命中，与第一遍天然不重叠，不另造
-            // 去重结构。
+            // 取回第二遍的 fuzzy 命中，与第一遍天然不重叠。唯一例外
+            // 是全拼命中的条目（matched 不认识全拼通道），合并时按
+            // pinyin_seen 再去一次重。
             let second = run_scan(true);
             if cancelled.load(Ordering::Relaxed) {
                 return Vec::new();
             }
             for (dst, extra) in locals.iter_mut().zip(second) {
-                dst.extend(extra.into_iter().filter(|h| h.fuzzy));
+                dst.extend(
+                    extra
+                        .into_iter()
+                        .filter(|h| h.fuzzy && !pinyin_seen.contains(&h.index)),
+                );
             }
         }
         let total: usize = locals.iter().map(|l| l.len()).sum();
@@ -441,34 +531,18 @@ impl<'a> SearchEngine<'a> {
         for l in locals {
             all.extend(l);
         }
-        // 排序：分数降序为主键；同分时依次按路径深度升序（浅者在前）、
-        // 名字长度升序（短者在前）、原索引序——v0.1.5 加的次级键，
-        // 免得同分条目（尤其降权后并列的缓存文件）按任意顺序挤占榜面。
-        // 次级键每条只算一次（别在比较器里反复拼路径 / 数深度）。
-        let mut keyed: Vec<(SearchHit, usize, usize)> = all
-            .into_iter()
-            .map(|h| {
-                let i = h.index as usize;
-                let depth = self
-                    .store
+        let store = self.store;
+        sort_truncate(&mut all, limit, |i| {
+            let i = i as usize;
+            (
+                store
                     .dir_path(i)
                     .chars()
                     .filter(|c| *c == '\\' || *c == '/')
-                    .count();
-                let name_len = self.store.name(i).chars().count();
-                (h, depth, name_len)
-            })
-            .collect();
-        keyed.sort_by(|a, b| {
-            b.0.score
-                .partial_cmp(&a.0.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.2.cmp(&b.2))
-                .then_with(|| a.0.index.cmp(&b.0.index))
+                    .count(),
+                store.name(i).chars().count(),
+            )
         });
-        let mut all: Vec<SearchHit> = keyed.into_iter().map(|(h, _, _)| h).collect();
-        all.truncate(limit);
         all
     }
 
@@ -501,7 +575,8 @@ impl<'a> SearchEngine<'a> {
 
         // ---- 目录本身模式（query 以斜杠结尾）：只出对齐命中的目录
         // 本身（文件夹条目、片段末尾对齐到它自己的最后一段），绝不
-        // 把目录下的内容倒出来。基础分取分段档 120，再走综合分。
+        // 把目录下的内容倒出来。基础分取词首档 70（v0.1.8 对齐
+        // 原版数值），再走综合分。
         if pq.dir_only {
             let mut local: Vec<SearchHit> = Vec::new();
             for entry in start..end {
@@ -509,6 +584,9 @@ impl<'a> SearchEngine<'a> {
                     continue;
                 }
                 if cats[entry] != Category::Folder as u8 {
+                    continue;
+                }
+                if self.is_dead(entry) {
                     continue;
                 }
                 if let Some(s) = scope {
@@ -521,13 +599,14 @@ impl<'a> SearchEngine<'a> {
                 if !frag_aligns_end(&segs, &pq.path_segs, pq.anchored) {
                     continue;
                 }
-                let (score, demoted) = self.finish_score(entry, 120.0);
+                let (score, demoted) = self.finish_score(entry, 70.0);
                 local.push(SearchHit {
                     index: entry as u32,
                     score,
                     match_start: 0,
                     match_len: 0,
                     via_initials: false,
+                    via_pinyin: false,
                     demoted,
                     fuzzy: false,
                 });
@@ -538,8 +617,9 @@ impl<'a> SearchEngine<'a> {
             return local;
         }
 
-        // ---- 通配模式（名字段含 * / ?）：整名匹配住 → 前缀档 160；
-        // 只有子串窗口匹配住（等价于模式两端加 *）→ 子串档 80。
+        // ---- 通配模式（名字段含 * / ?）：整名匹配住 → 前缀档 100；
+        // 只有子串窗口匹配住（等价于模式两端加 *）→ 子串档 40
+        //（v0.1.8 基分对齐原版名字通道数值）。
         if pq.wildcard {
             let pat: Vec<char> = pq.name_q.chars().collect();
             let mut wrapped: Vec<char> = Vec::with_capacity(pat.len() + 2);
@@ -549,6 +629,9 @@ impl<'a> SearchEngine<'a> {
             let mut local: Vec<SearchHit> = Vec::new();
             for entry in start..end {
                 if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
+                    continue;
+                }
+                if self.is_dead(entry) {
                     continue;
                 }
                 if let Some(s) = scope {
@@ -562,9 +645,9 @@ impl<'a> SearchEngine<'a> {
                 let name_chars: Vec<char> =
                     store.name(entry).to_lowercase().chars().collect();
                 let base = if wildcard_match(&pat, &name_chars) {
-                    160.0
+                    100.0
                 } else if wildcard_match(&wrapped, &name_chars) {
-                    80.0
+                    40.0
                 } else {
                     continue;
                 };
@@ -576,6 +659,7 @@ impl<'a> SearchEngine<'a> {
                     match_start: 0,
                     match_len: 0,
                     via_initials: false,
+                    via_pinyin: false,
                     demoted,
                     fuzzy: false,
                 });
@@ -616,6 +700,9 @@ impl<'a> SearchEngine<'a> {
             if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
                 continue;
             }
+            if self.is_dead(entry) {
+                continue;
+            }
             if let Some(s) = scope {
                 if !s.matches_parts(store.dir_path(entry), store.name(entry)) {
                     continue;
@@ -640,6 +727,7 @@ impl<'a> SearchEngine<'a> {
                 match_start: match_start as u32,
                 match_len: q_chars,
                 via_initials: false,
+                via_pinyin: false,
                 demoted,
                 fuzzy: false,
             });
@@ -671,6 +759,9 @@ impl<'a> SearchEngine<'a> {
                 if cat_mask != 0 && (cat_mask & (1u16 << cats[ientry])) == 0 {
                     continue;
                 }
+                if self.is_dead(ientry) {
+                    continue;
+                }
                 if let Some(s) = scope {
                     if !s.matches_parts(store.dir_path(ientry), store.name(ientry)) {
                         continue;
@@ -695,6 +786,7 @@ impl<'a> SearchEngine<'a> {
                     match_start: match_start as u32,
                     match_len: q_chars,
                     via_initials: true,
+                    via_pinyin: false,
                     demoted,
                     fuzzy: false,
                 });
@@ -718,6 +810,9 @@ impl<'a> SearchEngine<'a> {
                 if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
                     continue;
                 }
+                if self.is_dead(entry) {
+                    continue;
+                }
                 if let Some(s) = scope {
                     if !s.matches_parts(store.dir_path(entry), store.name(entry)) {
                         continue;
@@ -737,6 +832,7 @@ impl<'a> SearchEngine<'a> {
                         match_start: first_byte as u32,
                         match_len: 0,
                         via_initials: false,
+                        via_pinyin: false,
                         demoted,
                         fuzzy: true,
                     });
@@ -749,11 +845,119 @@ impl<'a> SearchEngine<'a> {
         local
     }
 
+    /// 全拼通道单分区扫描（v0.1.8）：在全拼池上用首字节锚点找候选，
+    /// 谓词链与首字母通道一致（分类 → 墓碑 → 范围 → 路径对齐）。
+    /// 与名字/首字母通道的去重在 search_scoped 合并时按下标做。
+    /// 打分（原版 PinyinScore）：命中 0 位 72 / 其余 45，−位置×0.1，
+    /// 类别 App/Shortcut +34、InstallDir/Folder +4，短名 +8，
+    /// 全等（0 位且全拼长 == 查询长）+30，再加路径惩罚与频次加分；
+    /// 不吃哈希名 −30（原版全拼通道没有这一项）。
+    fn scan_partition_pinyin(
+        &self,
+        start: usize,
+        end: usize,
+        pq: &ParsedQuery,
+        cat_mask: u16,
+        cancelled: &AtomicBool,
+        scope: Option<&ScopeFilter>,
+    ) -> Vec<SearchHit> {
+        let store = self.store;
+        let cats = store.cats();
+        let q = pq.name_q.as_str();
+        let qb = q.as_bytes();
+        if qb.is_empty() {
+            return Vec::new();
+        }
+        let q_chars = q.chars().count() as u32;
+        let full_off = store.full_off();
+        let full_pool = store.full_pool();
+        let seg_start = full_off[start] as usize;
+        let seg_end = full_off[end] as usize;
+        let segment = &full_pool[seg_start..seg_end];
+        let mut local: Vec<SearchHit> = Vec::new();
+        let mut entry = start;
+        let mut checked = 0usize;
+        for rel in memchr::memchr_iter(qb[0], segment) {
+            let pos = seg_start + rel;
+            while entry + 1 < end && (full_off[entry + 1] as usize) <= pos {
+                entry += 1;
+            }
+            if pos >= full_off[entry + 1] as usize {
+                continue;
+            }
+            if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
+                continue;
+            }
+            if self.is_dead(entry) {
+                continue;
+            }
+            if let Some(s) = scope {
+                if !s.matches_parts(store.dir_path(entry), store.name(entry)) {
+                    continue;
+                }
+            }
+            if pq.path_mode {
+                let segs = dir_segs_lower(store.dir_path(entry));
+                if !frag_aligns(&segs, &pq.path_segs, pq.anchored) {
+                    continue;
+                }
+            }
+            let fend = full_off[entry + 1] as usize;
+            if pos + qb.len() > fend {
+                continue;
+            }
+            if &full_pool[pos..pos + qb.len()] != qb {
+                continue;
+            }
+            let match_at = pos - full_off[entry] as usize;
+            let name = store.name(entry);
+            let name_chars = name.chars().count();
+            let full_len = fend - full_off[entry] as usize;
+            let mut score = if match_at == 0 { 72.0 } else { 45.0 };
+            score -= match_at as f32 * 0.1;
+            score += match store.category(entry) {
+                Category::App | Category::Shortcut => 34.0,
+                Category::InstallDir | Category::Folder => 4.0,
+                _ => 0.0,
+            };
+            if name_chars <= 6 {
+                score += 8.0;
+            }
+            if match_at == 0 && full_len == q.len() {
+                score += 30.0;
+            }
+            let full_path = store.full_path(entry);
+            score += path_penalty(&full_path);
+            if let Some(u) = self.usage {
+                score += u.boost(&full_path);
+            }
+            let demoted = junk_penalty(name, &full_path) > 0.0;
+            local.push(SearchHit {
+                index: entry as u32,
+                score,
+                match_start: match_at as u32,
+                match_len: q_chars,
+                via_initials: false,
+                via_pinyin: true,
+                demoted,
+                fuzzy: false,
+            });
+            checked += 1;
+            if checked % 4096 == 0 && cancelled.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if local.len() >= 16384 {
+                trim_local(&mut local);
+            }
+        }
+        local
+    }
+
     /// 返回 (得分, 是否被垃圾降权)。
-    /// 通道分档（v0.1.5 重定，档间距 ≥40，重要性加减不翻盘）：
-    /// 完全一致 200 / 前缀 160 / 分段前缀 120 / 子串 80 /
-    /// 拼音首字母 前缀 75 · 包含 60 / 子序列 30（在通道处给分）。
-    /// 综合分 = 通道分 + 重要性（finish_score），排序仍由匹配度主导。
+    /// 通道分档（v0.1.8 对齐原版 SearchIndex）：名字 前缀 100 /
+    /// 词首 70 / 子串 40；首字母 前缀 80 / 包含 50；全等 +30；
+    /// 短名 +8（名字与首字母两通道都有）；子序列 30（在通道处给）。
+    /// 综合分 = 通道分 + 类别加权/路径惩罚/哈希惩罚（finish_score）。
     fn score_match(
         &self,
         index: usize,
@@ -762,19 +966,20 @@ impl<'a> SearchEngine<'a> {
         q: &str,
     ) -> (f32, bool) {
         let name = self.store.name(index);
-        let name_len = name.chars().count() as f32;
+        let name_chars = name.chars().count();
+        let name_len = name_chars as f32;
         // 命中位置按「字符数」计。注意 via_initials 时 match_start_byte 是首字母串
         // 里的偏移，绝不能拿去切名字（会对不齐甚至切碎多字节汉字而 panic，
         // v0.1.0 拼音搜不到结果就是这个原因）；首字母串是纯 ASCII，字节偏移即字符数。
         let (base, match_at) = if via_initials {
             (
-                if match_start_byte == 0 { 75.0 } else { 60.0 },
+                if match_start_byte == 0 { 80.0 } else { 50.0 },
                 match_start_byte as f32,
             )
         } else {
             // 不切片：按 char_indices 数命中点前的字符数，prev/cur 取命中点前后字符。
             let mut cnt = 0usize;
-            let mut prev = ' ';
+            let mut prev: Option<char> = None;
             let mut cur = ' ';
             for (i, c) in name.char_indices() {
                 if i >= match_start_byte {
@@ -782,63 +987,196 @@ impl<'a> SearchEngine<'a> {
                     break;
                 }
                 cnt += 1;
-                prev = c;
+                prev = Some(c);
             }
             let match_at = cnt as f32;
-            let tier = if is_exact_name(name, q) {
-                200.0
-            } else if cnt == 0 {
-                160.0
-            } else if is_segment_start(prev, cur) {
-                120.0
+            let mut tier = if cnt == 0 {
+                100.0
+            } else if is_word_start(prev, cur) {
+                70.0
             } else {
-                80.0
+                40.0
             };
+            // 全等（原版 ExactBonus）：命中在 0 位且名长 == 查询长
+            if cnt == 0 && name_chars == q.chars().count() {
+                tier += 30.0;
+            }
             (tier, match_at)
         };
-        let score = base - match_at * 0.1 - name_len * 0.01;
+        let mut score = base - match_at * 0.1 - name_len * 0.01;
+        if name_chars <= 6 {
+            score += 8.0; // 短名加分（原版 ShortNameBonus，两通道同规）
+        }
         self.finish_score(index, score)
     }
 
-    /// 通道分之上的重要性调整：分类小额加分（App/快捷方式/安装目录/
-    /// 文件夹 +5）、垃圾降权（哈希名 −60 / 垃圾路径 −40，可叠加，
-    /// 见 junk_penalty）、使用频次加分（UsageStore 现有规则，上限
-    /// 约 +12）。合计幅度小于档间距，保证综合分不翻盘通道大档。
+    /// 通道分之上的综合调整（v0.1.8 对齐原版）：类别加权
+    /// App/Shortcut +38、InstallDir +10、Folder +5；路径惩罚
+    ///（path_penalty）；纯十六进制名 −30；使用频次加分（UsageStore
+    /// 现有规则，上限约 +12）。demoted 标志仍由 Rust 侧垃圾启发式
+    ///（junk_penalty）决定，只喂 UI 折叠分组、不再扣分——原版没有
+    /// 这套扣分，照原版数值对齐后哈希文件夹靠路径惩罚与哈希 −30
+    /// 沉底（有单测钉住）。
     fn finish_score(&self, index: usize, mut score: f32) -> (f32, bool) {
-        let name = self.store.name(index);
         score += match self.store.category(index) {
-            Category::App | Category::Shortcut => 5.0,
-            Category::InstallDir | Category::Folder => 5.0,
+            Category::App | Category::Shortcut => 38.0,
+            Category::InstallDir => 10.0,
+            Category::Folder => 5.0,
             _ => 0.0,
         };
-        let penalty = junk_penalty(name, &self.store.full_path(index));
-        score -= penalty;
-        if let Some(u) = self.usage {
-            score += u.boost(&self.store.full_path(index));
+        let full_path = self.store.full_path(index);
+        score += path_penalty(&full_path);
+        let name = self.store.name(index);
+        if looks_like_hash_orig(name) {
+            score -= 30.0;
         }
-        (score, penalty > 0.0)
+        if let Some(u) = self.usage {
+            score += u.boost(&full_path);
+        }
+        (score, junk_penalty(name, &full_path) > 0.0)
     }
 }
 
-/// 完全一致：全名或去扩展名后的主干与 query 相等（大小写不论）。
-fn is_exact_name(name: &str, q: &str) -> bool {
+/// 词首判定（原版 WordStart 口径）：命中点前一字符是分隔符
+///（空格 / - / _ / · / ( / （ / .），或前一字是汉字而命中字不是
+/// 汉字。注意原版**没有**驼峰规则——"ShunSeek" 里 Seek 不是词首
+///（与 v0.1.5 前的 Rust 私规不同，v0.1.8 起按原版）。
+fn is_word_start(prev: Option<char>, cur: char) -> bool {
+    match prev {
+        None => true,
+        Some(p) => {
+            matches!(p, ' ' | '-' | '_' | '·' | '(' | '（' | '.')
+                || (is_cjk(p) && !is_cjk(cur))
+        }
+    }
+}
+
+/// 路径惩罚（原版 PathPenalty）：完整路径中 '\\' 数（深度）超 3
+/// 后每层 −3、封顶 −15；含 \AppData\ −6；含 \$Recycle.Bin\ −10。
+fn path_penalty(full_path: &str) -> f32 {
+    let mut penalty = 0.0f32;
+    let depth = full_path.matches('\\').count() as i32;
+    if depth > 3 {
+        penalty -= ((depth - 3) * 3).min(15) as f32;
+    }
+    let lower = full_path.to_lowercase();
+    if lower.contains("\\appdata\\") {
+        penalty -= 6.0;
+    }
+    if lower.contains("\\$recycle.bin\\") {
+        penalty -= 10.0;
+    }
+    penalty
+}
+
+/// 纯十六进制名惩罚判定（原版 HashPenalty 口径）：**完整名**
+///（含扩展名）小写后长度 ≥8、全部字符是 0-9a-f、且至少含一个
+/// 数字。注意含 '.' 的名永远不命中（'.' 不是 hex 字符）——这是
+/// 原版行为（如 radium 的用户目录 "629fb81d" 这类无扩展名纯
+/// hex 名才是目标），与 Rust 侧 demoted 用的启发式是两套规则。
+fn looks_like_hash_orig(name: &str) -> bool {
     let lower = name.to_lowercase();
-    if lower == q {
-        return true;
+    if lower.chars().count() < 8 {
+        return false;
     }
-    match lower.rfind('.') {
-        Some(p) if p > 0 => &lower[..p] == q,
-        _ => false,
+    let mut has_digit = false;
+    for c in lower.chars() {
+        if !c.is_ascii_hexdigit() {
+            return false;
+        }
+        if c.is_ascii_digit() {
+            has_digit = true;
+        }
     }
+    has_digit
 }
 
-/// 分段前缀判定：命中点是否落在一段的开头。分段边界 = 分隔符
-///（空格 / _ / - / . / · / 括号）、驼峰边界（小写→大写）、
-/// 汉字→非汉字交界。如 ".claude" 的 claude 段、"ShunSeek" 的 Seek 段。
-fn is_segment_start(prev: char, cur: char) -> bool {
-    matches!(prev, ' ' | '-' | '_' | '·' | '.' | '．' | '(' | '（')
-        || (prev.is_lowercase() && cur.is_uppercase())
-        || (is_cjk(prev) && !is_cjk(cur))
+/// 合并搜索（v0.1.8 增量索引）：主索引带墓碑搜 + 增量小索引独立
+/// 搜，两路合并后统一排序截断。增量命中的下标偏移到主索引之后
+///（index >= base.count() 的属于增量层，调用方按此拆分取条目）。
+/// 两路各以 usize::MAX 为 limit 全量取回再合并——增量层本来就小，
+/// 主索引侧靠分区内的 16384 截断兜底。
+#[allow(clippy::too_many_arguments)]
+pub fn search_merged(
+    base: &IndexStore,
+    delta: Option<&IndexStore>,
+    dead: Option<&Tombstones>,
+    usage: Option<&UsageStore>,
+    query: &str,
+    cat_mask: u16,
+    limit: usize,
+    cancelled: &AtomicBool,
+    scope: Option<&ScopeFilter>,
+) -> Vec<SearchHit> {
+    let mut hits = match dead {
+        Some(d) => SearchEngine::with_tombstones(base, usage, d)
+            .search_scoped(query, cat_mask, usize::MAX, cancelled, scope),
+        None => SearchEngine::new(base, usage)
+            .search_scoped(query, cat_mask, usize::MAX, cancelled, scope),
+    };
+    let base_count = base.count();
+    if let Some(dstore) = delta {
+        if dstore.count() > 0 {
+            let mut dh = SearchEngine::new(dstore, usage).search_scoped(
+                query,
+                cat_mask,
+                usize::MAX,
+                cancelled,
+                scope,
+            );
+            for h in &mut dh {
+                h.index += base_count as u32;
+            }
+            hits.extend(dh);
+        }
+    }
+    sort_truncate(&mut hits, limit, |i| {
+        let i = i as usize;
+        let (store, local) = if i < base_count {
+            (base, i)
+        } else {
+            match delta {
+                Some(d) => (d, i - base_count),
+                None => return (0, 0),
+            }
+        };
+        (
+            store
+                .dir_path(local)
+                .chars()
+                .filter(|c| *c == '\\' || *c == '/')
+                .count(),
+            store.name(local).chars().count(),
+        )
+    });
+    hits
+}
+
+/// 统一排序 + 截断：分数降序为主键；同分依次按路径深度升序、
+/// 名字长度升序、原索引序。次级键由 key 解析器按统一索引给出
+///（合并搜索时跨两个 store 解析），每条只算一次。
+fn sort_truncate(
+    hits: &mut Vec<SearchHit>,
+    limit: usize,
+    key: impl Fn(u32) -> (usize, usize),
+) {
+    let mut keyed: Vec<(SearchHit, usize, usize)> = hits
+        .drain(..)
+        .map(|h| {
+            let (depth, name_len) = key(h.index);
+            (h, depth, name_len)
+        })
+        .collect();
+    keyed.sort_by(|a, b| {
+        b.0.score
+            .partial_cmp(&a.0.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.0.index.cmp(&b.0.index))
+    });
+    hits.extend(keyed.into_iter().map(|(h, _, _)| h));
+    hits.truncate(limit);
 }
 
 /// 锚点候选位置：查询 ≥2 字节时用前两字节的大小写变体做 memmem 扫描后排序去重；
@@ -1129,8 +1467,12 @@ mod tests {
 
     #[test]
     fn match_tiers_ordering() {
-        // 同一 query 五档俱全时排序必须是：
-        // 完全一致 > 前缀 > 分段前缀 > 子串 > 子序列
+        // v0.1.8 原版数值下的五档排序：全等（100+30+短名 8）>
+        // 前缀（100）> 首字母前缀（80，"s-e-e-k" 的首字母串恰为
+        // "seek"）> 子串（40，"aseekb" 命中位 1 扣 0.1 略胜
+        // "ShunSeek" 命中位 4 扣 0.4；原版无驼峰词首规则，Seek
+        // 不算词首）。子序列档（30）在本用例不出现（"s-e-e-k"
+        // 已被首字母通道收走）。
         let store = store_of(&[
             ("s-e-e-k", "C:\\x", Category::Other),
             ("aseekb", "C:\\x", Category::Other),
@@ -1143,9 +1485,121 @@ mod tests {
         let got = names(&store, &hits);
         assert_eq!(
             got,
-            vec!["seek", "seektool", "ShunSeek", "aseekb", "s-e-e-k"],
+            vec!["seek", "seektool", "s-e-e-k", "aseekb", "ShunSeek"],
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn pinyin_channel_finds_weixin() {
+        // 全拼通道钉死用例（v0.1.8）：搜 weixin 必须找到「微信」——
+        // 名字通道（名里没有 weixin 子串）与首字母通道（wx）都命
+        // 不中，只有全拼通道能命中，且 via_pinyin 标志为 true。
+        let store = store_of(&[
+            ("微信", "C:\\Program Files\\Tencent", Category::App),
+            ("weixin-notes", "C:\\x", Category::Document),
+        ]);
+        let engine = SearchEngine::new(&store, None);
+        let hits = engine.search("weixin", None, 100, &AtomicBool::new(false));
+        let got = names(&store, &hits);
+        assert!(got.contains(&"微信".to_string()), "weixin 应找到微信：{got:?}");
+        let wx = hits
+            .iter()
+            .find(|h| store.name(h.index as usize) == "微信")
+            .unwrap();
+        assert!(wx.via_pinyin, "微信应经全拼通道命中");
+        // 名字命中的 weixin-notes 不是全拼通道
+        let notes = hits
+            .iter()
+            .find(|h| store.name(h.index as usize) == "weixin-notes")
+            .unwrap();
+        assert!(!notes.via_pinyin);
+    }
+
+    #[test]
+    fn pinyin_channel_skipped_when_first_channels_fill_limit() {
+        // 前两通道命中已达 limit → 全拼通道不扫：limit=1 时名字
+        // 命中占满，微信（只能全拼命中）不出现。
+        let store = store_of(&[
+            ("微信", "C:\\Program Files\\Tencent", Category::App),
+            ("weixin-notes", "C:\\x", Category::Document),
+        ]);
+        let engine = SearchEngine::new(&store, None);
+        let hits = engine.search("weixin", None, 1, &AtomicBool::new(false));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(store.name(hits[0].index as usize), "weixin-notes");
+    }
+
+    #[test]
+    fn tombstones_hide_dead_entries() {
+        // 墓碑：路径墓碑与目录前缀墓碑命中的条目在所有通道不可见
+        let store = store_of(&[
+            ("report", "C:\\keep", Category::Document),
+            ("report", "C:\\gone", Category::Document),
+            ("report", "C:\\gone\\sub", Category::Document),
+        ]);
+        let mut tombs = Tombstones::default();
+        tombs.dead_paths.insert("c:\\gone\\report".to_string());
+        tombs.dead_dir_prefixes.push("c:\\gone\\sub\\".to_string());
+        let engine = SearchEngine::with_tombstones(&store, None, &tombs);
+        let hits = engine.search("report", None, 100, &AtomicBool::new(false));
+        assert_eq!(hits.len(), 1, "{:?}", names(&store, &hits));
+        assert_eq!(store.dir_path(hits[0].index as usize), "C:\\keep");
+    }
+
+    #[test]
+    fn merged_search_combines_base_and_delta() {
+        // 合并搜索：增量层的新文件可搜到（下标偏移到主索引之后），
+        // 主索引被墓碑杀掉的条目不出现
+        let base = store_of(&[
+            ("alpha", "C:\\x", Category::Document),
+            ("beta", "C:\\x", Category::Document),
+        ]);
+        let delta = store_of(&[("alphabet", "C:\\y", Category::Document)]);
+        let mut tombs = Tombstones::default();
+        tombs.dead_paths.insert("c:\\x\\beta".to_string());
+        let hits = search_merged(
+            &base,
+            Some(&delta),
+            Some(&tombs),
+            None,
+            "alpha",
+            0,
+            100,
+            &AtomicBool::new(false),
+            None,
+        );
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        // 增量命中下标 = 主索引条数 + 增量内下标
+        let dhit = hits
+            .iter()
+            .find(|h| h.index as usize >= base.count())
+            .expect("应有增量命中");
+        assert_eq!(delta.name(dhit.index as usize - base.count()), "alphabet");
+        // 搜 beta：主索引的被墓碑杀掉，无结果
+        let hits = search_merged(
+            &base,
+            Some(&delta),
+            Some(&tombs),
+            None,
+            "beta",
+            0,
+            100,
+            &AtomicBool::new(false),
+            None,
+        );
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn hash_orig_rule() {
+        // 原版 HashPenalty 口径：完整名全 hex + 含数字 + ≥8 字
+        assert!(looks_like_hash_orig("629fb81d")); // radium 用户目录
+        assert!(looks_like_hash_orig("deadbeef1234"));
+        assert!(!looks_like_hash_orig("wx915c6f684ab5b15f")); // 含 w/x
+        assert!(!looks_like_hash_orig("deadbeef.txt")); // '.' 不是 hex
+        assert!(!looks_like_hash_orig("abcdefab")); // 全 hex 但无数字
+        assert!(!looks_like_hash_orig("abc123")); // 太短
     }
 
     #[test]

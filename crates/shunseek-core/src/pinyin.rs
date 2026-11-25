@@ -33,6 +33,44 @@ pub fn initial_of(ch: char) -> Option<u8> {
     Some(LETTERS[seg])
 }
 
+/// 单个汉字的全拼音节（无声调、小写）；非一级汉字返回 None。
+pub fn syllable_of(ch: char) -> Option<&'static str> {
+    let cp = ch as u32;
+    if !(0x4E00..0x9FA6).contains(&cp) {
+        return None;
+    }
+    let idx = GB2312_LEVEL1.binary_search_by_key(&(cp as u16), |e| e.0).ok()?;
+    let si = crate::pinyin_full_table::FULL_IDX[idx];
+    if si == u16::MAX {
+        None
+    } else {
+        Some(crate::pinyin_full_table::SYLLABLES[si as usize])
+    }
+}
+
+/// 把任意显示名转成全拼串（对应 C# 版 PinyinFull.Convert）：汉字转
+/// 音节，英文数字原样小写，其余字符丢掉。直接写进给定字节缓冲。
+/// 纯 ASCII 名与混合名的过滤口径一致（都只留 a-z0-9），所以不像
+/// C# 版那样分两条路。
+pub fn full_into(text: &str, out: &mut Vec<u8>) {
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase() as u8);
+            }
+        } else if let Some(s) = syllable_of(ch) {
+            out.extend_from_slice(s.as_bytes());
+        }
+    }
+}
+
+/// 便捷版：返回 String（构建索引时用 full_into 热路径即可）。
+pub fn full(text: &str) -> String {
+    let mut v = Vec::with_capacity(text.len() * 2);
+    full_into(text, &mut v);
+    String::from_utf8(v).unwrap_or_default()
+}
+
 /// 把任意显示名转成拼音首字母串（全小写，只含 a-z0-9），直接写进给定的字节缓冲。
 pub fn initials_into(text: &str, out: &mut Vec<u8>) {
     for ch in text.chars() {

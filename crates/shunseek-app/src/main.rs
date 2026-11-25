@@ -33,8 +33,8 @@
 //!    语言；视觉令牌整体换成原版 .NET 的 ThemeManager 色板与布局
 //!    常量（朱砂强调、Ink 三段渐变、Serif 书眉/名单），逐项对照见
 //!    docs/feature-parity.md「设计令牌」节。
-//!  - 单实例：C# 版用命名 Mutex；Rust 版 TODO（需要 Windows 命名互斥 FFI
-//!    或单实例 socket），当前不做，重复启动会开两个窗口。
+//!  - 单实例：v0.1.8 落地（命名 Mutex + 命名事件唤醒已有实例，
+//!    见 main() 与 WAKE_FLAG）。
 //!  - 全局热键：轮询实现，见 hotkey.rs；非 Windows 无全局热键。
 
 #![cfg_attr(
@@ -60,8 +60,13 @@ use egui::{
     Align, Align2, Color32, FontId, Key, Layout, RichText, Rounding, Stroke,
     TextFormat, Vec2, ViewportCommand,
 };
+use shunseek_core::delta::Tombstones;
+#[cfg(windows)]
+use shunseek_core::delta::DeltaIndex;
+use shunseek_core::filetype::{self, Importance};
 use shunseek_core::{
-    build_index, Category, IndexStore, RawEntry, ScopeFilter, SearchEngine, UsageStore,
+    build_index, search_merged, Category, IndexStore, RawEntry, ScopeFilter, SearchEngine,
+    UsageStore,
 };
 
 const RESULT_LIMIT: usize = 100;
@@ -402,10 +407,12 @@ fn load_settings() -> Settings {
         theme,
         view,
         // close_action / hide_on_close 键：v0.1.6 起忽略（✕ 恒到托盘）
+        // 用户存过的值优先（解析成功就用，绝不覆盖）；没有/解析
+        // 失败才走 v0.1.8 候选链解析默认（Ctrl+Alt+Space 起）。
         hotkey: kv
             .get("hotkey")
             .and_then(|s| hotkey::HotkeyCombo::parse(s))
-            .unwrap_or(hotkey::HotkeyCombo::ALT_SPACE),
+            .unwrap_or_else(hotkey::resolve_default),
         result_limit: kv
             .get("result_limit")
             .and_then(|s| s.parse::<usize>().ok())
@@ -643,7 +650,20 @@ enum IndexMsg {
         saved: bool,
         summary: String,
         final_stage: bool,
+        /// USN 监视计划（v0.1.8）：仅最终一级且 MFT 模式时非空——
+        /// (盘符, 建索引时记下的 NextUsn 起点)。UI 收到后起监视
+        /// supervisor；便携模式恒空（无增量、仅手动重建）。
+        watch: Vec<(char, Option<i64>)>,
     },
+    /// 增量 flush 完成（v0.1.8）：增量层规模与累计变更、更新时刻。
+    /// UI 据此刷页脚「{总数} 项 · 增量 M · HH:mm 更新」并重搜。
+    Delta {
+        delta_count: usize,
+        total_count: usize,
+        updated_hhmm: String,
+    },
+    /// 增量层要求全量重建（墓碑超限 / 目录改名等，见 DeltaIndex）。
+    NeedRebuild,
 }
 
 /// 单个数据源的隔离包装：某个源 panic / 报错只丢它自己的数据，
@@ -749,6 +769,7 @@ fn spawn_rebuild(dir: PathBuf, tx: Sender<IndexMsg>) {
                         saved: true,
                         summary: "重建线程异常".to_string(),
                         final_stage: true,
+                        watch: Vec::new(),
                     });
                 }
             }
@@ -777,6 +798,7 @@ fn spawn_rebuild(dir: PathBuf, tx: Sender<IndexMsg>) {
                     saved,
                     summary,
                     final_stage: true,
+                    watch: Vec::new(),
                 });
             }
         })
@@ -795,6 +817,21 @@ fn send_index_stage(
     summary: String,
     final_stage: bool,
 ) {
+    send_index_stage_watch(tx, dir, entries, roots, summary, final_stage, Vec::new());
+}
+
+/// send_index_stage 的带监视计划版（v0.1.8）：只有最终一级且
+/// MFT 模式才传非空 watch，其余阶段恒空。
+#[allow(clippy::too_many_arguments)]
+fn send_index_stage_watch(
+    tx: &Sender<IndexMsg>,
+    dir: &PathBuf,
+    entries: &[RawEntry],
+    roots: &HashMap<char, String>,
+    summary: String,
+    final_stage: bool,
+    watch: Vec<(char, Option<i64>)>,
+) {
     let roots = if roots.is_empty() { None } else { Some(roots) };
     let store = build_index(entries.to_vec(), roots);
     let count = store.count();
@@ -809,6 +846,7 @@ fn send_index_stage(
         saved,
         summary,
         final_stage,
+        watch,
     });
 }
 
@@ -855,6 +893,134 @@ fn shallow_profile_entries() -> Vec<RawEntry> {
     out
 }
 
+/// NTFS 文件引用号打卷标签（v0.1.8）：高 16 位 = 盘符序号
+///（'A'=1…），低 48 位 = 卷内原始引用号（NTFS 记录号 ≤48 位）。
+/// MFT 枚举产出的是卷内裸号，多卷同号（如卷根都是 5）；不打标签
+/// 时增量墓碑与目录映射会跨卷误杀。core 的 load_volume 产出裸号，
+/// app 在并入时统一改写 file_ref/parent_ref；USN 变更进
+/// DeltaIndex 前同样改写（见监视 supervisor）。
+#[cfg(windows)]
+fn tag_ref(drive: char, raw: u64) -> u64 {
+    let tag = (drive as u64).saturating_sub(64) << 48;
+    tag | (raw & 0x0000_FFFF_FFFF_FFFF)
+}
+
+/// 进程是否已提升（管理员）：OpenProcessToken + TokenElevation。
+/// MFT 直读需要管理员（原版口径：管理员+NTFS 才走 MFT 全盘）。
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elev: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elev as *mut TOKEN_ELEVATION as *mut std::ffi::c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        ok != 0 && elev.TokenIsElevated != 0
+    }
+}
+
+/// 固定盘的文件系统名（如 "NTFS"）；非固定盘/查询失败返回 None。
+#[cfg(windows)]
+fn drive_fs_name(drive: char) -> Option<String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
+    const DRIVE_FIXED: u32 = 3; // windows-sys 0.52 未导出该常量
+    let root: Vec<u16> = OsStr::new(&format!("{drive}:\\"))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        if GetDriveTypeW(root.as_ptr()) != DRIVE_FIXED {
+            return None;
+        }
+        let mut fs = vec![0u16; 64];
+        let ok = GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs.as_mut_ptr(),
+            fs.len() as u32,
+        );
+        if ok == 0 {
+            return None;
+        }
+        let end = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
+        Some(String::from_utf16_lossy(&fs[..end]))
+    }
+}
+
+/// 便携模式索引范围（v0.1.8，对齐原版 IndexService 便携口径）：
+/// UserProfile + 公共目录 + ProgramData（含开始菜单）+ ProgramFiles。
+#[cfg(windows)]
+fn portable_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for key in ["USERPROFILE", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                roots.push(PathBuf::from(v));
+            }
+        }
+        // USERPROFILE 之后插入公共目录与 ProgramData（顺序只影响
+        // 遍历先后，不影响结果集）
+        if key == "USERPROFILE" {
+            roots.push(PathBuf::from("C:\\Users\\Public\\Desktop"));
+            roots.push(PathBuf::from("C:\\Users\\Public\\Documents"));
+            if let Ok(pd) = std::env::var("ProgramData") {
+                if !pd.is_empty() {
+                    roots.push(PathBuf::from(&pd).join("Microsoft\\Windows\\Start Menu"));
+                    roots.push(PathBuf::from(pd));
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// 便携模式排除前缀（v0.1.8，对齐原版 IndexService 的 13 项，
+/// 以 LOCALAPPDATA / APPDATA 为基拼出；基为空的项自动丢弃）。
+#[cfg(windows)]
+fn portable_excludes() -> Vec<String> {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let roaming = std::env::var("APPDATA").unwrap_or_default();
+    let j = |base: &str, sub: &str| format!("{base}\\{sub}");
+    [
+        j(&roaming, "Tencent\\xwechat\\radium"),
+        j(&roaming, "Tencent\\WeChat\\All Users"),
+        j(&local, "Temp"),
+        j(&local, "Packages"),
+        j(&local, "Microsoft\\Windows"),
+        j(&local, "CrashDumps"),
+        j(&roaming, "Microsoft\\Windows\\Recent"),
+        j(&local, "ShunSeek"),
+        j(&local, "Google\\Chrome\\User Data\\Default\\Cache"),
+        j(&local, "Microsoft\\Edge\\User Data\\Default\\Cache"),
+        j(&roaming, "Code\\Cache"),
+        j(&roaming, "Code\\CachedData"),
+        j(&roaming, "Code\\logs"),
+    ]
+    .into_iter()
+    .filter(|s| !s.starts_with('\\'))
+    .collect()
+}
+
 /// Windows 分级建立（v0.1.5）：打开就能搜，不等全量建完。
 /// 第一级：appscan（快捷方式 + 已装应用）+ 桌面/用户目录浅层，先建成
 /// 索引换入，搜索立刻可用；第二级：逐盘 MFT，每完成一盘把「第一级 +
@@ -864,7 +1030,7 @@ fn shallow_profile_entries() -> Vec<RawEntry> {
 /// 为 0 → 每个固定盘根全盘遍历。最终一级存缓存 index.bin。
 #[cfg(windows)]
 fn rebuild_windows(dir: &PathBuf, tx: &Sender<IndexMsg>) {
-    use shunseek_core::sources::{appscan, mft, walker};
+    use shunseek_core::sources::{appscan, mft, usn, walker};
     let mut entries: Vec<RawEntry> = Vec::new();
     let mut roots: HashMap<char, String> = HashMap::new();
     let mut drives: Vec<char> = Vec::new();
@@ -888,55 +1054,108 @@ fn rebuild_windows(dir: &PathBuf, tx: &Sender<IndexMsg>) {
         dir,
         &entries,
         &roots,
-        format!("索引：应用 {apps} · 浅层 {shallow_n} · MFT 建立中…"),
+        format!("索引：应用 {apps} · 浅层 {shallow_n} · 全量建立中…"),
         false,
     );
 
-    // ---- 第二级：逐盘 MFT，逐盘并入 ----
-    let mut parts: Vec<String> = Vec::new();
-    let mut mft_total = 0usize;
-    for (di, drive) in drives.iter().enumerate() {
-        match guarded(|| mft::load_volume(*drive)) {
-            Some(Ok(mut v)) => {
-                mft_total += v.len();
-                parts.push(format!("MFT {drive}:{}", v.len()));
-                entries.append(&mut v);
-            }
-            _ => parts.push(format!("MFT {drive}:失败")),
-        }
-        if di + 1 < drives.len() {
-            let done: Vec<String> = drives[..=di]
-                .iter()
-                .map(|d| format!("MFT {d}:完成"))
-                .collect();
-            send_index_stage(
-                tx,
-                dir,
-                &entries,
-                &roots,
-                format!(
-                    "索引：应用 {apps} · 浅层 {shallow_n} · {} · 其余盘建立中…",
-                    done.join(" · ")
-                ),
-                false,
-            );
-        }
-    }
+    // ---- 分档（v0.1.8，对齐原版 IndexService 模式口径）----
+    // 管理员 + 有 NTFS 固定盘 → MFT 模式（NTFS 盘直读、其余固定盘
+    // 遍历并入）；否则便携模式（便携范围 + 噪音目录跳过 + 13 项
+    // 排除前缀）。MFT 模式同时产出 USN 监视计划供增量层用。
+    let ntfs_drives: Vec<char> = drives
+        .iter()
+        .copied()
+        .filter(|d| {
+            drive_fs_name(*d)
+                .map(|fs| fs.eq_ignore_ascii_case("NTFS"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let mft_mode = is_elevated() && !ntfs_drives.is_empty();
 
-    // ---- 兜底（旧语义）：MFT 全灭 → 遍历用户目录；仍空 → 全盘遍历 ----
+    let mut parts: Vec<String> = vec![format!(
+        "模式 {}",
+        if mft_mode { "MFT" } else { "便携" }
+    )];
+    let mut mft_total = 0usize;
     let mut walk_count = 0usize;
-    if mft_total == 0 {
-        if let Ok(profile) = std::env::var("USERPROFILE") {
-            let v = guarded(|| walker::walk(&[PathBuf::from(profile)], true))
+    let mut watch_plan: Vec<(char, Option<i64>)> = Vec::new();
+    if mft_mode {
+        // ---- 第二级：逐盘 MFT，逐盘并入 ----
+        for (di, drive) in ntfs_drives.iter().enumerate() {
+            // 先记 USN 起点再枚举：枚举期间发生的增删改由增量层补
+            let start_usn = usn::query_next_usn(*drive);
+            match guarded(|| mft::load_volume(*drive)) {
+                Some(Ok(mut v)) => {
+                    mft_total += v.len();
+                    parts.push(format!("MFT {drive}:{}", v.len()));
+                    // refs 打卷标签（多卷同号防增量误杀，见 tag_ref）
+                    for e in &mut v {
+                        if e.file_ref != 0 {
+                            e.file_ref = tag_ref(*drive, e.file_ref);
+                        }
+                        if e.parent_ref != 0 {
+                            e.parent_ref = tag_ref(*drive, e.parent_ref);
+                        }
+                    }
+                    entries.append(&mut v);
+                    watch_plan.push((*drive, start_usn));
+                }
+                _ => parts.push(format!("MFT {drive}:失败")),
+            }
+            if di + 1 < ntfs_drives.len() {
+                let done: Vec<String> = ntfs_drives[..=di]
+                    .iter()
+                    .map(|d| format!("MFT {d}:完成"))
+                    .collect();
+                send_index_stage(
+                    tx,
+                    dir,
+                    &entries,
+                    &roots,
+                    format!(
+                        "索引：应用 {apps} · 浅层 {shallow_n} · {} · 其余盘建立中…",
+                        done.join(" · ")
+                    ),
+                    false,
+                );
+            }
+        }
+        // 非 NTFS 固定盘：遍历并入（噪音目录整树跳过）
+        for drive in drives.iter().filter(|d| !ntfs_drives.contains(d)) {
+            let root = PathBuf::from(format!("{drive}:\\"));
+            let v = guarded(|| walker::walk_with_excludes(&[root], true, &[]))
                 .unwrap_or_default();
-            walk_count = v.len();
+            walk_count += v.len();
+            parts.push(format!("遍历 {drive}:{}", v.len()));
             entries.extend(v);
         }
+        if mft_total == 0 {
+            // MFT 全灭：退便携范围，别让索引只剩应用 + 浅层
+            watch_plan.clear();
+            let v = guarded(|| {
+                walker::walk_with_excludes(&portable_roots(), true, &portable_excludes())
+            })
+            .unwrap_or_default();
+            walk_count += v.len();
+            entries.extend(v);
+        }
+    } else {
+        // ---- 便携模式：便携范围遍历（噪音跳过 + 排除前缀）----
+        let v = guarded(|| {
+            walker::walk_with_excludes(&portable_roots(), true, &portable_excludes())
+        })
+        .unwrap_or_default();
+        walk_count = v.len();
+        entries.extend(v);
     }
     parts.push(format!("应用 {apps}"));
     parts.push(format!("浅层 {shallow_n}"));
-    parts.push(format!("遍历 {walk_count}"));
+    if walk_count > 0 {
+        parts.push(format!("遍历 {walk_count}"));
+    }
     if entries.is_empty() && !drives.is_empty() {
+        // 最后兜底（旧语义）：什么都没拿到 → 全盘遍历保命
         let mut full_count = 0usize;
         for drive in &drives {
             let root = PathBuf::from(format!("{drive}:\\"));
@@ -947,8 +1166,184 @@ fn rebuild_windows(dir: &PathBuf, tx: &Sender<IndexMsg>) {
         parts.push(format!("全盘遍历 {full_count}"));
     }
 
-    // ---- 最终一级：存缓存 + 换入 ----
-    send_index_stage(tx, dir, &entries, &roots, parts.join(" · "), true);
+    // ---- 最终一级：存缓存 + 换入（MFT 成功时带监视计划）----
+    if mft_mode && mft_total > 0 {
+        send_index_stage_watch(tx, dir, &entries, &roots, parts.join(" · "), true, watch_plan);
+    } else {
+        send_index_stage(tx, dir, &entries, &roots, parts.join(" · "), true);
+    }
+}
+
+// ---------------------------------------------------------------- 增量监视（v0.1.8）
+
+/// 本地时间 "HH:MM"（页脚增量状态用；复用 win_time 的本地转换）。
+#[cfg(windows)]
+fn now_hhmm() -> String {
+    let full = win_time::to_local_string(std::time::SystemTime::now())
+        .unwrap_or_else(|| "--:--".to_string());
+    full.chars().skip(11).take(5).collect()
+}
+
+/// USN 监视 supervisor（v0.1.8，仅 MFT 模式）：每卷一个
+/// UsnWatcher 线程把变更喂进一条 mpsc 通道；flush 线程独占
+/// DeltaIndex，每 300ms 把攒下的变更批量应用、freeze 成
+/// (增量索引, 墓碑）快照换进 delta_state，并发 IndexMsg::Delta
+/// 让 UI 刷页脚 + 重搜；墓碑超限/目录改名等触发 NeedRebuild。
+/// 代际退休：watch_gen 与自己代号不符时停掉全部 watcher 并退出
+///（每次最终重建都会 +1 代，旧 supervisor 自动收摊）。
+/// 路径解析靠主索引的文件夹 ref→路径表（dir_paths，refs 已打
+/// 卷标签）；父目录不在表里（索引外新建的目录树）→ 请求全量
+/// 重建兜底，绝不硬拼错路径。便携模式不进这里（无监视、仅手动
+/// 重建），不会崩。
+#[cfg(windows)]
+fn spawn_watch_supervisor(
+    gen: u64,
+    plan: Vec<(char, Option<i64>)>,
+    store: Arc<Mutex<IndexStore>>,
+    delta_state: Arc<Mutex<(IndexStore, Tombstones)>>,
+    watch_gen: Arc<std::sync::atomic::AtomicU64>,
+    flush_now: Arc<AtomicBool>,
+    tx: Sender<IndexMsg>,
+    base_count: usize,
+) {
+    use shunseek_core::sources::usn::{UsnChange, UsnChangeKind, UsnWatcher};
+    // 文件夹 ref（已打标签）→ 完整路径；卷根 ref=5 单独登记
+    let mut dir_paths: HashMap<u64, String> = HashMap::new();
+    {
+        let st = lock_rec(&store);
+        for i in 0..st.count() {
+            let r = st.file_ref(i);
+            if r != 0 && st.category(i) == Category::Folder {
+                dir_paths.insert(r, st.full_path(i));
+            }
+        }
+    }
+    for (drive, _) in &plan {
+        dir_paths.insert(tag_ref(*drive, 5), format!("{drive}:\\"));
+    }
+    let (ch_tx, ch_rx) = std::sync::mpsc::channel::<(char, UsnChange)>();
+    let mut watchers: Vec<Arc<UsnWatcher>> = Vec::new();
+    for (drive, start) in &plan {
+        let w = Arc::new(UsnWatcher::with_start(*drive, *start));
+        watchers.push(w.clone());
+        let ch_tx = ch_tx.clone();
+        let drive = *drive;
+        std::thread::Builder::new()
+            .name(format!("shunseek-usn-{drive}"))
+            .spawn(move || {
+                let _ = w.run(|ch| {
+                    let _ = ch_tx.send((drive, ch));
+                });
+            })
+            .ok();
+    }
+    drop(ch_tx);
+    std::thread::Builder::new()
+        .name("shunseek-usn-flush".into())
+        .spawn(move || {
+            let mut delta = DeltaIndex::new();
+            let mut dir_paths = dir_paths;
+            let mut last_changes = 0usize;
+            let mut rebuild_sent = false;
+            let join = |parent: &str, name: &str| -> String {
+                if parent.ends_with('\\') {
+                    format!("{parent}{name}")
+                } else {
+                    format!("{parent}\\{name}")
+                }
+            };
+            loop {
+                std::thread::sleep(Duration::from_millis(300));
+                if watch_gen.load(Ordering::SeqCst) != gen {
+                    for w in &watchers {
+                        w.stop();
+                    }
+                    break;
+                }
+                let force_report = flush_now.swap(false, Ordering::SeqCst);
+                let mut touched = false;
+                while let Ok((drive, ch)) = ch_rx.try_recv() {
+                    touched = true;
+                    let tref = tag_ref(drive, ch.file_ref);
+                    let tparent = tag_ref(drive, ch.parent_ref);
+                    match ch.kind {
+                        UsnChangeKind::Created | UsnChangeKind::RenamedNewName => {
+                            // 目录改名：子树里所有路径都变了，增量层
+                            // 拼不全 → 请求全量重建兜底（原版口径）
+                            if ch.is_dir
+                                && matches!(ch.kind, UsnChangeKind::RenamedNewName)
+                            {
+                                delta.request_rebuild();
+                            }
+                            match dir_paths.get(&tparent) {
+                                Some(parent) => {
+                                    let full = join(parent, &ch.name);
+                                    if ch.is_dir {
+                                        dir_paths.insert(tref, full.clone());
+                                    }
+                                    delta.upsert(RawEntry {
+                                        name: ch.name.clone(),
+                                        full_path: Some(full),
+                                        category: if ch.is_dir {
+                                            Category::Folder
+                                        } else {
+                                            shunseek_core::classify_by_extension(&ch.name)
+                                        },
+                                        file_ref: tref,
+                                        parent_ref: tparent,
+                                        is_dir: ch.is_dir,
+                                    });
+                                }
+                                None => delta.request_rebuild(),
+                            }
+                        }
+                        UsnChangeKind::Deleted | UsnChangeKind::RenamedOldName => {
+                            if ch.is_dir {
+                                if matches!(ch.kind, UsnChangeKind::RenamedOldName) {
+                                    delta.request_rebuild();
+                                }
+                                match dir_paths.remove(&tref) {
+                                    Some(p) => delta.remove_directory(&p, true),
+                                    None => delta.remove(tref, ""),
+                                }
+                            } else {
+                                let path = dir_paths
+                                    .get(&tparent)
+                                    .map(|p| join(p, &ch.name))
+                                    .unwrap_or_default();
+                                delta.remove(tref, &path);
+                            }
+                        }
+                        UsnChangeKind::Other => {}
+                    }
+                }
+                let changed = delta.total_changes() != last_changes;
+                if !touched && !changed && !force_report {
+                    continue;
+                }
+                if watch_gen.load(Ordering::SeqCst) != gen {
+                    for w in &watchers {
+                        w.stop();
+                    }
+                    break;
+                }
+                last_changes = delta.total_changes();
+                let (frozen, tombs) = delta.freeze();
+                let dcount = frozen.count();
+                let dead = tombs.dead_count();
+                *lock_rec(&delta_state) = (frozen, tombs);
+                let _ = tx.send(IndexMsg::Delta {
+                    delta_count: dcount,
+                    total_count: base_count.saturating_sub(dead) + dcount,
+                    updated_hhmm: now_hhmm(),
+                });
+                if delta.requires_rebuild() && !rebuild_sent {
+                    rebuild_sent = true;
+                    let _ = tx.send(IndexMsg::NeedRebuild);
+                }
+            }
+        })
+        .ok();
 }
 
 // ---------------------------------------------------------------- 搜索
@@ -961,46 +1356,36 @@ struct ResultRow {
     /// 命中段在 name 中的字节偏移；usize::MAX = 不高亮（空查询 / 拼音首字母命中）
     match_start: usize,
     match_len: usize,
-    /// 是否被 core 降权（哈希名 / 垃圾路径）：展示时归类到尾部折叠区。
+    /// 是否被 core 降权（哈希名 / 垃圾路径）：v0.1.8 起只作折叠
+    /// 判定的输入之一（与重要度 Low 取或），不再单独成段。
     demoted: bool,
+    /// 具体类型名（v0.1.8，core filetype::describe）：如「Word 文档」
+    /// 「快捷方式」；行右侧簇 / 宫格副行 / 悬停卡的类型都用它。
+    type_label: String,
+    /// 重要度三档（v0.1.8，core filetype）：折叠分组与重要度点取色用。
+    importance: Importance,
 }
 
-/// 展示行（v0.1.5）：由原始结果 rows 派生，绘制与键盘导航都以它为准。
-/// 两段式派生（rebuild_display）：重要结果（demoted=false）在前，
-/// 其中同一父目录命中 ≥4 条折叠成一个 Group 行（展开后成员以
-/// Single(indent) 跟在组行后）；被降权的结果（demoted=true）整体
-/// 移到尾部，其中同父 ≥2 条折成组、单条直接平铺。空查询不折叠，
-/// display 与 rows 一一对应。
+/// 展示行：由原始结果 rows 派生，绘制与键盘导航都以它为准。
+/// v0.1.8 折叠口径换成原版 FoldByType（见 rebuild_display）：
+/// High 永不折；前 5 条非 High 保底平铺；Normal 同类型总数 ≥4
+/// 折成「N 个{类型}」组（组头恒在，展开成员跟随其后、再点收起）；
+/// Low（或 demoted 信号）汇成尾部一个「其他 N 项」组。空查询
+/// 不折叠，display 与 rows 一一对应。
 #[derive(Clone)]
 enum DisplayRow {
     Single { row: usize, indent: bool },
     Group {
-        /// 父目录完整路径（也是展开状态的键）。
-        dir: String,
+        /// 展开状态键："type:{类型名}" 或 "low"。
+        key: String,
+        /// 组头整行文字（如「12 个日志文件」/「其他 8 项（…）」）。
+        label: String,
         count: usize,
         expanded: bool,
     },
 }
 
-/// 结果完整路径的父目录（最后一个分隔符之前）；无分隔符时为空串。
-fn parent_dir(path: &str) -> &str {
-    match path.rfind(['\\', '/']) {
-        Some(p) => &path[..p],
-        None => "",
-    }
-}
-
-/// 父目录的末两段（组行主文字用，如 "radium\\users"）；不足两段时原样返回。
-fn dir_tail(dir: &str) -> String {
-    let segs: Vec<&str> = dir.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
-    if segs.len() <= 2 {
-        dir.to_string()
-    } else {
-        segs[segs.len() - 2..].join("\\")
-    }
-}
-
-/// 父目录的最后一段（宫格组格主文字 / 详情卡的组名用）。
+/// 父目录的最后一段（范围摘要等处用）。
 fn dir_last(dir: &str) -> String {
     dir.split(['\\', '/'])
         .filter(|s| !s.is_empty())
@@ -1142,8 +1527,8 @@ struct ShunSeekApp {
     rows: Vec<ResultRow>,
     /// 由 rows 派生的展示行（折叠后）；selected / 绘制都以它为准。
     display: Vec<DisplayRow>,
-    /// 已展开的折叠组，按父目录路径记（跨搜索保留展开状态）。
-    expanded_dirs: HashSet<String>,
+    /// 已展开的折叠组，按组键记（"type:{类型}" / "low"，跨搜索保留）。
+    expanded_groups: HashSet<String>,
     /// 本批结果是否启用折叠（空查询不折叠）。
     fold_active: bool,
     /// 结果行真实系统图标缓存（Windows；非 Windows 恒空回退色块）。
@@ -1156,6 +1541,21 @@ struct ShunSeekApp {
     search_focused: bool,
     store: Arc<Mutex<IndexStore>>,
     usage: Arc<Mutex<UsageStore>>,
+    /// 增量索引冻结快照（v0.1.8）：(增量小索引, 墓碑集)，flush
+    /// 线程每 300ms 换新，搜索线程与主索引一起走 search_merged。
+    delta_state: Arc<Mutex<(IndexStore, Tombstones)>>,
+    /// USN 监视代号：每次最终重建 +1，旧一代监视/flush 线程自退。
+    watch_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// 托盘「立即刷新索引」：置位后 flush 线程立刻合并一次。
+    flush_now: Arc<AtomicBool>,
+    /// USN 监视是否在跑（最终重建带了监视计划才为 true）：
+    /// 托盘「立即刷新索引」据此决定走 flush 还是直接全量重建。
+    watch_active: bool,
+    /// 展开折叠组时的一次性结果上限提升（→300，见 toggle_group）：
+    /// Some 时 schedule_search 用它代替 result_limit；查询文本一变
+    /// 即失效（override_query 记武装时的查询）。
+    limit_override: Option<usize>,
+    override_query: String,
     search_cancel: Arc<AtomicBool>,
     search_tx: Sender<SearchMsg>,
     search_rx: Receiver<SearchMsg>,
@@ -1253,6 +1653,36 @@ impl ShunSeekApp {
         let index_tx_app = index_tx.clone();
         spawn_rebuild(dir.clone(), index_tx);
 
+        // 单实例唤醒等待线程（v0.1.8，Windows）：main 建好的命名
+        // 事件句柄在这里等——第二进程 SetEvent 后置位 WAKE_FLAG
+        // 并唤醒 UI 线程（update 里 show）。
+        #[cfg(windows)]
+        {
+            let h = WAKE_EVENT.load(Ordering::SeqCst);
+            if h != 0 {
+                let ctx = cc.egui_ctx.clone();
+                std::thread::Builder::new()
+                    .name("shunseek-wake".into())
+                    .spawn(move || {
+                        use windows_sys::Win32::System::Threading::{
+                            ResetEvent, WaitForSingleObject,
+                        };
+                        loop {
+                            let r = unsafe { WaitForSingleObject(h, u32::MAX) };
+                            if r != 0 {
+                                break; // WAIT_FAILED 等异常：线程收工
+                            }
+                            unsafe {
+                                ResetEvent(h);
+                            }
+                            WAKE_FLAG.store(true, Ordering::SeqCst);
+                            ctx.request_repaint();
+                        }
+                    })
+                    .ok();
+            }
+        }
+
         let settings = load_settings();
         let theme = settings.theme;
         let view_mode = settings.view;
@@ -1269,7 +1699,7 @@ impl ShunSeekApp {
             grid_cols: 6,
             rows: Vec::new(),
             display: Vec::new(),
-            expanded_dirs: HashSet::new(),
+            expanded_groups: HashSet::new(),
             fold_active: false,
             icons: icons::IconCache::new(&cc.egui_ctx),
             selected: 0,
@@ -1278,6 +1708,15 @@ impl ShunSeekApp {
             search_focused: false,
             store: Arc::new(Mutex::new(store)),
             usage: Arc::new(Mutex::new(usage)),
+            delta_state: Arc::new(Mutex::new((
+                build_index(Vec::new(), None),
+                Tombstones::default(),
+            ))),
+            watch_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            flush_now: Arc::new(AtomicBool::new(false)),
+            watch_active: false,
+            limit_override: None,
+            override_query: String::new(),
             search_cancel: Arc::new(AtomicBool::new(true)),
             search_tx,
             search_rx,
@@ -1290,7 +1729,7 @@ impl ShunSeekApp {
                     rebuilding: true,
                 },
             ),
-            visible: true,
+            visible: !START_HIDDEN.load(Ordering::SeqCst),
             allow_exit: false,
             focus_search: true,
             scroll_to_selected: false,
@@ -1350,10 +1789,15 @@ impl ShunSeekApp {
         let cat_mask: u16 = cat_set
             .iter()
             .fold(0u16, |m, c| m | (1u16 << (*c as u8)));
-        let result_limit = self.result_limit;
+        // 展开折叠组的一次性上限提升：查询文本变了即失效
+        if self.limit_override.is_some() && self.override_query != self.query {
+            self.limit_override = None;
+        }
+        let result_limit = self.limit_override.unwrap_or(self.result_limit);
         let scope = self.build_scope_filter();
         let store = self.store.clone();
         let usage = self.usage.clone();
+        let delta_state = self.delta_state.clone();
         let tx = self.search_tx.clone();
         std::thread::Builder::new()
             .name("shunseek-search".into())
@@ -1369,27 +1813,52 @@ impl ShunSeekApp {
                     {
                         let store_g = lock_rec(&store);
                         let usage_g = lock_rec(&usage);
+                        let delta_g = lock_rec(&delta_state);
                         if empty_query {
                             // 首页由 UI 侧 pins 绘制；空查询只回空结果集，
                             // 保持消息管线（计数/选中复位）一致。
                             rows = Vec::new();
                         } else {
-                            let engine = SearchEngine::new(&store_g, Some(&usage_g));
-                            let hits = engine.search_scoped(
-                                &query,
-                                cat_mask,
-                                result_limit,
-                                &cancel,
-                                scope.as_ref(),
-                            );
+                            // v0.1.8：增量层非空（有增量条目或墓碑）时
+                            // 走合并搜索（主索引带墓碑 + 增量层独立搜
+                            // 后合并，命中下标 >= 主索引条数的是增量层）；
+                            // 否则原单引擎路径，行为不变。
+                            let (delta_store, tombs) = &*delta_g;
+                            let hits = if delta_store.count() > 0 || !tombs.is_empty() {
+                                search_merged(
+                                    &store_g,
+                                    Some(delta_store),
+                                    Some(tombs),
+                                    Some(&usage_g),
+                                    &query,
+                                    cat_mask,
+                                    result_limit,
+                                    &cancel,
+                                    scope.as_ref(),
+                                )
+                            } else {
+                                SearchEngine::new(&store_g, Some(&usage_g)).search_scoped(
+                                    &query,
+                                    cat_mask,
+                                    result_limit,
+                                    &cancel,
+                                    scope.as_ref(),
+                                )
+                            };
                             if cancel.load(Ordering::SeqCst) {
                                 return;
                             }
+                            let base_count = store_g.count();
                             rows = hits
                                 .iter()
                                 .map(|h| {
-                                    let i = h.index as usize;
-                                    let name = store_g.name(i);
+                                    let (st, i): (&IndexStore, usize) =
+                                        if (h.index as usize) < base_count {
+                                            (&store_g, h.index as usize)
+                                        } else {
+                                            (delta_store, h.index as usize - base_count)
+                                        };
+                                    let name = st.name(i);
                                     // 高亮长度：core 给的是名字段的字符数
                                     // （路径模式下不含路径片段），换算成字节数。
                                     // match_start 是字节偏移：切片数字符前先
@@ -1412,14 +1881,30 @@ impl ShunSeekApp {
                                             .unwrap_or(name.len());
                                         end_byte - start_byte
                                     };
+                                    let path = st.full_path(i);
+                                    let category = st.category(i);
+                                    // 类型名 + 重要度（v0.1.8）：每行
+                                    // 构建时算一次，绘制/折叠直接读。
+                                    let (type_label, importance) = filetype::describe(
+                                        &path,
+                                        category,
+                                        matches!(
+                                            category,
+                                            Category::Folder | Category::InstallDir
+                                        ),
+                                    );
                                     ResultRow {
                                         name: name.to_string(),
-                                        path: store_g.full_path(i),
-                                        category: store_g.category(i),
-                                        // 拼音首字母 / 子序列命中的 match_start
-                                        // 不是连续命中段，不高亮以免标错位置；
-                                        // 连续命中也先收敛边界再存。
-                                        match_start: if h.via_initials || h.fuzzy {
+                                        path,
+                                        category,
+                                        // 拼音首字母 / 全拼 / 子序列命中的
+                                        // match_start 不是连续命中段，不
+                                        // 高亮以免标错位置；连续命中也先
+                                        // 收敛边界再存。
+                                        match_start: if h.via_initials
+                                            || h.via_pinyin
+                                            || h.fuzzy
+                                        {
                                             usize::MAX
                                         } else {
                                             floor_char_boundary(
@@ -1429,6 +1914,8 @@ impl ShunSeekApp {
                                         },
                                         match_len,
                                         demoted: h.demoted,
+                                        type_label,
+                                        importance,
                                     }
                                 })
                                 .collect();
@@ -1497,6 +1984,12 @@ impl ShunSeekApp {
         let Some(row) = self.rows.get(idx).cloned() else {
             return;
         };
+        // 打开失败提示（v0.1.8）：路径已不存在（被移动/删除而
+        // 索引还没刷新）时不再盲开 ShellExecute，只在状态栏说明。
+        if !row.path.is_empty() && !std::path::Path::new(&row.path).exists() {
+            self.status = "路径已不存在（可能被移动或删除）".to_string();
+            return;
+        }
         opener::open(&row.path, &row.name, locate);
         {
             let mut u = lock_rec(&self.usage);
@@ -1522,7 +2015,7 @@ impl ShunSeekApp {
             0
         };
         match self.display.get(idx).cloned() {
-            Some(DisplayRow::Group { dir, .. }) => self.toggle_group(&dir),
+            Some(DisplayRow::Group { key, .. }) => self.toggle_group(&key),
             Some(DisplayRow::Single { row, .. }) => self.open_row(ctx, row, locate),
             None => {}
         }
@@ -1543,20 +2036,136 @@ impl ShunSeekApp {
         self.scroll_to_selected = true;
     }
 
-    /// 由 rows 重建展示行（两段式）：重要结果（demoted=false）在前，
-    /// 段内同父 ≥4 条折成组行（出现在该目录首个成员的位置，展开后
-    /// 成员带缩进跟在后面）；被降权的结果整体移到尾部段，段内同父
-    /// ≥2 条即折成组、单条平铺。只作用于已取回的这批结果（≤100 条）。
+    /// 由 rows 重建展示行（v0.1.8，原版 MainViewModel.FoldByType
+    /// 口径）：只在 fold_active && fold_demoted 时折叠，其余平铺。
+    /// 折叠判定按行的重要度（core filetype）+ demoted 信号：
+    ///  - High 永不折，永远平铺；
+    ///  - 前 5 条非 High 结果保底平铺（原版 AlwaysVisible=5）；
+    ///  - Normal：同一类型名在非 High 中的总数 ≥4（FoldThreshold）
+    ///    时，其余（非保底）成员折成一个「{N} 个{类型}」组，组头
+    ///    出现在该类型第一个被折成员的位置；N = 总数 − 保底数；
+    ///  - Low 或 demoted：非保底成员全部汇成尾部一个「其他 N 项
+    ///    （日志/缓存/临时文件）」组（原版 LowGroupLabel 口径）；
+    ///    只剩 1 条时直接平铺在尾部、不成组。
+    /// 组头恒保留：展开时成员以 indent 紧随组头，再点组头收起
+    ///（展开状态按组键存 expanded_groups，跨搜索保留）。
     fn rebuild_display(&mut self) {
         let mut display: Vec<DisplayRow> = Vec::with_capacity(self.rows.len());
         if self.fold_active && self.fold_demoted {
-            Self::display_section(&self.rows, &self.expanded_dirs, Some(false), 4, &mut display);
-            Self::display_section(&self.rows, &self.expanded_dirs, Some(true), 2, &mut display);
-        } else if self.fold_active {
-            // 设置里关掉「折叠不重要结果」：demoted 不再单独归类，
-            // 全体按同一套 ≥4 规则派生（core 的排序降权仍在，
-            // 不重要结果自然靠后逐条平铺）
-            Self::display_section(&self.rows, &self.expanded_dirs, None, 4, &mut display);
+            let rows = &self.rows;
+            // 非 High 总数按类型名计（折叠阈值口径）
+            let mut totals: HashMap<&str, usize> = HashMap::new();
+            for r in rows {
+                if r.importance != Importance::High {
+                    *totals.entry(r.type_label.as_str()).or_default() += 1;
+                }
+            }
+            // 保底集：前 5 条非 High 的下标
+            let mut always: HashSet<usize> = HashSet::new();
+            for (i, r) in rows.iter().enumerate() {
+                if always.len() >= 5 {
+                    break;
+                }
+                if r.importance != Importance::High {
+                    always.insert(i);
+                }
+            }
+            let mut emitted: HashSet<&str> = HashSet::new();
+            let mut low_rows: Vec<usize> = Vec::new();
+            for (i, r) in rows.iter().enumerate() {
+                let is_low = r.importance == Importance::Low || r.demoted;
+                if r.importance == Importance::High {
+                    display.push(DisplayRow::Single {
+                        row: i,
+                        indent: false,
+                    });
+                } else if is_low {
+                    if always.contains(&i) {
+                        display.push(DisplayRow::Single {
+                            row: i,
+                            indent: false,
+                        });
+                    } else {
+                        low_rows.push(i);
+                    }
+                } else if always.contains(&i) {
+                    display.push(DisplayRow::Single {
+                        row: i,
+                        indent: false,
+                    });
+                } else if totals.get(r.type_label.as_str()).copied().unwrap_or(0) >= 4 {
+                    // Normal 且同类够多：首个被折成员处出组头
+                    if emitted.insert(r.type_label.as_str()) {
+                        let label = r.type_label.clone();
+                        // 组头计数 = 该组实际代表的成员数（非保底、
+                        // Normal、未被 demoted 信号划去 Low 组的）
+                        let count = rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(j, rr)| {
+                                rr.importance == Importance::Normal
+                                    && !rr.demoted
+                                    && rr.type_label == label
+                                    && !always.contains(j)
+                            })
+                            .count();
+                        let key = format!("type:{label}");
+                        let expanded = self.expanded_groups.contains(&key);
+                        display.push(DisplayRow::Group {
+                            key,
+                            label: format!("{count} 个{label}"),
+                            count,
+                            expanded,
+                        });
+                        if expanded {
+                            for (j, rr) in rows.iter().enumerate() {
+                                if rr.importance == Importance::Normal
+                                    && !rr.demoted
+                                    && rr.type_label == label
+                                    && !always.contains(&j)
+                                {
+                                    display.push(DisplayRow::Single {
+                                        row: j,
+                                        indent: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // 其余成员已被组行代表，跳过
+                } else {
+                    display.push(DisplayRow::Single {
+                        row: i,
+                        indent: false,
+                    });
+                }
+            }
+            // Low 组恒在尾部（原版：低组在主循环之后统一发出）
+            match low_rows.len() {
+                0 => {}
+                1 => display.push(DisplayRow::Single {
+                    row: low_rows[0],
+                    indent: false,
+                }),
+                n => {
+                    let key = "low".to_string();
+                    let expanded = self.expanded_groups.contains(&key);
+                    display.push(DisplayRow::Group {
+                        label: format!("其他 {n} 项（日志/缓存/临时文件）"),
+                        key,
+                        count: n,
+                        expanded,
+                    });
+                    if expanded {
+                        for &j in &low_rows {
+                            display.push(DisplayRow::Single {
+                                row: j,
+                                indent: true,
+                            });
+                        }
+                    }
+                }
+            }
         } else {
             display.extend((0..self.rows.len()).map(|i| DisplayRow::Single {
                 row: i,
@@ -1569,66 +2178,26 @@ impl ShunSeekApp {
         }
     }
 
-    /// 展示行派生的一段：从 rows 里挑 demoted 标志匹配 `demoted`
-    ///（None = 全部）的条目（保持原相对顺序），同父目录计数
-    /// ≥ threshold 的折成组行。
-    fn display_section(
-        rows: &[ResultRow],
-        expanded_dirs: &HashSet<String>,
-        demoted: Option<bool>,
-        threshold: usize,
-        display: &mut Vec<DisplayRow>,
-    ) {
-        let in_section = |r: &ResultRow| demoted.map_or(true, |d| r.demoted == d);
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for r in rows {
-            if in_section(r) {
-                let p = parent_dir(&r.path);
-                if !p.is_empty() {
-                    *counts.entry(p).or_default() += 1;
-                }
-            }
+    /// 展开/收起一个折叠组（按组键记状态），重建展示行；组头恒
+    /// 保留、位置不因展开/收起而移动，selected 无需调整。
+    /// 展开时若当前结果已顶到上限且上限 <300，一次性把上限提到
+    /// 300 重查（原版 Expand 行为：组里可能还有没取回的成员）；
+    /// 提升只对当前查询有效，查询一变即失效（见 schedule_search）。
+    fn toggle_group(&mut self, key: &str) {
+        let expanding = !self.expanded_groups.contains(key);
+        if expanding {
+            self.expanded_groups.insert(key.to_string());
+        } else {
+            self.expanded_groups.remove(key);
         }
-        let mut emitted: HashSet<&str> = HashSet::new();
-        for (i, r) in rows.iter().enumerate() {
-            if !in_section(r) {
-                continue;
-            }
-            let p = parent_dir(&r.path);
-            if counts.get(p).copied().unwrap_or(0) >= threshold {
-                if emitted.insert(p) {
-                    let expanded = expanded_dirs.contains(p);
-                    display.push(DisplayRow::Group {
-                        dir: p.to_string(),
-                        count: counts[p],
-                        expanded,
-                    });
-                    if expanded {
-                        for (j, rr) in rows.iter().enumerate() {
-                            if in_section(rr) && parent_dir(&rr.path) == p {
-                                display.push(DisplayRow::Single {
-                                    row: j,
-                                    indent: true,
-                                });
-                            }
-                        }
-                    }
-                }
-                // 该目录的其余成员已被组行代表，跳过
-            } else {
-                display.push(DisplayRow::Single {
-                    row: i,
-                    indent: false,
-                });
-            }
-        }
-    }
-
-    /// 展开/收起一个折叠组（按父目录路径记状态），重建展示行；
-    /// 组行本身的位置不因展开/收起而移动，selected 无需调整。
-    fn toggle_group(&mut self, dir: &str) {
-        if !self.expanded_dirs.remove(dir) {
-            self.expanded_dirs.insert(dir.to_string());
+        if expanding
+            && self.rows.len() >= self.result_limit
+            && self.result_limit < 300
+            && self.limit_override.is_none()
+        {
+            self.limit_override = Some(300);
+            self.override_query = self.query.clone();
+            self.schedule_search();
         }
         self.rebuild_display();
     }
@@ -1808,6 +2377,12 @@ impl ShunSeekApp {
                         shunseek_core::classify_by_extension(&name)
                     }
                 });
+                let (type_label, importance) = filetype::describe(
+                    p,
+                    category,
+                    matches!(category, Category::Folder | Category::InstallDir)
+                        || std::path::Path::new(p).is_dir(),
+                );
                 ResultRow {
                     name,
                     path: p.clone(),
@@ -1815,6 +2390,8 @@ impl ShunSeekApp {
                     match_start: usize::MAX,
                     match_len: 0,
                     demoted: false,
+                    type_label,
+                    importance,
                 }
             })
             .collect();
@@ -1825,6 +2402,10 @@ impl ShunSeekApp {
         let Some(row) = self.home_items.get(idx).cloned() else {
             return;
         };
+        if !row.path.is_empty() && !std::path::Path::new(&row.path).exists() {
+            self.status = "路径已不存在（可能被移动或删除）".to_string();
+            return;
+        }
         opener::open(&row.path, &row.name, locate);
         {
             let mut u = lock_rec(&self.usage);
@@ -1877,13 +2458,46 @@ impl ShunSeekApp {
             } = ev
             {
                 match *key {
-                    // Esc 顺序：先收起展开中的筛选控件（并关掉范围
-                    // 面板），没有展开控件时才隐藏窗口。
+                    // Esc 三段链（v0.1.8 补中间一档，对齐原版）：
+                    // 先收起展开中的筛选控件（并关掉范围面板）→
+                    // 再清查询（回到首页）→ 最后才隐藏窗口。
                     Key::Escape => {
                         if self.expanded_filter.take().is_some() {
                             ctx.memory_mut(|m| m.close_popup());
+                        } else if !self.query.is_empty() {
+                            self.query.clear();
+                            self.schedule_search();
                         } else {
                             self.hide(ctx);
+                        }
+                    }
+                    // PgUp/PgDn：三行/三排步进（v0.1.8）；Home/End
+                    // 跳首/尾。步长口径与方向键一致（列表 1、宫格
+                    // 按列数、首页按首页列数）。
+                    Key::PageDown | Key::PageUp => {
+                        let unit = if self.is_home() {
+                            self.home_cols.max(1) as i32
+                        } else if self.view_mode == ViewMode::Grid {
+                            self.grid_cols.max(1) as i32
+                        } else {
+                            1
+                        };
+                        let d = unit * 3;
+                        self.move_selection(if *key == Key::PageDown { d } else { -d });
+                    }
+                    Key::Home => {
+                        self.selected = 0;
+                        self.scroll_to_selected = true;
+                    }
+                    Key::End => {
+                        let len = if self.is_home() {
+                            self.home_items.len()
+                        } else {
+                            self.display.len()
+                        };
+                        if len > 0 {
+                            self.selected = len - 1;
+                            self.scroll_to_selected = true;
                         }
                     }
                     // 宫格步长：首页用首页列数、搜索宫格用宫格列数；
@@ -1936,6 +2550,7 @@ impl ShunSeekApp {
                     saved,
                     summary,
                     final_stage,
+                    watch,
                 } => {
                     *lock_rec(&self.store) = store;
                     self.index_count = count;
@@ -1955,11 +2570,64 @@ impl ShunSeekApp {
                         } else {
                             format!("{} 项 · 缓存写入失败", group_thousands(count))
                         };
+                        // v0.1.8 增量监视换代：旧 supervisor 退休，
+                        // 增量快照清零；本轮带监视计划（MFT 模式）
+                        // 就起新一代 supervisor。便携模式 watch 为
+                        // 空 → 无增量，仅手动重建。
+                        let gen = self
+                            .watch_gen
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        *lock_rec(&self.delta_state) = (
+                            build_index(Vec::new(), None),
+                            Tombstones::default(),
+                        );
+                        self.watch_active = !watch.is_empty();
+                        #[cfg(windows)]
+                        if !watch.is_empty() {
+                            spawn_watch_supervisor(
+                                gen,
+                                watch,
+                                self.store.clone(),
+                                self.delta_state.clone(),
+                                self.watch_gen.clone(),
+                                self.flush_now.clone(),
+                                self.index_tx.clone(),
+                                count,
+                            );
+                        }
+                        #[cfg(not(windows))]
+                        let _ = gen;
                     } else {
                         // 阶段性换入：搜索已可对当前索引用，不等最终一级
                         self.status = "正在建立索引…".to_string();
                     }
                     self.schedule_search();
+                }
+                IndexMsg::Delta {
+                    delta_count,
+                    total_count,
+                    updated_hhmm,
+                } => {
+                    // 页脚增量状态（原版短格式）：「{总数} 项 · 增量
+                    // M · HH:mm 更新」；增量为 0 时只报总数 + 时刻。
+                    self.index_count = total_count;
+                    self.status = if delta_count > 0 {
+                        format!(
+                            "{} 项 · 增量 {} · {} 更新",
+                            group_thousands(total_count),
+                            group_thousands(delta_count),
+                            updated_hhmm
+                        )
+                    } else {
+                        format!("{} 项 · {} 更新", group_thousands(total_count), updated_hhmm)
+                    };
+                    self.schedule_search();
+                }
+                IndexMsg::NeedRebuild => {
+                    // 增量层要求全量重建（墓碑超限/目录改名等）；
+                    // start_rebuild 自带并发护栏，重复请求无害。
+                    self.start_rebuild();
                 }
             }
         }
@@ -3305,17 +3973,24 @@ impl ShunSeekApp {
                 let plate =
                     egui::Rect::from_center_size(icon_rect.center(), Vec2::splat(40.0));
                 painter.rect_filled(plate, Rounding::same(10.0), pal.icon_plate);
-                // 占位盘不许是空的：按类别画清晰字形（TextMid 对比度）
-                let glyph =
-                    egui::Rect::from_center_size(plate.center(), Vec2::splat(26.0));
-                match item.category {
-                    Category::Folder | Category::InstallDir => {
-                        paint_folder_glyph(&painter, glyph)
+                // 图标总规（v0.1.8 用户钉死）：文件类图标只许 Windows
+                // 系统原版（Shell 取图链：真实路径 → .lnk 目标解析 →
+                // USEFILEATTRIBUTES 通用图标），不许自绘字形冒充。
+                // Windows 上图标未到达时只画空占位盘，到达后换真图标；
+                // 非 Windows 演示构建没有 Shell，才保留类别字形。
+                #[cfg(not(windows))]
+                {
+                    let glyph =
+                        egui::Rect::from_center_size(plate.center(), Vec2::splat(26.0));
+                    match item.category {
+                        Category::Folder | Category::InstallDir => {
+                            paint_folder_glyph(&painter, glyph)
+                        }
+                        Category::Document => {
+                            paint_doc_glyph(&painter, glyph, pal.text_mid)
+                        }
+                        _ => paint_file_glyph(&painter, glyph, pal.text_mid),
                     }
-                    Category::Document => {
-                        paint_doc_glyph(&painter, glyph, pal.text_mid)
-                    }
-                    _ => paint_file_glyph(&painter, glyph, pal.text_mid),
                 }
             }
         }
@@ -3511,15 +4186,17 @@ impl ShunSeekApp {
         // clone dir 字符串），行本体绘制时借用，不整行 clone。
         enum CellData {
             Single(usize, bool),
-            Group(String, usize, bool),
+            /// (组键, 组头文字, 成员数, 是否展开)
+            Group(String, String, usize, bool),
         }
         let data = match self.display.get(idx)? {
             DisplayRow::Single { row, indent } => CellData::Single(*row, *indent),
             DisplayRow::Group {
-                dir,
+                key,
+                label,
                 count,
                 expanded,
-            } => CellData::Group(dir.clone(), *count, *expanded),
+            } => CellData::Group(key.clone(), label.clone(), *count, *expanded),
         };
         let rect = cell.shrink(3.0);
         let response = ui.interact(rect, ui.id().with(("grid_cell", idx)), egui::Sense::click());
@@ -3597,6 +4274,14 @@ impl ShunSeekApp {
                     galley,
                     pal.name_text,
                 );
+                // 类型副行（v0.1.8）：格子底部一行小字具体类型名
+                painter.text(
+                    egui::pos2(rect.center().x, rect.bottom() - 8.0),
+                    egui::Align2::CENTER_CENTER,
+                    r.type_label.clone(),
+                    FontId::proportional(9.5),
+                    pal.path_text,
+                );
                 let mut act = None;
                 if response.double_clicked() {
                     act = Some(RowAction::Open(idx));
@@ -3621,24 +4306,23 @@ impl ShunSeekApp {
                 });
                 menu_act.or(act)
             }
-            CellData::Group(dir, count, expanded) => {
-                if response.hovered() {
-                    self.hover_seen = Some(HoverTarget {
-                        name: dir_last(dir),
-                        path: dir.clone(),
-                        category: Category::Folder,
-                    });
-                }
-                // 占位盘 + 文件夹字形（组格没有单一真实图标可取）
+            CellData::Group(key, label, count, expanded) => {
+                // 占位盘（组格没有单一真实图标可取）。图标总规
+                //（v0.1.8）：Windows 上不许拿自绘文件夹字形冒充文件
+                // 夹图标，只画空盘；文件夹字形仅非 Windows 演示保留。
+                // 类型组没有单一路径，不弹悬停详情卡。
                 painter.rect_filled(icon_rect, Rounding::same(10.0), pal.icon_plate);
-                let glyph = egui::Rect::from_center_size(
-                    icon_rect.center(),
-                    Vec2::splat(30.0),
-                );
-                paint_folder_glyph(&painter, glyph);
+                #[cfg(not(windows))]
+                {
+                    let glyph = egui::Rect::from_center_size(
+                        icon_rect.center(),
+                        Vec2::splat(30.0),
+                    );
+                    paint_folder_glyph(&painter, glyph);
+                }
                 let galley = ui.fonts(|f| {
                     f.layout(
-                        dir_last(dir),
+                        label.clone(),
                         serif(12.0),
                         pal.name_text,
                         92.0,
@@ -3660,7 +4344,7 @@ impl ShunSeekApp {
                     pal.path_text,
                 );
                 if response.clicked() || response.double_clicked() {
-                    Some(RowAction::Toggle(idx, dir.clone()))
+                    Some(RowAction::Toggle(idx, key.clone()))
                 } else {
                     None
                 }
@@ -3672,7 +4356,7 @@ impl ShunSeekApp {
     /// open_selected，逻辑一致）。
     fn open_display_row(&mut self, ctx: &egui::Context, idx: usize, locate: bool) {
         match self.display.get(idx).cloned() {
-            Some(DisplayRow::Group { dir, .. }) => self.toggle_group(&dir),
+            Some(DisplayRow::Group { key, .. }) => self.toggle_group(&key),
             Some(DisplayRow::Single { row, .. }) => self.open_row(ctx, row, locate),
             None => {}
         }
@@ -3680,19 +4364,20 @@ impl ShunSeekApp {
 
     fn draw_display_row(&mut self, ui: &mut egui::Ui, idx: usize) -> Option<RowAction> {
         // 借用取出（v0.1.6 减负）：Single 的字段是 Copy；Group 只
-        // clone 一条 dir 字符串，不再整行 clone DisplayRow。
+        // clone 键与标签字符串，不再整行 clone DisplayRow。
         match self.display.get(idx)? {
             DisplayRow::Single { row, indent } => {
                 let (r, i) = (*row, *indent);
                 self.draw_row(ui, r, idx, i)
             }
             DisplayRow::Group {
-                dir,
+                key,
+                label,
                 count,
                 expanded,
             } => {
-                let (d, c, e) = (dir.clone(), *count, *expanded);
-                self.draw_group_row(ui, idx, &d, c, e)
+                let (k, l, c, e) = (key.clone(), label.clone(), *count, *expanded);
+                self.draw_group_row(ui, idx, &k, &l, c, e)
             }
         }
     }
@@ -3765,8 +4450,10 @@ impl ShunSeekApp {
         }
 
         // 右侧簇（右 Margin 12 起向左）：类型标签 → 重要度点 → 固定标记
+        // 类型标签 v0.1.8 起用具体类型名（filetype，如「Word 文档」），
+        // 重要度点按三档取色（demoted 信号强制按 Low 显示）。
         let type_galley = painter.layout_no_wrap(
-            row.category.display_name().to_string(),
+            row.type_label.clone(),
             FontId::proportional(10.0),
             pal.path_text,
         );
@@ -3779,9 +4466,10 @@ impl ShunSeekApp {
         let imp_color = if row.demoted {
             pal.importance_low
         } else {
-            match row.category {
-                Category::App | Category::Shortcut => pal.importance_high,
-                _ => pal.importance_normal,
+            match row.importance {
+                Importance::High => pal.importance_high,
+                Importance::Normal => pal.importance_normal,
+                Importance::Low => pal.importance_low,
             }
         };
         let dot_c = egui::pos2(type_x - 7.0 - 2.5, rect.center().y);
@@ -3903,17 +4591,20 @@ impl ShunSeekApp {
     }
     /// 折叠组行（原版 FoldRow）：FoldFill 底、圆角 9，内缩近似
     /// 原版 Margin 2,4,6,4；左侧小三角字形（9.5 级 TextLow）+
-    /// Serif 12 TextMid 单行文字「{末两段} · N 个同目录结果」。
-    /// 选中描 PillStroke 边，悬停叠 SurfaceHover。
-    /// 点击 = 展开/收起（RowAction::Toggle），悬停提示完整父目录。
+    /// Serif 12 TextMid 单行文字 = 组头标签（「N 个{类型}」/
+    /// 「其他 N 项（…）」）+ 展开状态后缀。组头恒保留：展开后
+    /// 再点收起（用户钉死）。选中描 PillStroke 边，悬停叠
+    /// SurfaceHover。点击 = 展开/收起（RowAction::Toggle 带组键）。
     fn draw_group_row(
         &mut self,
         ui: &mut egui::Ui,
         display_idx: usize,
-        dir: &str,
+        key: &str,
+        label: &str,
         count: usize,
         expanded: bool,
     ) -> Option<RowAction> {
+        let _ = count; // 计数已含在 label 里，参数留作调试/将来副行用
         let pal = self.theme.palette();
         let (rect, response) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), ROW_H),
@@ -3953,12 +4644,10 @@ impl ShunSeekApp {
         };
         painter.add(egui::Shape::convex_polygon(tri, pal.path_text, Stroke::NONE));
 
-        // 单行文字（裁剪到组行右内边距）
+        // 单行文字（裁剪到组行右内边距）：组头标签 + 状态后缀
         let text = format!(
-            "{} · {} 个同目录结果{}",
-            dir_tail(dir),
-            count,
-            if expanded { " · 已展开" } else { "" }
+            "{label}{}",
+            if expanded { " · 点击收起" } else { " · 点击展开" }
         );
         let text_x = bg.left() + 32.0;
         let clip = egui::Rect::from_min_max(
@@ -3973,16 +4662,10 @@ impl ShunSeekApp {
             pal.text_mid,
         );
 
-        if response.hovered() {
-            self.hover_seen = Some(HoverTarget {
-                name: dir_last(dir),
-                path: dir.to_string(),
-                category: Category::Folder,
-            });
-        }
+        // 类型组没有单一路径，不弹悬停详情卡
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.clicked() || response.double_clicked() {
-            Some(RowAction::Toggle(display_idx, dir.to_string()))
+            Some(RowAction::Toggle(display_idx, key.to_string()))
         } else {
             None
         }
@@ -4140,6 +4823,10 @@ fn paint_folder_glyph(painter: &egui::Painter, rect: egui::Rect) {
 
 /// 文档字形（首页占位盘用）：竖页 + 右上折角 + 三行正文线，
 /// 描边取传入色（调用方给 TextMid，保证在占位盘里清晰可见）。
+/// 文档字形：仅非 Windows 演示构建的占位盘用（v0.1.8 图标总规：
+/// Windows 上文件类图标只许系统原版，不许自绘冒充，故本函数在
+/// Windows 构建中不存在）。
+#[cfg(not(windows))]
 fn paint_doc_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let (w, h) = (rect.width(), rect.height());
     let (x0, y0) = (rect.left(), rect.top());
@@ -4189,6 +4876,8 @@ fn paint_doc_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 
 /// 通用文件字形（首页占位盘用）：圆角页身轮廓 + 中间一短横，
 /// 与文档字形（折角 + 多行）区分。
+/// 通用文件字形：仅非 Windows 演示构建的占位盘用（同 paint_doc_glyph）。
+#[cfg(not(windows))]
 fn paint_file_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let (w, h) = (rect.width(), rect.height());
     let (x0, y0) = (rect.left(), rect.top());
@@ -4878,11 +5567,14 @@ impl ShunSeekApp {
                             .as_ref()
                             .map(|m| m.is_dir)
                             .unwrap_or(target.category == Category::Folder);
-                        let type_name = if is_dir {
-                            "文件夹"
-                        } else {
-                            target.category.display_name()
-                        };
+                        // 类型用具体类型名（v0.1.8 filetype，如
+                        // 「PDF 文档」「快捷方式」），不再是粗分类名
+                        let type_name = filetype::describe(
+                            &target.path,
+                            target.category,
+                            is_dir,
+                        )
+                        .0;
                         ui.label(
                             RichText::new(format!("类型：{type_name}"))
                                 .size(11.5)
@@ -4951,6 +5643,16 @@ fn egui_key_to_vk(key: Key) -> Option<u32> {
 
 impl eframe::App for ShunSeekApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --tray 静默启动（v0.1.8）：首帧把窗口藏进托盘（窗口是
+        // 先建成再隐藏的，ViewportBuilder 没有初始不可见选项）
+        if START_HIDDEN.swap(false, Ordering::SeqCst) {
+            self.hide(ctx);
+        }
+        // 单实例唤醒（v0.1.8）：第二进程 SetEvent 后等待线程置位
+        // WAKE_FLAG 并 request_repaint，这里把已有窗口呼出来
+        if WAKE_FLAG.swap(false, Ordering::SeqCst) {
+            self.show(ctx);
+        }
         // 热键 / 托盘（都要在窗口隐藏时也能响应，靠各自线程 request_repaint 唤醒）
         if self.hotkey.take_fired() {
             self.toggle(ctx);
@@ -4966,6 +5668,15 @@ impl eframe::App for ShunSeekApp {
                     }
                 }
                 tray::TrayAction::RebuildIndex => self.start_rebuild(),
+                tray::TrayAction::RefreshIndex => {
+                    // 有 USN 监视：请 flush 线程立即合并一次；
+                    // 便携模式没监视 → 等效手动全量重建
+                    if self.watch_active {
+                        self.flush_now.store(true, Ordering::SeqCst);
+                    } else {
+                        self.start_rebuild();
+                    }
+                }
                 tray::TrayAction::OpenSettings => {
                     if !self.visible {
                         self.show(ctx);
@@ -5169,7 +5880,86 @@ fn install_visuals(ctx: &egui::Context, theme: Theme) {
     ctx.set_visuals(visuals);
 }
 
+/// --tray 静默启动标志（自启带 --tray 时 main 置位，首帧消费）。
+static START_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// 单实例唤醒标志：等待线程收到命名事件后置位，update 消费。
+static WAKE_FLAG: AtomicBool = AtomicBool::new(false);
+/// 单实例唤醒事件句柄（main 创建；0 = 无/非 Windows）。
+static WAKE_EVENT: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+/// 崩溃日志（v0.1.8）：panic 时先把信息写到数据目录
+/// logs/crash-<unix秒>.log，再链回默认 hook（stderr 照常输出）。
+fn install_crash_log_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let dir = data_dir().join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let body = format!(
+            "ShunSeek v{} panic\n{info}\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let _ = std::fs::write(dir.join(format!("crash-{ts}.log")), body);
+        prev(info);
+    }));
+}
+
+/// 单实例获取（v0.1.8，Windows）：命名 Mutex 已存在 → 给已有
+/// 实例的命名事件 SetEvent 唤醒它、返回 false（本进程退出）；
+/// 首实例 → 建手动重置唤醒事件（句柄存 WAKE_EVENT 给等待线程）
+/// 并返回 true。Mutex 创建失败时保守放行（宁可双开不可锁死）。
+#[cfg(windows)]
+fn single_instance_acquire() -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, CreateMutexW, OpenEventW, SetEvent, EVENT_MODIFY_STATE,
+    };
+    let wide = |s: &str| -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    };
+    unsafe {
+        let mutex_name = wide("ShunSeekSingleInstanceMutex");
+        let mh = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
+        if mh == 0 {
+            return true;
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let ev_name = wide("ShunSeekWakeEvent");
+            let eh = OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr());
+            if eh != 0 {
+                SetEvent(eh);
+                CloseHandle(eh);
+            }
+            return false;
+        }
+        let ev_name = wide("ShunSeekWakeEvent");
+        let eh = CreateEventW(std::ptr::null(), 1, 0, ev_name.as_ptr());
+        if eh != 0 {
+            WAKE_EVENT.store(eh, Ordering::SeqCst);
+        }
+        true
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    install_crash_log_hook();
+    // --tray / --silent：自启静默启动，只进托盘不弹窗
+    if std::env::args().any(|a| a == "--tray" || a == "--silent") {
+        START_HIDDEN.store(true, Ordering::SeqCst);
+    }
+    // 单实例：第二个进程唤醒已有实例后退出（见 single_instance_acquire）
+    #[cfg(windows)]
+    {
+        if !single_instance_acquire() {
+            return Ok(());
+        }
+    }
     let viewport = egui::ViewportBuilder::default()
         .with_title("瞬觅 ShunSeek")
         .with_icon(egui::IconData {

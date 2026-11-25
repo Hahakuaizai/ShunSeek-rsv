@@ -1,8 +1,13 @@
 //! 结果行真实图标（v0.1.5）：Windows 上向 Shell 要系统图标，行里不再
 //! 只有分类色块 + 首字。设计要点：
 //!  - **不阻塞 UI**：取图标在专职后台线程做，UI 绘制时只查缓存；
-//!    未命中先发请求（同 key 只发一次）、本帧回退色块，图标到了
+//!    未命中先发请求（同 key 只发一次）、本帧只画空占位盘，图标到了
 //!    （worker 完成时会 request_repaint）下一帧自动换上。
+//!  - **图标总规（v0.1.8 用户钉死）**：文件类图标只许 Windows 11
+//!    系统原版——本链三段（真实路径取图 → .lnk 目标解析取图 →
+//!    USEFILEATTRIBUTES 按扩展名/属性问通用图标）全是 Shell 系统
+//!    图标，最终兜底也是系统通用图标；绘制侧在 Windows 上永不画
+//!    自绘分类字形冒充文件/文件夹/软件图标，未到达就空盘等。
 //!  - **按 key 取，不逐个访问磁盘**：普通文件按扩展名取（SHGetFileInfoW
 //!    + USEFILEATTRIBUTES，只问类型图标，不打开文件本体）；文件夹共用
 //!    一个 "folder"；只有 .exe / .lnk / 应用条目按完整路径取真图标
@@ -16,8 +21,9 @@
 //!    SHGetFileInfo 取图失败时，走 IShellLink COM 解析目标路径与
 //!    图标位置、再对目标取图（见 fetch_lnk_target_icon）。
 //!
-//! 非 Windows：没有系统图标这回事，texture() 恒返回 None，全行回退
-//! 色块——与 v0.1.4 及以前完全一致。
+//! 非 Windows：没有 Shell 这回事，texture() 恒返回 None，绘制侧
+//! 回退空占位盘（演示构建另在盘内保留类别字形，见 main.rs 的
+//! cfg 分流；Windows 构建无此回退）。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};

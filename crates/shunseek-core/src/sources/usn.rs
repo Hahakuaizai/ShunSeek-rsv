@@ -29,6 +29,34 @@ pub struct UsnChange {
 pub struct UsnWatcher {
     drive: char,
     stop: Arc<AtomicBool>,
+    /// 起始 USN（v0.1.8）：建索引时先记下该卷的 NextUsn，监听从
+    /// 那一刻起的变化，不漏建索引期间发生的增删改。
+    start_usn: Option<i64>,
+}
+
+/// 查某卷 USN 日志的当前 NextUsn（v0.1.8，增量监听的起点）；
+/// 非 NTFS / 无权限 / 任何 FFI 失败都返回 None（调用方据此判定
+/// 该卷走不了增量，别崩）。
+pub fn query_next_usn(drive: char) -> Option<i64> {
+    let handle = VolumeHandle::open_volume(drive).ok()?;
+    let mut journal_buf = [0u8; 56];
+    let mut returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle.0,
+            FSCTL_QUERY_USN_JOURNAL,
+            std::ptr::null(),
+            0,
+            journal_buf.as_mut_ptr() as *mut _,
+            journal_buf.len() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(i64::from_le_bytes(journal_buf[16..24].try_into().ok()?))
 }
 
 impl UsnWatcher {
@@ -36,6 +64,17 @@ impl UsnWatcher {
         UsnWatcher {
             drive,
             stop: Arc::new(AtomicBool::new(false)),
+            start_usn: None,
+        }
+    }
+
+    /// 带起始 USN 的监听器（v0.1.8）：start 为建索引时 query_next_usn
+    /// 记下的值；None 时退回原行为（从日志当前末尾开始）。
+    pub fn with_start(drive: char, start_usn: Option<i64>) -> UsnWatcher {
+        UsnWatcher {
+            drive,
+            stop: Arc::new(AtomicBool::new(false)),
+            start_usn,
         }
     }
 
@@ -65,7 +104,9 @@ impl UsnWatcher {
             return Err(std::io::Error::last_os_error());
         }
         let journal_id = u64::from_le_bytes(journal_buf[0..8].try_into().unwrap());
-        let mut next_usn = i64::from_le_bytes(journal_buf[16..24].try_into().unwrap());
+        let mut next_usn = self
+            .start_usn
+            .unwrap_or_else(|| i64::from_le_bytes(journal_buf[16..24].try_into().unwrap()));
 
         let reason_mask = USN_REASON_FILE_CREATE
             | USN_REASON_FILE_DELETE

@@ -1,6 +1,8 @@
-//! 全局热键呼出 / 隐藏搜索窗：自定义组合（设置里捕获修改），
-//! 默认 Alt+Space。settings.txt 的 hotkey 键存规范串（如 "alt+space"、
-//! "ctrl+alt+q"）。
+//! 全局热键呼出 / 隐藏搜索窗：自定义组合（设置里捕获修改）。
+//! 默认值 v0.1.8 起走候选链解析（Ctrl+Alt+Space → Ctrl+Shift+Q
+//! → Alt+Q，见 resolve_default；Alt+Space 在用户机器上被占用，
+//! 只作为用户手动存入的值存在）。settings.txt 的 hotkey 键存
+//! 规范串（如 "alt+space"、"ctrl+alt+q"），存过的值永远优先。
 //!
 //! Windows：C# 版用 RegisterHotKey + 窗口消息钩子。egui/eframe 没有把
 //! WM_HOTKEY 暴露给应用，这里改用后台线程轮询 GetAsyncKeyState（user32 FFI）：
@@ -36,6 +38,31 @@ impl HotkeyCombo {
         shift: false,
         win: false,
         vk: 0x20,
+    };
+
+    /// v0.1.8 默认热键候选链（对齐原版）：Ctrl+Alt+Space 优先
+    ///（Alt+Space 在用户机器上被占用/冲突），依次回退
+    /// Ctrl+Shift+Q → Alt+Q。
+    pub const CTRL_ALT_SPACE: HotkeyCombo = HotkeyCombo {
+        ctrl: true,
+        alt: true,
+        shift: false,
+        win: false,
+        vk: 0x20,
+    };
+    pub const CTRL_SHIFT_Q: HotkeyCombo = HotkeyCombo {
+        ctrl: true,
+        alt: false,
+        shift: true,
+        win: false,
+        vk: 0x51,
+    };
+    pub const ALT_Q: HotkeyCombo = HotkeyCombo {
+        ctrl: false,
+        alt: true,
+        shift: false,
+        win: false,
+        vk: 0x51,
     };
 
     pub fn new(ctrl: bool, alt: bool, shift: bool, win: bool, vk: u32) -> HotkeyCombo {
@@ -213,6 +240,24 @@ pub fn check(combo: HotkeyCombo) -> HotkeyCheck {
         return HotkeyCheck::Shared(reason.to_string());
     }
     HotkeyCheck::Available
+}
+
+/// 解析默认热键（v0.1.8）：候选链 Ctrl+Alt+Space → Ctrl+Shift+Q
+/// → Alt+Q 顺序过 check()，第一个 Available 的胜出；全军覆没时
+/// 退回链首（总比没有热键强，用户可在设置里再改）。仅在
+/// settings.txt 没有 hotkey 键（或解析失败）时调用——用户已存
+/// 的值永远优先，绝不覆盖。
+pub fn resolve_default() -> HotkeyCombo {
+    for cand in [
+        HotkeyCombo::CTRL_ALT_SPACE,
+        HotkeyCombo::CTRL_SHIFT_Q,
+        HotkeyCombo::ALT_Q,
+    ] {
+        if check(cand) == HotkeyCheck::Available {
+            return cand;
+        }
+    }
+    HotkeyCombo::CTRL_ALT_SPACE
 }
 
 /// 推荐候选（冲突时给出）：每个都要先过 check、只留 Available 的。

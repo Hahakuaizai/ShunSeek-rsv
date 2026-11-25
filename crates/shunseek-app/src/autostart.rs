@@ -1,5 +1,9 @@
 //! 开机自启动：HKCU\Software\Microsoft\Windows\CurrentVersion\Run
-//! 下的值名 "ShunSeek"，值为带引号的当前 exe 完整路径。
+//! 下的值名 "ShunSeek"，值为带引号的当前 exe 完整路径 + ` --tray`
+//!（v0.1.8：自启时静默启动、只进托盘，程序在 main 里解析该参数）。
+//! is_enabled 除「值存在」外还核对值里含当前 exe 路径——旧版本写
+//! 的无 --tray 值、或 exe 被移动过，都判未启用，设置里重勾一次
+//! 即按新格式重写。
 //!
 //! 勾选状态以注册表实际有无为准：启动时读一次，每次切换后回读确认
 //! （写失败就不勾，别让 UI 显示一个并不存在的自启动）。
@@ -58,9 +62,33 @@ mod win {
                 &mut ty,
                 std::ptr::null_mut(),
                 &mut len,
+            ) == ERROR_SUCCESS
+                && len >= 2;
+            if !ok {
+                RegCloseKey(h);
+                return false;
+            }
+            // 读出值本体，核对含当前 exe 路径（v0.1.8）
+            let mut buf = vec![0u16; (len as usize / 2).max(1)];
+            let mut len2 = len;
+            let ok = RegQueryValueExW(
+                h,
+                wide(VALUE_NAME).as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                buf.as_mut_ptr() as *mut u8,
+                &mut len2,
             ) == ERROR_SUCCESS;
             RegCloseKey(h);
-            ok
+            if !ok {
+                return false;
+            }
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let value = String::from_utf16_lossy(&buf[..end]);
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            !exe.is_empty() && value.to_lowercase().contains(&exe.to_lowercase())
         }
     }
 
@@ -76,7 +104,7 @@ mod win {
                     RegCloseKey(h);
                     return false;
                 }
-                let val = wide(&format!("\"{exe}\""));
+                let val = wide(&format!("\"{exe}\" --tray"));
                 RegSetValueExW(
                     h,
                     name.as_ptr(),

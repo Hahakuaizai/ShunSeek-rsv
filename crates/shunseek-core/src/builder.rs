@@ -23,12 +23,30 @@ pub fn build_index(
         }
     }
 
+    // .lnk 去重（v0.1.8，对齐原版构建期去重）：同一快捷方式既被
+    // MFT 扫到又被 appscan（开始菜单/桌面）扫到时，只留带完整路径
+    // 的 appscan 条目（它带正确的分类与图标路径），MFT 的跳过。
+    let mut lnk_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &entries {
+        if e.full_path.is_some() && e.name.to_lowercase().ends_with(".lnk") {
+            if let Some(p) = &e.full_path {
+                lnk_paths.insert(p.to_lowercase());
+            }
+        }
+    }
+
     let mut builder = Builder::new();
     for e in &entries {
         let full_path = match &e.full_path {
             Some(p) => p.clone(),
             None => resolve_mft_path(e, &entries, &ref_to_index, volume_roots),
         };
+        if e.full_path.is_none()
+            && e.name.to_lowercase().ends_with(".lnk")
+            && lnk_paths.contains(&full_path.to_lowercase())
+        {
+            continue;
+        }
         let mut category = e.category;
         if category == Category::Other && !e.is_dir {
             category = classify_by_extension(&e.name);

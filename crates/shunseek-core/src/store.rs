@@ -51,11 +51,14 @@ impl RawEntry {
 // ---------------- 落盘格式 ----------------
 
 pub(crate) const MAGIC: &[u8; 8] = b"SSKIDX01";
-const VERSION: u32 = 1;
+/// v2（v0.1.8）：尾部追加全拼池两区段（full_off, full_pool），旧
+/// 区段下标不变；v1 缓存文件版本校验不过会自动重建（同原版口径）。
+const VERSION: u32 = 2;
 /// header 大小（字节），区段从此偏移开始，按 8 字节对齐排布。
 const HEADER_SIZE: usize = 256;
-/// 区段数：dirs_off, dirs_pool, name_off, name_pool, init_off, init_pool, dir_ids, cats, refs
-const SECTIONS: usize = 9;
+/// 区段数：dirs_off, dirs_pool, name_off, name_pool, init_off, init_pool,
+/// dir_ids, cats, refs, full_off, full_pool
+const SECTIONS: usize = 11;
 
 #[derive(Clone, Copy, Default)]
 struct Section {
@@ -78,6 +81,8 @@ struct OwnedData {
     dir_ids: Vec<u32>,
     cats: Vec<u8>,
     refs: Vec<u64>,
+    full_off: Vec<u32>,
+    full_pool: Vec<u8>,
 }
 
 struct MappedData {
@@ -162,6 +167,18 @@ impl IndexStore {
             Backing::Mapped(m) => mapped_u64(m, 8),
         }
     }
+    pub fn full_off(&self) -> &[u32] {
+        match &self.backing {
+            Backing::Owned(o) => &o.full_off,
+            Backing::Mapped(m) => mapped_u32(m, 9),
+        }
+    }
+    pub fn full_pool(&self) -> &[u8] {
+        match &self.backing {
+            Backing::Owned(o) => &o.full_pool,
+            Backing::Mapped(m) => mapped_u8(m, 10),
+        }
+    }
 
     // ---- 条目访问（冷路径：命中后组装结果才碰）----
 
@@ -176,6 +193,14 @@ impl IndexStore {
     pub fn initials(&self, i: usize) -> &str {
         let off = self.init_off();
         let pool = self.init_pool();
+        let (a, b) = (off[i] as usize, off[i + 1] as usize);
+        std::str::from_utf8(&pool[a..b]).unwrap_or("")
+    }
+
+    /// 全拼串（v0.1.8 第三搜索通道用，如 "微信" → "weixin"）。
+    pub fn full_pinyin(&self, i: usize) -> &str {
+        let off = self.full_off();
+        let pool = self.full_pool();
         let (a, b) = (off[i] as usize, off[i + 1] as usize);
         std::str::from_utf8(&pool[a..b]).unwrap_or("")
     }
@@ -216,8 +241,9 @@ impl IndexStore {
         self.dirs_pool().len()
             + self.name_pool().len()
             + self.init_pool().len()
+            + self.full_pool().len()
             + (self.dir_count() + 1) * 4
-            + (n + 1) * 4 * 2
+            + (n + 1) * 4 * 3
             + n * (4 + 1 + 8)
     }
 
@@ -236,6 +262,8 @@ impl IndexStore {
             u32_bytes(self.dir_ids()),
             self.cats(),
             u64_bytes(self.refs()),
+            u32_bytes(self.full_off()),
+            self.full_pool(),
         ];
         let mut sections = [Section::default(); SECTIONS];
         let mut cursor = HEADER_SIZE;
@@ -356,6 +384,8 @@ pub struct Builder {
     name_pool: Vec<u8>,
     init_off: Vec<u32>,
     init_pool: Vec<u8>,
+    full_off: Vec<u32>,
+    full_pool: Vec<u8>,
     dir_ids: Vec<u32>,
     cats: Vec<u8>,
     refs: Vec<u64>,
@@ -377,6 +407,8 @@ impl Builder {
             name_pool: Vec::new(),
             init_off: vec![0],
             init_pool: Vec::new(),
+            full_off: vec![0],
+            full_pool: Vec::new(),
             dir_ids: Vec::new(),
             cats: Vec::new(),
             refs: Vec::new(),
@@ -409,6 +441,8 @@ impl Builder {
         self.name_off.push(self.name_pool.len() as u32);
         pinyin::initials_into(name, &mut self.init_pool);
         self.init_off.push(self.init_pool.len() as u32);
+        pinyin::full_into(name, &mut self.full_pool);
+        self.full_off.push(self.full_pool.len() as u32);
         self.dir_ids.push(dir_id);
         self.cats.push(category as u8);
         self.refs.push(file_ref);
@@ -427,6 +461,8 @@ impl Builder {
                 name_pool: self.name_pool,
                 init_off: self.init_off,
                 init_pool: self.init_pool,
+                full_off: self.full_off,
+                full_pool: self.full_pool,
                 dir_ids: self.dir_ids,
                 cats: self.cats,
                 refs: self.refs,

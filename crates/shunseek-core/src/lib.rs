@@ -5,7 +5,10 @@
 
 pub mod builder;
 pub mod category;
+pub mod delta;
+pub mod filetype;
 pub mod pinyin;
+mod pinyin_full_table;
 mod pinyin_table;
 pub mod search;
 pub mod sources;
@@ -14,6 +17,8 @@ pub mod usage;
 
 pub use builder::build_index;
 pub use category::{classify_by_extension, Category};
-pub use search::{ScopeFilter, SearchEngine, SearchHit};
+pub use delta::{DeltaIndex, Tombstones};
+pub use filetype::Importance;
+pub use search::{search_merged, ScopeFilter, SearchEngine, SearchHit};
 pub use store::{IndexStore, RawEntry};
 pub use usage::UsageStore;
