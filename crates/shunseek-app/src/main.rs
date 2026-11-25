@@ -630,6 +630,18 @@ fn collect_entries() -> (Vec<RawEntry>, Option<HashMap<char, String>>, String) {
     }
 }
 
+/// 退出看门狗：正常退出路径（关窗 → eframe 结束事件循环）万一被卡住，
+/// 1.5 秒后强制结束进程。这是「托盘关不掉」bug 的最后一道保险——
+/// 该 bug 的根源是隐藏状态下事件循环停转、退出动作无人处理；v0.1.5
+/// 已改事件唤醒根治，这里再兜一层：只要退出意图已发出，进程必死。
+/// 设置与使用记录都在变更时即时落盘，强制结束不丢数据。
+fn spawn_exit_watchdog() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(1500));
+        std::process::exit(0);
+    });
+}
+
 fn spawn_rebuild(dir: PathBuf, tx: Sender<IndexMsg>) {
     std::thread::Builder::new()
         .name("shunseek-index".into())
@@ -2857,25 +2869,17 @@ impl ShunSeekApp {
                         ACCENT,
                     );
                 }
-                // 名字：最多 2 行、超出省略、居中
-                let mut job = egui::text::LayoutJob::default();
-                job.wrap = egui::text::TextWrapping {
-                    max_width: 92.0,
-                    max_rows: 2,
-                    break_anywhere: true,
-                    overflow_character: Some('…'),
-                };
-                job.halign = egui::Align::Center;
-                job.append(
-                    &r.name,
-                    0.0,
-                    TextFormat {
-                        font_id: FontId::proportional(12.0),
-                        color: pal.name_text,
-                        ..Default::default()
-                    },
-                );
-                let galley = painter.layout_job(job);
+                // 名字：最多 2 行、超出省略、居中。用 fonts.layout 标准
+                // 路径排版（手动拼 LayoutJob 曾出现首字丢失，原因不明，
+                // 换用与 Label 相同的排版入口后正常）。
+                let galley = ui.fonts(|f| {
+                    f.layout(
+                        r.name.clone(),
+                        FontId::proportional(12.0),
+                        pal.name_text,
+                        92.0,
+                    )
+                });
                 painter.galley(
                     egui::pos2(
                         rect.center().x - galley.size().x / 2.0,
@@ -2913,24 +2917,14 @@ impl ShunSeekApp {
                     });
                 }
                 paint_folder_tile(&painter, icon_rect, pal);
-                let mut job = egui::text::LayoutJob::default();
-                job.wrap = egui::text::TextWrapping {
-                    max_width: 92.0,
-                    max_rows: 2,
-                    break_anywhere: true,
-                    overflow_character: Some('…'),
-                };
-                job.halign = egui::Align::Center;
-                job.append(
-                    &dir_last(dir),
-                    0.0,
-                    TextFormat {
-                        font_id: FontId::proportional(12.0),
-                        color: pal.name_text,
-                        ..Default::default()
-                    },
-                );
-                let galley = painter.layout_job(job);
+                let galley = ui.fonts(|f| {
+                    f.layout(
+                        dir_last(dir),
+                        FontId::proportional(12.0),
+                        pal.name_text,
+                        92.0,
+                    )
+                });
                 painter.galley(
                     egui::pos2(
                         rect.center().x - galley.size().x / 2.0,
@@ -4209,6 +4203,7 @@ impl eframe::App for ShunSeekApp {
                     self.tray.shutdown();
                     self.allow_exit = true;
                     ctx.send_viewport_cmd(ViewportCommand::Close);
+                    spawn_exit_watchdog();
                 }
             }
         }
@@ -4221,6 +4216,7 @@ impl eframe::App for ShunSeekApp {
             } else {
                 self.tray.shutdown();
                 self.allow_exit = true;
+                spawn_exit_watchdog();
             }
         }
 
