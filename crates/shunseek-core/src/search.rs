@@ -212,34 +212,44 @@ impl<'a> SearchEngine<'a> {
 
     fn score_match(&self, index: usize, match_start_byte: usize, via_initials: bool) -> f32 {
         let name = self.store.name(index);
-        // 命中位置与名字长度按「字符数」计，与 C# 版的 char 口径一致
-        let match_at = name[..match_start_byte.min(name.len())].chars().count() as f32;
         let name_len = name.chars().count() as f32;
-        let mut score = if via_initials {
-            if match_at == 0.0 {
-                80.0
-            } else {
-                50.0
-            }
-        } else if match_at == 0.0 {
-            100.0
+        // 命中位置按「字符数」计。注意 via_initials 时 match_start_byte 是首字母串
+        // 里的偏移，绝不能拿去切名字（会对不齐甚至切碎多字节汉字而 panic，
+        // v0.1.0 拼音搜不到结果就是这个原因）；首字母串是纯 ASCII，字节偏移即字符数。
+        let (mut score, match_at) = if via_initials {
+            (
+                if match_start_byte == 0 { 80.0 } else { 50.0 },
+                match_start_byte as f32,
+            )
         } else {
-            let prev = name[..match_start_byte.min(name.len())]
-                .chars()
-                .last()
-                .unwrap_or(' ');
-            let cur_is_cjk = name[match_start_byte.min(name.len())..]
-                .chars()
-                .next()
-                .map(is_cjk)
-                .unwrap_or(false);
-            let word_start = matches!(prev, ' ' | '-' | '_' | '·' | '(' | '（' | '.')
-                || (is_cjk(prev) && !cur_is_cjk);
-            if word_start {
-                70.0
-            } else {
-                40.0
+            // 不切片：按 char_indices 数命中点前的字符数，prev 取命中点前最后一个字符。
+            let mut cnt = 0usize;
+            let mut prev = ' ';
+            for (i, c) in name.char_indices() {
+                if i >= match_start_byte {
+                    break;
+                }
+                cnt += 1;
+                prev = c;
             }
+            let match_at = cnt as f32;
+            let base = if cnt == 0 {
+                100.0
+            } else {
+                let cur_is_cjk = name
+                    .char_indices()
+                    .find(|(i, _)| *i >= match_start_byte)
+                    .map(|(_, c)| is_cjk(c))
+                    .unwrap_or(false);
+                let word_start = matches!(prev, ' ' | '-' | '_' | '·' | '(' | '（' | '.')
+                    || (is_cjk(prev) && !cur_is_cjk);
+                if word_start {
+                    70.0
+                } else {
+                    40.0
+                }
+            };
+            (base, match_at)
         };
         score -= match_at * 0.1;
         score -= name_len * 0.01;
