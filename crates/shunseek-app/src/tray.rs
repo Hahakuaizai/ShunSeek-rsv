@@ -519,6 +519,11 @@ mod win {
         SetForegroundWindow(hwnd);
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
+        // 点外钩子挂起（v0.1.10）：托盘菜单在主窗矩形之外，点
+        // 菜单条目（如「打开瞬觅」）对钩子而言是「点外」——不
+        // 挂起的话菜单动作刚投递、主窗先被钩子藏掉，Show 又与
+        // 隐藏赛跑。菜单存续期间整体豁免，关菜单即恢复。
+        crate::clickwatch::set_suspended(true);
         let cmd = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -528,6 +533,7 @@ mod win {
             hwnd,
             std::ptr::null(),
         );
+        crate::clickwatch::set_suspended(false);
         // 配合 SetForegroundWindow 的收尾消息，保证菜单状态机干净关闭
         PostMessageW(hwnd, 0, 0, 0); // WM_NULL
         DestroyMenu(menu);
