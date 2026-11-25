@@ -7,6 +7,9 @@
 //!  - 背景：真 Mica 需要 DWM 的 DWMWA_SYSTEMBACKDROP_TYPE，egui 不直接
 //!    支持；这里用手工竖向渐变 + 圆角 + 投影 + 细描边近似（见 update()
 //!    里的 paint_vertical_gradient 与 CentralPanel 的 Frame）。
+//!  - 视觉语言（v0.1.2）：借 LeiBox 的玻璃/光束设计——搜索框光束游走
+//!    描边、分类玻璃标签栏 + 亮色磨砂胶囊、窗口顶部高光带与双层描边、
+//!    色块玻璃高光、弹窗深色玻璃；粒子/折射类重动效 egui 做不到，未移植。
 //!  - 单实例：C# 版用命名 Mutex；Rust 版 TODO（需要 Windows 命名互斥 FFI
 //!    或单实例 socket），当前不做，重复启动会开两个窗口。
 //!  - 全局热键：轮询实现，见 hotkey.rs；非 Windows 无全局热键。
@@ -255,8 +258,10 @@ struct ShunSeekApp {
     /// 最近一次索引就绪文案（含来源摘要）；空查询的搜索完成消息
     /// 会覆盖 status，用它把就绪文案找回来，别让摘要一闪而过。
     ready_status: Option<String>,
-    /// 搜索框上一帧是否聚焦（画聚焦描边时读它，一帧延迟无感）。
+    /// 搜索框上一帧是否聚焦（放大镜着色读它，一帧延迟无感）。
     search_focused: bool,
+    /// 搜索框上一帧是否悬停（与聚焦一起决定流光描边是流动还是静止）。
+    search_hovered: bool,
     store: Arc<Mutex<IndexStore>>,
     usage: Arc<Mutex<UsageStore>>,
     search_cancel: Arc<AtomicBool>,
@@ -301,6 +306,7 @@ impl ShunSeekApp {
             status_alert: false,
             ready_status: None,
             search_focused: false,
+            search_hovered: false,
             store: Arc::new(Mutex::new(store)),
             usage: Arc::new(Mutex::new(usage)),
             search_cancel: Arc::new(AtomicBool::new(true)),
@@ -625,6 +631,241 @@ fn paint_vertical_gradient(
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// 光束彩虹带：青 #22D3EE → 蓝 #3B82F6 → 紫 #A855F7 → 粉 #EC4899，
+/// s 是段内位置（0=束头，1=束尾），供光束游走时给每小段上色。
+fn beam_color(s: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, (u8, u8, u8)); 4] = [
+        (0.0, (34, 211, 238)),
+        (1.0 / 3.0, (59, 130, 246)),
+        (2.0 / 3.0, (168, 85, 247)),
+        (1.0, (236, 72, 153)),
+    ];
+    let s = s.clamp(0.0, 1.0);
+    for w in STOPS.windows(2) {
+        let (t0, c0) = w[0];
+        let (t1, c1) = w[1];
+        if s <= t1 {
+            let k = if t1 > t0 { (s - t0) / (t1 - t0) } else { 0.0 };
+            return (
+                lerp_u8(c0.0, c1.0, k),
+                lerp_u8(c0.1, c1.1, k),
+                lerp_u8(c0.2, c1.2, k),
+            );
+        }
+    }
+    (236, 72, 153)
+}
+
+/// 往轮廓折线里加点（与上一点重合的跳过）。
+fn push_pt(pts: &mut Vec<egui::Pos2>, p: egui::Pos2) {
+    if pts.last().map(|l: &egui::Pos2| l.distance(p) > 0.01).unwrap_or(true) {
+        pts.push(p);
+    }
+}
+
+/// 圆角矩形的稠密轮廓折线（顺时针，不闭合，首尾靠绘制时回绕相连）。
+/// 直边每 ~6px 一个点、圆弧每 7.5° 一个点，供流光描边按弧长重采样。
+fn rounded_rect_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
+    let mut pts: Vec<egui::Pos2> = Vec::new();
+    let r = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let edge_steps = |len: f32| ((len / 6.0).ceil().max(1.0)) as usize;
+    let arc = |pts: &mut Vec<egui::Pos2>, cx: f32, cy: f32, a0: f32| {
+        let mut a = a0;
+        while a < a0 + 90.0 {
+            let rad = a.to_radians();
+            push_pt(pts, egui::pos2(cx + r * rad.cos(), cy + r * rad.sin()));
+            a += 7.5;
+        }
+        let rad = (a0 + 90.0).to_radians();
+        push_pt(pts, egui::pos2(cx + r * rad.cos(), cy + r * rad.sin()));
+    };
+    // 顶边（左→右）
+    let n = edge_steps(rect.width() - r * 2.0);
+    for i in 0..=n {
+        push_pt(
+            &mut pts,
+            egui::pos2(
+                rect.left() + r + (rect.width() - r * 2.0) * (i as f32 / n as f32),
+                rect.top(),
+            ),
+        );
+    }
+    // 右上弧 -90°→0°
+    arc(&mut pts, rect.right() - r, rect.top() + r, -90.0);
+    // 右边（上→下）
+    let n = edge_steps(rect.height() - r * 2.0);
+    for i in 1..=n {
+        push_pt(
+            &mut pts,
+            egui::pos2(
+                rect.right(),
+                rect.top() + r + (rect.height() - r * 2.0) * (i as f32 / n as f32),
+            ),
+        );
+    }
+    // 右下弧 0°→90°
+    arc(&mut pts, rect.right() - r, rect.bottom() - r, 0.0);
+    // 底边（右→左）
+    let n = edge_steps(rect.width() - r * 2.0);
+    for i in 1..=n {
+        push_pt(
+            &mut pts,
+            egui::pos2(
+                rect.right() - r - (rect.width() - r * 2.0) * (i as f32 / n as f32),
+                rect.bottom(),
+            ),
+        );
+    }
+    // 左下弧 90°→180°
+    arc(&mut pts, rect.left() + r, rect.bottom() - r, 90.0);
+    // 左边（下→上）
+    let n = edge_steps(rect.height() - r * 2.0);
+    for i in 1..=n {
+        push_pt(
+            &mut pts,
+            egui::pos2(
+                rect.left(),
+                rect.bottom() - r - (rect.height() - r * 2.0) * (i as f32 / n as f32),
+            ),
+        );
+    }
+    // 左上弧 180°→270°，终点即顶边起点
+    arc(&mut pts, rect.left() + r, rect.top() + r, 180.0);
+    pts
+}
+
+/// 【LeiBox 光束游走描边】底圈是一整圈 white alpha 26 的 1px 淡边；
+/// beam_phase 有值时，一束约 1/4 周长的光沿周界游走：束头最亮、向尾
+/// 按距离渐隐到 0，颜色沿段内位置走青→蓝→紫→粉彩虹带；每小段先画
+/// 一层线宽 4、alpha 约 1/3 的同色辉光，再画线宽 1.5 的亮芯。
+/// beam_phase=None（未聚焦）时只留淡边，静态不动画。
+fn paint_flow_border(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    radius: f32,
+    beam_phase: Option<f32>,
+) {
+    let pts = rounded_rect_outline(rect, radius);
+    if pts.len() < 2 {
+        return;
+    }
+    // 底圈淡边
+    let faint = Stroke::new(1.0_f32, Color32::from_white_alpha(26));
+    let n = pts.len();
+    for i in 0..n {
+        painter.line_segment([pts[i], pts[(i + 1) % n]], faint);
+    }
+    let Some(phase) = beam_phase else {
+        return;
+    };
+    // 累计弧长（含收尾回绕段）+ 按弧长取点
+    let mut cum: Vec<f32> = Vec::with_capacity(n + 1);
+    cum.push(0.0);
+    for i in 0..n {
+        let d = pts[i].distance(pts[(i + 1) % n]);
+        cum.push(cum[i] + d);
+    }
+    let total = cum[n];
+    if total <= 0.0 {
+        return;
+    }
+    let point_at = |d: f32| -> egui::Pos2 {
+        let d = d.rem_euclid(total);
+        let seg = match cum.binary_search_by(|v| v.partial_cmp(&d).unwrap()) {
+            Ok(i) => i.min(n - 1),
+            Err(i) => i.saturating_sub(1).min(n - 1),
+        };
+        let seg_len = (cum[seg + 1] - cum[seg]).max(f32::EPSILON);
+        let k = ((d - cum[seg]) / seg_len).clamp(0.0, 1.0);
+        pts[seg].lerp(pts[(seg + 1) % n], k)
+    };
+    // 光束：束头在 phase 处，束身向后（逆行进方向）拖 1/4 周长
+    const SUB: usize = 40;
+    let beam_len = total * 0.25;
+    let head = phase.rem_euclid(1.0) * total;
+    // 先整束辉光（宽、淡），再整束亮芯（细、亮），保证芯压在辉光上
+    for pass in 0..2 {
+        for i in 0..SUB {
+            let s = (i as f32 + 0.5) / SUB as f32; // 段内位置：0 束头 → 1 束尾
+            let fade = 1.0 - s;
+            let alpha = (255.0 * fade * fade) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let (r, g, b) = beam_color(s);
+            let d0 = head - beam_len * (i as f32 / SUB as f32);
+            let d1 = head - beam_len * ((i + 1) as f32 / SUB as f32);
+            if pass == 0 {
+                painter.line_segment(
+                    [point_at(d0), point_at(d1)],
+                    Stroke::new(4.0_f32, Color32::from_rgba_unmultiplied(r, g, b, alpha / 3)),
+                );
+            } else {
+                painter.line_segment(
+                    [point_at(d0), point_at(d1)],
+                    Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(r, g, b, alpha)),
+                );
+            }
+        }
+    }
+}
+
+/// 窗口顶部玻璃高光带：顶部 90px 内 white alpha 自 26 渐隐到 0，
+/// 且横向偏左上加强（每片横向分 4 段、权重 1.0→0.35 递减，模拟光从
+/// 左上打在玻璃面上；玻璃透镜的折射 egui 做不了，只取这点受光感）。
+/// 纵向切片叠画，首片带上圆角，贴合面板圆角轮廓。
+fn paint_top_glass_highlight(painter: &egui::Painter, rect: egui::Rect) {
+    const BAND_H: f32 = 90.0;
+    const SLICES: usize = 18;
+    const X_WEIGHTS: [f32; 4] = [1.0, 0.8, 0.55, 0.35];
+    let inner = rect.shrink(1.0);
+    let slice_h = BAND_H / SLICES as f32;
+    let seg_w = inner.width() / X_WEIGHTS.len() as f32;
+    for i in 0..SLICES {
+        let t = i as f32 / SLICES as f32;
+        let alpha = 26.0 * (1.0 - t);
+        if alpha < 1.0 {
+            continue;
+        }
+        for (j, w) in X_WEIGHTS.iter().enumerate() {
+            let seg = egui::Rect::from_min_max(
+                egui::pos2(
+                    inner.left() + seg_w * j as f32,
+                    inner.top() + slice_h * i as f32,
+                ),
+                egui::pos2(
+                    inner.left() + seg_w * (j + 1) as f32,
+                    inner.top() + slice_h * (i + 1) as f32,
+                ),
+            );
+            // 只有首片的最左/最右段需要贴合面板上圆角
+            let rounding = if i == 0 && j == 0 {
+                Rounding {
+                    nw: 11.0,
+                    ne: 0.0,
+                    sw: 0.0,
+                    se: 0.0,
+                }
+            } else if i == 0 && j == X_WEIGHTS.len() - 1 {
+                Rounding {
+                    nw: 0.0,
+                    ne: 11.0,
+                    sw: 0.0,
+                    se: 0.0,
+                }
+            } else {
+                Rounding {
+                    nw: 0.0,
+                    ne: 0.0,
+                    sw: 0.0,
+                    se: 0.0,
+                }
+            };
+            painter.rect_filled(seg, rounding, Color32::from_white_alpha((alpha * w) as u8));
+        }
+    }
+}
+
 /// 分类筛选条：前 9 个直接摆出，其余收进「更多」菜单（原版是占位按钮，
 /// 这里做成真功能）。顺序与 Category / WPF 版一致。
 const CHIP_CATS: &[Option<Category>] = &[
@@ -659,35 +900,29 @@ enum RowAction {
 
 impl ShunSeekApp {
     fn draw_search_box(&mut self, ui: &mut egui::Ui) {
-        // 聚焦态读上一帧记录的 has_focus（一帧延迟，体感无差），
-        // 聚焦时描边换成 1.5px 强调蓝，未聚焦是淡白细线。
-        let (stroke, fill) = if self.search_focused {
-            (
-                Stroke::new(1.5_f32, ACCENT),
-                Color32::from_white_alpha(22),
-            )
-        } else {
-            (
-                Stroke::new(1.0_f32, Color32::from_white_alpha(30)),
-                Color32::from_white_alpha(22),
-            )
-        };
+        // Frame 本身不再描边：边框由 paint_flow_border 手工画——
+        // 一圈淡边 + 一束沿周界游走的彩虹光（LeiBox 光束描边）。
+        // 聚焦/悬停时光束游走，未聚焦只留静态淡边（不请求重绘，省电）。
         let frame = egui::Frame::none()
-            .fill(fill)
-            .stroke(stroke)
+            .fill(Color32::from_white_alpha(22))
             .rounding(Rounding::same(10.0))
             .inner_margin(egui::Margin::symmetric(12.0, 10.0));
-        frame.show(ui, |ui| {
+        let frame_resp = frame.show(ui, |ui| {
             ui.horizontal(|ui| {
-                // 左侧放大镜：手绘圆 + 斜线两笔，不用 emoji
+                // 左侧放大镜：手绘圆 + 斜线两笔，不用 emoji；
+                // 聚焦时换成流光蓝 #3B82F6，未聚焦是中性灰。
                 let (icon_rect, _) = ui.allocate_exact_size(
                     Vec2::new(22.0, 22.0),
                     egui::Sense::hover(),
                 );
                 let painter = ui.painter_at(icon_rect);
                 let c = icon_rect.center() + Vec2::new(-1.5, -1.5);
-                let icon_stroke =
-                    Stroke::new(1.6_f32, Color32::from_rgb(139, 148, 158));
+                let icon_color = if self.search_focused {
+                    Color32::from_rgb(59, 130, 246)
+                } else {
+                    Color32::from_rgb(139, 148, 158)
+                };
+                let icon_stroke = Stroke::new(1.6_f32, icon_color);
                 painter.circle_stroke(c, 5.5, icon_stroke);
                 painter.line_segment(
                     [
@@ -710,8 +945,9 @@ impl ShunSeekApp {
                 if out.response.changed() {
                     self.schedule_search();
                 }
-                // 右侧 ESC 徽标（不可点，纯提示，与 WPF 版一致；弱化处理）
-                egui::Frame::none()
+                // 右侧 ESC 徽标（不可点，纯提示，与 WPF 版一致）：
+                // 玻璃小片——半透填充 + 顶部 1px 高光线。
+                let badge = egui::Frame::none()
                     .fill(Color32::from_white_alpha(10))
                     .rounding(Rounding::same(4.0))
                     .inner_margin(egui::Margin::symmetric(6.0, 1.0))
@@ -722,47 +958,95 @@ impl ShunSeekApp {
                                 .color(Color32::from_rgb(110, 118, 129)),
                         );
                     });
+                let br = badge.response.rect;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(br.left() + 3.0, br.top() + 0.5),
+                        egui::pos2(br.right() - 3.0, br.top() + 0.5),
+                    ],
+                    Stroke::new(1.0_f32, Color32::from_white_alpha(50)),
+                );
             });
         });
+        // 光束描边：画在 Frame 之上（同一层后画者居上）。
+        let rect = frame_resp.response.rect;
+        let hovered = frame_resp.response.hovered();
+        self.search_hovered = hovered;
+        let animated = self.search_focused || hovered;
+        let ctx = ui.ctx().clone();
+        let beam_phase = if animated {
+            // 约 7 秒绕一圈，束头位置随时间推进
+            Some((ctx.input(|i| i.time) * 0.14) as f32 % 1.0)
+        } else {
+            None
+        };
+        paint_flow_border(&ui.painter_at(rect), rect, 10.0, beam_phase);
+        // 只在窗口可见且处于游走态时才请求重绘驱动动画
+        if animated && self.visible {
+            ctx.request_repaint();
+        }
     }
 
     fn draw_chips(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::horizontal()
-            .id_salt("chips")
-            .auto_shrink([false, true])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    for &cat in CHIP_CATS {
-                        let selected = self.category == cat;
-                        if chip_button(ui, &chip_label(cat), selected).clicked() {
-                            self.category = cat;
-                            self.schedule_search();
-                        }
-                    }
-                    // 「更多」：弹出菜单（原版是占位按钮，这里是真筛选）
-                    let resp = ui.menu_button(
-                        RichText::new("更多 ▾")
-                            .size(12.5)
-                            .color(Color32::from_rgb(201, 209, 217)),
-                        |ui| {
-                            for &cat in MORE_CATS {
-                                let sel = self.category == Some(cat);
-                                if ui.selectable_label(sel, cat.display_name()).clicked() {
-                                    self.category = Some(cat);
-                                    self.schedule_search();
-                                    ui.close_menu();
-                                }
+        // 【LeiBox 玻璃标签栏】整行 chips 坐一条玻璃长条上：半透浅色填充 +
+        // 圆角 16，顶部再补一条 1px 高光线，模拟玻璃上缘的受光。
+        let bar = egui::Frame::none()
+            .fill(Color32::from_white_alpha(14))
+            .rounding(Rounding::same(16.0))
+            .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+        let bar_resp = bar.show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("chips")
+                .auto_shrink([false, true])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for &cat in CHIP_CATS {
+                            let selected = self.category == cat;
+                            if glass_chip(ui, &chip_label(cat), selected).clicked() {
+                                self.category = cat;
+                                self.schedule_search();
                             }
-                        },
-                    );
-                    let _ = resp;
-                    let _ = MORE_CATS
-                        .iter()
-                        .any(|c| Some(*c) == self.category);
+                        }
+                        // 「更多」：玻璃胶囊 + 玻璃弹窗（原版是占位按钮，这里是真筛选）
+                        let more_selected =
+                            MORE_CATS.iter().any(|c| Some(*c) == self.category);
+                        let more_resp = glass_chip(ui, "更多 ▾", more_selected);
+                        let popup_id = ui.make_persistent_id("more_cats_popup");
+                        let mut picked: Option<Category> = None;
+                        egui::containers::popup::popup_below_widget(
+                            ui,
+                            popup_id,
+                            &more_resp,
+                            egui::containers::popup::PopupCloseBehavior::CloseOnClickOutside,
+                            |ui| {
+                                ui.set_min_width(120.0);
+                                for &cat in MORE_CATS {
+                                    let sel = self.category == Some(cat);
+                                    if ui.selectable_label(sel, cat.display_name()).clicked() {
+                                        picked = Some(cat);
+                                    }
+                                }
+                            },
+                        );
+                        if let Some(cat) = picked {
+                            self.category = Some(cat);
+                            self.schedule_search();
+                            ui.memory_mut(|mem| mem.close_popup());
+                        }
+                    });
                 });
-            });
+        });
+        // 玻璃栏顶部高光线（内缩圆角量，避免压到圆角弧）
+        let br = bar_resp.response.rect;
+        ui.painter().line_segment(
+            [
+                egui::pos2(br.left() + 16.0, br.top() + 0.5),
+                egui::pos2(br.right() - 16.0, br.top() + 0.5),
+            ],
+            Stroke::new(1.0_f32, Color32::from_white_alpha(60)),
+        );
     }
 
     fn draw_results(&mut self, ui: &mut egui::Ui) {
@@ -826,6 +1110,14 @@ impl ShunSeekApp {
                 Vec2::new(3.0, ROW_H - 20.0),
             );
             painter.rect_filled(bar, Rounding::same(2.0), ACCENT);
+            // 顶部 1px 高光线（玻璃上缘受光，与玻璃栏/胶囊同一语言）
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 8.0, rect.top() + 0.5),
+                    egui::pos2(rect.right() - 8.0, rect.top() + 0.5),
+                ],
+                Stroke::new(1.0_f32, Color32::from_white_alpha(50)),
+            );
         } else if response.hovered() {
             painter.rect_filled(rect, Rounding::same(8.0), Color32::from_white_alpha(8));
         }
@@ -837,6 +1129,21 @@ impl ShunSeekApp {
             Vec2::splat(36.0),
         );
         painter.rect_filled(tile_rect, Rounding::same(9.0), Color32::from_rgb(r, g, b));
+        // 色块玻璃感：上半部叠一层高光（上圆角、下直角），像光打在玻璃面上
+        let tile_gloss = egui::Rect::from_min_size(
+            tile_rect.min,
+            Vec2::new(tile_rect.width(), tile_rect.height() / 2.0),
+        );
+        painter.rect_filled(
+            tile_gloss,
+            Rounding {
+                nw: 9.0,
+                ne: 9.0,
+                sw: 0.0,
+                se: 0.0,
+            },
+            Color32::from_white_alpha(46),
+        );
         let tile_char = row
             .category
             .display_name()
@@ -985,29 +1292,63 @@ impl ShunSeekApp {
     }
 }
 
-fn chip_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (fill, stroke, text) = if selected {
-        (
-            ACCENT,
-            Stroke::new(1.0_f32, ACCENT),
-            RichText::new(label).size(12.5).strong().color(Color32::WHITE),
-        )
-    } else {
-        (
-            Color32::from_white_alpha(8),
-            Stroke::new(1.0_f32, Color32::from_white_alpha(18)),
-            RichText::new(label)
-                .size(12.5)
-                .color(Color32::from_rgb(201, 209, 217)),
-        )
-    };
-    ui.add(
-        egui::Button::new(text)
-            .fill(fill)
-            .stroke(stroke)
-            .rounding(Rounding::same(13.0))
-            .min_size(Vec2::new(0.0, 26.0)),
-    )
+/// 【LeiBox 亮色磨砂胶囊】手绘分类 chip：原作玻璃标签栏是浅色磨砂栏 +
+/// 选中项背后一块白色高亮胶囊，深色主题照此办理——
+/// 选中 = 近白色磨砂填充（white alpha 225）+ 深色字 #1A1D23 + 顶部高光线 +
+/// 脚下一点柔和投影；未选中 = 透明底、#C9D1D9 字，hover 垫 white alpha 10。
+/// 选中态切换用 animate_bool_with_time 做 0.18 秒交叉淡入（填充与字色同步
+/// 插值）：原作的滑动指标要先量齐所有 chip 的位置再回绘一层，隔着
+/// ScrollArea 的裁剪层做起来绕，按简报许可在此降级为淡入，不做滑动。
+fn glass_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let font = FontId::proportional(12.5);
+    // 选中进度 v：0=未选中，1=完全选中，切换时平滑过渡
+    let v = ui
+        .ctx()
+        .animate_bool_with_time(ui.make_persistent_id(("glass_chip_sel", label)), selected, 0.18);
+    let text_color = Color32::from_rgb(
+        lerp_u8(201, 26, v),
+        lerp_u8(209, 29, v),
+        lerp_u8(217, 35, v),
+    );
+    let galley = ui
+        .fonts(|f| f.layout_no_wrap(label.to_string(), font.clone(), text_color));
+    let size = Vec2::new(galley.size().x + 24.0, 26.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let rounding = Rounding::same(13.0);
+    if v > 0.01 {
+        // 柔和投影（向下 1px 的黑影，随选中进度淡入）
+        painter.rect_filled(
+            rect.translate(Vec2::new(0.0, 1.0)),
+            rounding,
+            Color32::from_black_alpha((80.0 * v) as u8),
+        );
+        // 近白色磨砂填充
+        painter.rect_filled(
+            rect,
+            rounding,
+            Color32::from_white_alpha((225.0 * v) as u8),
+        );
+        // 顶部高光线
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 10.0, rect.top() + 0.5),
+                egui::pos2(rect.right() - 10.0, rect.top() + 0.5),
+            ],
+            Stroke::new(1.0_f32, Color32::from_white_alpha((200.0 * v) as u8)),
+        );
+    } else if response.hovered() {
+        painter.rect_filled(rect, rounding, Color32::from_white_alpha(10));
+    }
+    painter.galley(
+        egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        text_color,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 impl eframe::App for ShunSeekApp {
@@ -1038,17 +1379,27 @@ impl eframe::App for ShunSeekApp {
 
         // 悬浮窗背景：手工竖向渐变（上 #252A35 → 下 #16181D）画在背景层，
         // 面板本身透明，靠 Frame 的投影 + 淡描边撑出 Fluent 悬浮感。
+        let bg_painter = ctx.layer_painter(egui::LayerId::background());
+        let screen = ctx.screen_rect();
         paint_vertical_gradient(
-            &ctx.layer_painter(egui::LayerId::background()),
-            ctx.screen_rect(),
+            &bg_painter,
+            screen,
             12.0,
             Color32::from_rgb(37, 42, 53),
             Color32::from_rgb(22, 24, 29),
         );
+        // 玻璃/冰霜质感：顶部 90px 高光带（alpha 26→0）+ 内层描边，
+        // 与面板 Frame 的外层描边组成双层玻璃边缘。
+        paint_top_glass_highlight(&bg_painter, screen);
+        bg_painter.rect_stroke(
+            screen.shrink(1.0),
+            Rounding::same(11.0),
+            Stroke::new(1.0_f32, Color32::from_white_alpha(10)),
+        );
         let panel_frame = egui::Frame::central_panel(&ctx.style())
             .fill(Color32::TRANSPARENT)
             .rounding(Rounding::same(12.0))
-            .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(18)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(22)))
             .shadow(egui::epaint::Shadow {
                 offset: Vec2::new(0.0, 8.0),
                 blur: 24.0,
@@ -1081,7 +1432,17 @@ impl eframe::App for ShunSeekApp {
 fn install_visuals(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = Color32::from_rgb(22, 24, 29);
-    visuals.window_fill = Color32::from_rgb(22, 24, 29);
+    // 弹窗（「更多」菜单等）走深色玻璃：#1E222B、alpha 235 微透，
+    // 描边淡白、圆角 10（LeiBox 玻璃语言在系统弹窗上的落点）。
+    visuals.window_fill = Color32::from_rgba_unmultiplied(30, 34, 43, 235);
+    visuals.window_stroke = Stroke::new(1.0_f32, Color32::from_white_alpha(24));
+    visuals.window_rounding = Rounding::same(10.0);
+    visuals.popup_shadow = egui::epaint::Shadow {
+        offset: Vec2::new(0.0, 4.0),
+        blur: 16.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(120),
+    };
     visuals.extreme_bg_color = Color32::from_rgb(10, 11, 14);
     visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(37, 99, 235, 120);
     visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
