@@ -247,7 +247,7 @@ mod platform {
                 let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
                 wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
                 let ok = GetWindowPlacement(h, &mut wp) != 0;
-                WAS_MAX.store(ok && wp.showCmd == SW_SHOWMAXIMIZED, Ordering::SeqCst);
+                WAS_MAX.store(ok && wp.showCmd == SW_SHOWMAXIMIZED as u32, Ordering::SeqCst);
                 if ok {
                     ORIG_X.store(wp.rcNormalPosition.left, Ordering::SeqCst);
                     ORIG_Y.store(wp.rcNormalPosition.top, Ordering::SeqCst);
