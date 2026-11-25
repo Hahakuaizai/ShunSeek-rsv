@@ -102,6 +102,22 @@ impl UsageStore {
         }
     }
 
+    /// 首页（常用列表）用：全部已记录条目的快照
+    /// (小写路径, 次数, 上次使用 unix 秒)。表本身通常只有几百条，
+    /// UI 拿它去索引里反查下标，比逐条 boost() 试探便宜得多。
+    pub fn snapshot(&self) -> Vec<(String, u32, u64)> {
+        self.map
+            .iter()
+            .map(|(p, i)| (p.clone(), i.count, i.last_used_unix))
+            .collect()
+    }
+
+    /// 清空全部使用记录（设置里的「清除使用记录」用）：表清零后由
+    /// 调用方 save 落盘，写出的就是空表，常用统计从零开始。
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     pub fn save(&self) -> io::Result<()> {
         let Some(p) = &self.file_path else {
             return Ok(());

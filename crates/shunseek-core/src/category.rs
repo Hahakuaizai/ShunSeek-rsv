@@ -1,7 +1,7 @@
 //! 条目分类。与 C# 版 EntryCategory 数值一一对应（会写进索引缓存文件，不要重排）。
 //! 顺序即 UI 分类筛选条的大致顺序。
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Category {
     Other = 0,

@@ -1,6 +1,6 @@
 [package]
 name = "shunseek-app"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "瞬觅 ShunSeek 界面（Rust 版，egui 重绘）：DeskBox 式小悬浮窗 + 全局热键 + 托盘"
 
@@ -9,8 +9,31 @@ shunseek-core = { path = "../shunseek-core" }
 eframe = "0.29"
 egui = "0.29"
 
+# exe 图标嵌入（build.rs）。故意不做 target 限定：build.rs 在所有平台
+# 都会编译，非 Windows 目标时它读 TARGET 后直接返回；若写成
+# [target.'cfg(windows)'.build-dependencies]，交叉 check 到 Linux 目标时
+# build.rs 引用不到这个 crate 会直接编译失败。
+[build-dependencies]
+winresource = "0.1"
+
 # 托盘：只在 Windows 目标启用。
 # tray-icon 在 Linux 上要拉 GTK / appindicator 系统库，无头构建机上没有，
 # 所以非 Windows 目标不引入这个依赖，托盘模块退化为骨架（见 src/tray.rs）。
+# windows-sys：icons.rs 取系统图标（Shell/Gdi）、悬停卡本地时间转换
+# （System_Time）、开机自启动注册表（System_Registry）、热键占用
+# 探测 RegisterHotKey（UI_Input_KeyboardAndMouse）。
+# rfd：范围面板「添加文件夹…」的系统文件夹选择框（仅 Windows 引入，
+# 非 Windows 目标不编译此依赖、按钮置灰）。
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.19"
+rfd = "0.15"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Time",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

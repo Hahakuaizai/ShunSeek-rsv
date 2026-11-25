@@ -14,6 +14,6 @@ pub mod usage;
 
 pub use builder::build_index;
 pub use category::{classify_by_extension, Category};
-pub use search::{SearchEngine, SearchHit};
+pub use search::{ScopeFilter, SearchEngine, SearchHit};
 pub use store::{IndexStore, RawEntry};
 pub use usage::UsageStore;

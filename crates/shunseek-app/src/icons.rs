@@ -1,0 +1,295 @@
+//! 结果行真实图标（v0.1.5）：Windows 上向 Shell 要系统图标，行里不再
+//! 只有分类色块 + 首字。设计要点：
+//!  - **不阻塞 UI**：取图标在专职后台线程做，UI 绘制时只查缓存；
+//!    未命中先发请求（同 key 只发一次）、本帧回退色块，图标到了
+//!    （worker 完成时会 request_repaint）下一帧自动换上。
+//!  - **按 key 取，不逐个访问磁盘**：普通文件按扩展名取（SHGetFileInfoW
+//!    + USEFILEATTRIBUTES，只问类型图标，不打开文件本体）；文件夹共用
+//!    一个 "folder"；只有 .exe / .lnk / 应用条目按完整路径取真图标
+//!    （每个程序各异，且 .lnk 经 Shell 解析会拿到目标的图标）。
+//!  - **缓存有上限**：key 数到 MAX_ICON_KEYS 就不再取新的，免得长
+//!    会话里纹理无限涨；取失败的 key 也记下来（None），不反复重试。
+//!  - **全程判空判错**：FFI 任何一步失败都回退色块，绝不 panic。
+//!
+//! 非 Windows：没有系统图标这回事，texture() 恒返回 None，全行回退
+//! 色块——与 v0.1.4 及以前完全一致。
+
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender};
+
+use shunseek_core::Category;
+
+/// 图标缓存上限（个 key）：一屏结果最多牵涉百来个 key，256 足够。
+const MAX_ICON_KEYS: usize = 256;
+/// 图标在行内的绘制边长（色块位是 36×36，图标 28 居中，留一圈呼吸）。
+pub const ICON_SIZE: f32 = 28.0;
+
+/// 一个结果行该用什么 key 取图标：
+///  - 文件夹 / 安装目录 → "folder"（全系统共用一个通用文件夹图标）
+///  - 应用 / 快捷方式 / 散落 exe → "path:<完整路径>"（图标各异）
+///  - 其余文件 → 扩展名（含点、小写，如 ".docx"）；无扩展名 → "file"
+pub fn key_for(name: &str, path: &str, category: Category) -> String {
+    match category {
+        Category::Folder | Category::InstallDir => "folder".to_string(),
+        Category::App | Category::Shortcut | Category::Executable => {
+            format!("path:{path}")
+        }
+        _ => match name.rfind('.') {
+            Some(p) if p > 0 => name[p..].to_lowercase(),
+            _ => "file".to_string(),
+        },
+    }
+}
+
+/// 后台线程取回的一张图标：(宽, 高, RGBA 字节)。
+type Pixels = (u32, u32, Vec<u8>);
+
+pub struct IconCache {
+    /// key → 纹理；None = 已取过但失败 / 无图标，恒回退色块。
+    textures: HashMap<String, Option<egui::TextureHandle>>,
+    /// 已发过请求的 key（防重复发）。非 Windows 下无人用，属预期闲置。
+    #[allow(dead_code)]
+    requested: HashSet<String>,
+    tx: Option<Sender<String>>,
+    rx: Option<Receiver<(String, Option<Pixels>)>>,
+}
+
+impl IconCache {
+    pub fn new(ctx: &egui::Context) -> IconCache {
+        let (tx, rx) = win::spawn_worker(ctx);
+        IconCache {
+            textures: HashMap::new(),
+            requested: HashSet::new(),
+            tx,
+            rx,
+        }
+    }
+
+    /// 查 key 的图标纹理：命中（含已知失败）直接返回；未命中则发请求
+    /// 并返回 None（本帧回退色块）。顺带收割后台线程已取回的结果。
+    pub fn texture(&mut self, ctx: &egui::Context, key: &str) -> Option<egui::TextureHandle> {
+        // 收割结果：RGBA → egui 纹理（只能在 UI 线程做，所以在这里建）
+        if let Some(rx) = &self.rx {
+            let mut arrived: Vec<(String, Option<Pixels>)> = Vec::new();
+            while let Ok(item) = rx.try_recv() {
+                arrived.push(item);
+            }
+            for (k, px) in arrived {
+                let handle = px.map(|(w, h, rgba)| {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba,
+                    );
+                    ctx.load_texture(
+                        format!("ss-icon-{k}"),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+                self.textures.insert(k, handle);
+            }
+        }
+        if let Some(h) = self.textures.get(key) {
+            return h.clone();
+        }
+        // 未命中：发请求（同 key 只发一次；缓存 + 在途都算数，满了停增）
+        if self.textures.len() + self.requested.len() < MAX_ICON_KEYS
+            && !self.requested.contains(key)
+        {
+            if let Some(tx) = &self.tx {
+                if tx.send(key.to_string()).is_ok() {
+                    self.requested.insert(key.to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use super::Pixels;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+
+    /// 起图标 worker 线程（非 Windows 返回 (None, None)，缓存恒空）。
+    /// worker 只做 FFI 取图 + 回传像素，不碰 egui 纹理（那是 UI 线程的事）；
+    /// 每取回一张就 request_repaint，让正在显示的行尽快换上真图标。
+    pub fn spawn_worker(
+        ctx: &egui::Context,
+    ) -> (
+        Option<Sender<String>>,
+        Option<Receiver<(String, Option<Pixels>)>>,
+    ) {
+        let (req_tx, req_rx) = channel::<String>();
+        let (res_tx, res_rx) = channel::<(String, Option<Pixels>)>();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shunseek-icons".into())
+            .spawn(move || {
+                while let Ok(key) = req_rx.recv() {
+                    // FFI 全程已判空判错，这里再套一层 catch_unwind：
+                    // 就算 Shell 那边出了意料外的状况，也只丢这一张图。
+                    let px = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        fetch(&key)
+                    }))
+                    .unwrap_or(None);
+                    if res_tx.send((key, px)).is_err() {
+                        break; // UI 已退出，线程跟着收工
+                    }
+                    ctx.request_repaint();
+                }
+            });
+        match spawned {
+            Ok(_) => (Some(req_tx), Some(res_rx)),
+            Err(_) => (None, None),
+        }
+    }
+
+    /// 按 key 取系统图标并转成 RGBA。任何一步失败都返回 None。
+    fn fetch(key: &str) -> Option<Pixels> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::{
+            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_USEFILEATTRIBUTES,
+        };
+
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+        // (要问的路径, 文件属性, 是否走 USEFILEATTRIBUTES 不落盘)
+        let (path_str, attrs, use_attrs): (String, u32, bool) =
+            if key == "folder" {
+                ("folder".to_string(), FILE_ATTRIBUTE_DIRECTORY, true)
+            } else if key == "file" {
+                ("file".to_string(), FILE_ATTRIBUTE_NORMAL, true)
+            } else if let Some(p) = key.strip_prefix("path:") {
+                (p.to_string(), 0, false)
+            } else {
+                // ".docx" 之类的扩展名 key：拼个假文件名问类型图标
+                (format!("file{key}"), FILE_ATTRIBUTE_NORMAL, true)
+            };
+
+        let wide: Vec<u16> = OsStr::new(&path_str)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut info: SHFILEINFOW = unsafe { std::mem::zeroed() };
+        let mut flags = SHGFI_ICON; // 不设 SMALLICON 即大图标（一般 32×32）
+        if use_attrs {
+            flags |= SHGFI_USEFILEATTRIBUTES;
+        }
+        let ok = unsafe {
+            SHGetFileInfoW(
+                wide.as_ptr(),
+                attrs,
+                &mut info,
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                flags,
+            )
+        };
+        if ok == 0 || info.hIcon == 0 {
+            return None;
+        }
+        let px = unsafe { hicon_to_rgba(info.hIcon) };
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon(info.hIcon);
+        }
+        px
+    }
+
+    /// HICON → (宽, 高, RGBA)：GetIconInfo 拿颜色位图，GetDIBits 按
+    /// 32bpp 自上而下读 BGRA，再转成 RGBA。位图句柄用完 DeleteObject。
+    unsafe fn hicon_to_rgba(
+        hicon: windows_sys::Win32::UI::WindowsAndMessaging::HICON,
+    ) -> Option<Pixels> {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Graphics::Gdi::{
+            DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
+            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
+
+        let mut ii: ICONINFO = std::mem::zeroed();
+        if GetIconInfo(hicon, &mut ii) == 0 {
+            return None;
+        }
+        let result = (|| {
+            if ii.hbmColor == 0 {
+                return None;
+            }
+            let mut bm: BITMAP = std::mem::zeroed();
+            let got = GetObjectW(
+                ii.hbmColor,
+                std::mem::size_of::<BITMAP>() as i32,
+                &mut bm as *mut BITMAP as *mut c_void,
+            );
+            if got == 0 {
+                return None;
+            }
+            let (w, h) = (bm.bmWidth, bm.bmHeight);
+            if w <= 0 || h <= 0 || w > 256 || h > 256 {
+                return None;
+            }
+            let mut bmi: BITMAPINFO = std::mem::zeroed();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h; // 负高 = 自上而下，省一次翻转
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            let hdc = GetDC(0);
+            if hdc == 0 {
+                return None;
+            }
+            let lines = GetDIBits(
+                hdc,
+                ii.hbmColor,
+                0,
+                h as u32,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+            ReleaseDC(0, hdc);
+            if lines == 0 {
+                return None;
+            }
+            // BGRA → RGBA
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            // 老图标没有 alpha 通道（全像素 alpha=0）：整体置不透明，
+            // 否则整张图会因 alpha=0 而完全透明、什么都看不见。
+            if buf.iter().skip(3).step_by(4).all(|&a| a == 0) {
+                for px in buf.chunks_exact_mut(4) {
+                    px[3] = 255;
+                }
+            }
+            Some((w as u32, h as u32, buf))
+        })();
+        if ii.hbmColor != 0 {
+            DeleteObject(ii.hbmColor);
+        }
+        if ii.hbmMask != 0 {
+            DeleteObject(ii.hbmMask);
+        }
+        result
+    }
+}
+
+#[cfg(not(windows))]
+mod win {
+    use super::Pixels;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    /// 非 Windows 骨架：不起线程，缓存恒空，结果行回退分类色块。
+    pub fn spawn_worker(
+        _ctx: &egui::Context,
+    ) -> (
+        Option<Sender<String>>,
+        Option<Receiver<(String, Option<Pixels>)>>,
+    ) {
+        (None, None)
+    }
+}
