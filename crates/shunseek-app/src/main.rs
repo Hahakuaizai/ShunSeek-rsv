@@ -2002,6 +2002,11 @@ struct ShunSeekApp {
     /// 不参与窗口拖动（与 blockers 分开存，语义不同）。
     scroll_prev: Vec<egui::Rect>,
     scroll_cur: Vec<egui::Rect>,
+    /// 可拖窗的上下两条带的分界（本帧记录）：上带 = 窗口顶到搜索框
+    /// 顶（标题栏），下带 = 状态栏顶到窗口底。内容区一律不拖窗——
+    /// 搜索框里划词、结果区里划选都不能把整窗拽走。
+    drag_top_end: f32,
+    drag_bottom_start: f32,
     blockers_prev: Vec<egui::Rect>,
     blockers_cur: Vec<egui::Rect>,
     /// 按下后待命的拖动起点：任意非拉伸带位置按下都记下，
@@ -2294,6 +2299,8 @@ impl ShunSeekApp {
             clickwatch: clickwatch::ClickWatch::start(cc.egui_ctx.clone()),
             scroll_prev: Vec::new(),
             scroll_cur: Vec::new(),
+            drag_top_end: 46.0,
+            drag_bottom_start: f32::MAX,
             blockers_prev: Vec::new(),
             blockers_cur: Vec::new(),
             pending_drag: None,
@@ -2760,15 +2767,18 @@ impl ShunSeekApp {
                         self.pending_drag = None;
                         return;
                     }
-                    // ④ 其余任何位置（含控件上）：一律进入待命拖动。
-                    // 旧版（v0.1.10–v0.1.13）在这里用「按下点是否落在
-                    // 控件矩形内」直接排除——而结果行/卡片/搜索区这些
-                    // rect 都是拉满整行整列的扁平矩形，视觉上的「空白」
-                    // 常常仍落在里面，于是时灵时不灵。改为统一待命，
-                    // 靠下面的 8px 位移阈值区分意图：位移不足 8px
-                    // （大于 egui 的 6px 点击阈值再多给 2px 余量）仍
-                    // 归控件，超过就开始拖窗——纯点击不会被抢。
-                    self.pending_drag = Some(origin);
+                    // ④ 只留上下两条带可拖窗：上带是标题栏，下带是
+                    // 状态栏。内容区（搜索框、工具栏、结果、面板）按下
+                    // 一律不进入待命拖动——在搜索框里划词、在结果里划
+                    // 选，窗口都不该跟着走（用户 2026-11-27 明确要求）。
+                    // 带内仍靠 8px 位移阈值区分点击与拖拽。
+                    let y = origin.y;
+                    self.pending_drag =
+                        if y < self.drag_top_end || y > self.drag_bottom_start {
+                            Some(origin)
+                        } else {
+                            None
+                        };
                 }
             }
         }
@@ -4518,6 +4528,8 @@ impl ShunSeekApp {
         // 拖动排除区（handle_window_press 的 blockers）：在搜索框
         // 里按下拖动留给文本选择，不触发窗口拖动
         self.blockers_cur.push(rect);
+        // 上可拖带到这里为止（搜索框顶 = 标题栏下沿）
+        self.drag_top_end = rect.top();
         let v = ui.ctx().animate_bool_with_time(
             ui.make_persistent_id("search_focus_bar"),
             self.search_focused,
@@ -6296,6 +6308,8 @@ impl ShunSeekApp {
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::hover());
         let painter = ui.painter_at(rect);
+        // 下可拖带从状态栏顶开始
+        self.drag_bottom_start = rect.top();
         // 右：设置按钮（固定宽，先占位，位置恒定）
         let set_w = 62.0;
         let set_rect = egui::Rect::from_min_size(
