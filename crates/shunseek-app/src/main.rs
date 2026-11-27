@@ -234,6 +234,11 @@ struct Palette {
     pill_fill: Color32,
     pill_hover: Color32,
     pill_stroke: Color32,
+    /// 首页磁贴三态：hover 中性浮底 / 选中朱砂薄底 / 选中描边。
+    /// 与 pill_* 分开，磁贴悬停不再染朱砂底（v0.1.20 设计重做）。
+    tile_hover_fill: Color32,
+    tile_sel_fill: Color32,
+    tile_sel_stroke: Color32,
     /// 未选行/chip 的 hover 填充 = MenuHover。
     chip_hover_fill: Color32,
     /// 结果行三态：RowHover / RowSel / RowSelStroke。
@@ -260,17 +265,20 @@ struct Palette {
 }
 impl Palette {
 
-    /// 深色：v0.1.2 全部硬编码数值原样。
-    /// 深色（原版默认）：ThemeManager.cs 深色画刷逐值。
+    /// 深色（v0.1.20 设计重做）：从「上雾下黑的硬分界」改成
+    /// 「一整块沉墨底 + 浮起的输入卡 + 朱砂只做点缀」。
     fn dark() -> Self {
         Self {
-            grad_top: Color32::from_rgb(18, 24, 28), // InkFill #12181C
-            grad_mid: Color32::from_rgb(14, 20, 24), // InkFill #0E1418
-            grad_bottom: Color32::from_rgb(10, 15, 18), // InkFill #0A0F12
-            top_highlight_peak: 10,                  // TopGlow 白@8% × 层 0.5
+            grad_top: Color32::from_rgb(16, 23, 28), // InkFill #10171C
+            grad_mid: Color32::from_rgb(12, 18, 22), // InkFill #0C1216
+            grad_bottom: Color32::from_rgb(9, 14, 18), // InkFill #090E12
+            // 暗色不再画顶部白雾：220px 高的大块提亮在深色上就是
+            // 一条横贯窗体的灰带，与下半段的硬边界正是「暗主题
+            // 有点奇怪」的主因。层次改由面板填充与描边承担。
+            top_highlight_peak: 0,
             panel_stroke: Color32::from_rgb(42, 52, 58), // ShellStroke #2A343A
-            panel_fill: Color32::from_rgb(10, 15, 18),
-            extreme_bg: Color32::from_rgb(22, 29, 34), // Surface #161D22
+            panel_fill: Color32::from_rgb(9, 14, 18),
+            extreme_bg: Color32::from_rgb(23, 31, 37), // Surface #171F25
             popup_fill: Color32::from_rgba_unmultiplied(20, 26, 31, 250), // MenuFill #141A1F
             popup_stroke: Color32::from_rgb(38, 48, 54), // MenuStroke #263036
             popup_shadow_color: Color32::from_black_alpha(140), // #000 @0.55
@@ -280,29 +288,35 @@ impl Palette {
             path_text: Color32::from_rgb(115, 126, 132), // TextLow #737E84
             empty_text: Color32::from_rgb(115, 126, 132),
             status_text: Color32::from_rgb(115, 126, 132),
-            hairline: Color32::from_rgb(30, 38, 43),   // HairLine #1E262B
-            edge_line: Color32::from_rgb(36, 45, 51),  // EdgeLine #242D33
-            edge_strong: Color32::from_rgb(48, 59, 66), // EdgeStrong #303B42
-            surface: Color32::from_rgb(22, 29, 34),    // Surface #161D22
-            surface_hover: Color32::from_rgb(28, 36, 42), // SurfaceHover #1C242A
-            surface_sel: Color32::from_rgb(33, 43, 50), // SurfaceSel #212B32
-            search_fill: Color32::from_rgb(22, 29, 34),
+            hairline: Color32::from_rgb(33, 42, 48),   // HairLine #212A30
+            edge_line: Color32::from_rgb(38, 48, 56),  // EdgeLine #263038
+            edge_strong: Color32::from_rgb(52, 64, 72), // EdgeStrong #344048
+            surface: Color32::from_rgb(23, 31, 37),    // Surface #171F25
+            surface_hover: Color32::from_rgb(30, 40, 47), // SurfaceHover #1E282F
+            surface_sel: Color32::from_rgb(35, 46, 54), // SurfaceSel #232E36
+            search_fill: Color32::from_rgb(23, 31, 37),
             search_icon: Color32::from_rgb(115, 126, 132),
             search_text: Color32::from_rgb(237, 233, 225),
             hint: Some(Color32::from_rgb(115, 126, 132)),
-            esc_fill: Color32::from_rgb(26, 34, 39),   // ChipFill #1A2227
+            esc_fill: Color32::from_rgb(29, 38, 45),   // ChipFill #1D262D
             esc_text: Color32::from_rgb(115, 126, 132),
-            bar_fill: Color32::from_rgb(22, 29, 34),
-            bar_stroke: Color32::from_rgb(36, 45, 51),
+            bar_fill: Color32::from_rgb(23, 31, 37),
+            bar_stroke: Color32::from_rgb(38, 48, 56),
             chip_text_rgb: (154, 165, 171),
             chip_sel_text_rgb: (217, 122, 95),
-            pill_fill: Color32::from_rgba_unmultiplied(196, 87, 63, 31), // @12%
-            pill_hover: Color32::from_rgba_unmultiplied(196, 87, 63, 58), // @23%
-            pill_stroke: Color32::from_rgba_unmultiplied(196, 87, 63, 89), // @35%
-            chip_hover_fill: Color32::from_rgb(30, 40, 46), // MenuHover #1E282E
-            row_hover_fill: Color32::from_rgb(22, 29, 34), // RowHover #161D22
-            row_sel_fill: Color32::from_rgb(33, 43, 50), // RowSel #212B32
-            row_sel_stroke: Color32::from_rgb(47, 59, 67), // RowSelStroke #2F3B43
+            pill_fill: Color32::from_rgba_unmultiplied(196, 87, 63, 28), // @11%
+            pill_hover: Color32::from_rgba_unmultiplied(196, 87, 63, 46), // @18%
+            pill_stroke: Color32::from_rgba_unmultiplied(196, 87, 63, 115), // @45%
+            // 磁贴：悬停是一层中性暖白浮底，选中才是朱砂薄底 +
+            // 朱砂描边——「悬停就变粉红」正是截图里 workspace 那块
+            // 突兀的红底。
+            tile_hover_fill: Color32::from_rgba_unmultiplied(237, 233, 225, 9),
+            tile_sel_fill: Color32::from_rgba_unmultiplied(196, 87, 63, 52), // @20%
+            tile_sel_stroke: Color32::from_rgba_unmultiplied(196, 87, 63, 140), // @55%
+            chip_hover_fill: Color32::from_rgb(32, 42, 50), // MenuHover #202A32
+            row_hover_fill: Color32::from_rgb(23, 31, 37), // RowHover #171F25
+            row_sel_fill: Color32::from_rgb(33, 44, 52), // RowSel #212C34
+            row_sel_stroke: Color32::from_rgb(51, 64, 74), // RowSelStroke #33404A
             fold_fill: Color32::from_rgb(21, 29, 34),  // FoldFill #151D22
             icon_plate: Color32::from_rgb(27, 36, 42), // IconPlate #1B242A
             highlight: Color32::from_rgb(217, 122, 95),
@@ -361,8 +375,11 @@ impl Palette {
             chip_text_rgb: (90, 90, 90),
             chip_sel_text_rgb: (156, 58, 36),
             pill_fill: Color32::from_rgba_unmultiplied(178, 67, 44, 26), // @10%
-            pill_hover: Color32::from_rgba_unmultiplied(178, 67, 44, 48), // @19%
-            pill_stroke: Color32::from_rgba_unmultiplied(178, 67, 44, 89), // @35%
+            pill_hover: Color32::from_rgba_unmultiplied(178, 67, 44, 40), // @16%
+            pill_stroke: Color32::from_rgba_unmultiplied(178, 67, 44, 101), // @40%
+            tile_hover_fill: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
+            tile_sel_fill: Color32::from_rgba_unmultiplied(178, 67, 44, 40), // @16%
+            tile_sel_stroke: Color32::from_rgba_unmultiplied(178, 67, 44, 130), // @51%
             chip_hover_fill: Color32::from_rgb(238, 238, 238), // 中性化（原 MenuHover #EDF1EC）
             row_hover_fill: Color32::from_rgb(243, 243, 243), // 中性化（原 RowHover #F2F5F1）
             row_sel_fill: Color32::from_rgb(234, 234, 234), // 中性化（原 RowSel #E8EDE7）
@@ -448,6 +465,9 @@ impl Palette {
             pill_fill: lc(self.pill_fill, other.pill_fill, t),
             pill_hover: lc(self.pill_hover, other.pill_hover, t),
             pill_stroke: lc(self.pill_stroke, other.pill_stroke, t),
+            tile_hover_fill: lc(self.tile_hover_fill, other.tile_hover_fill, t),
+            tile_sel_fill: lc(self.tile_sel_fill, other.tile_sel_fill, t),
+            tile_sel_stroke: lc(self.tile_sel_stroke, other.tile_sel_stroke, t),
             chip_hover_fill: lc(self.chip_hover_fill, other.chip_hover_fill, t),
             row_hover_fill: lc(self.row_hover_fill, other.row_hover_fill, t),
             row_sel_fill: lc(self.row_sel_fill, other.row_sel_fill, t),
@@ -3924,14 +3944,35 @@ fn fade_alpha(c: Color32, t: f32) -> Color32 {
     )
 }
 
-/// 光束彩虹带：青 #22D3EE → 蓝 #3B82F6 → 紫 #A855F7 → 粉 #EC4899，
-/// s 是段内位置（0=束头，1=束尾），供光束游走时给每小段上色。
+/// 左右两端渐隐的 1px 横线（发丝线/外壳反光共用）。矩形高度即线宽。
+fn paint_fade_hline(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let (r, g, b) = (color.r(), color.g(), color.b());
+    let clear = Color32::from_rgba_unmultiplied(r, g, b, 0);
+    let y0 = rect.top();
+    let y1 = rect.bottom();
+    let mut mesh = egui::Mesh::default();
+    for (x, col) in [
+        (rect.left(), clear),
+        (rect.center().x, color),
+        (rect.right(), clear),
+    ] {
+        mesh.colored_vertex(egui::pos2(x, y0), col);
+        mesh.colored_vertex(egui::pos2(x, y1), col);
+    }
+    mesh.indices
+        .extend_from_slice(&[0, 1, 2, 1, 3, 2, 2, 3, 4, 3, 5, 4]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// 光束色带（v0.1.20 换掉青紫彩虹）：暖白 #EDE9E1 → 浅朱砂
+/// #E28A6C → 朱砂 #C4573F → 深朱砂 #96402C。同一束光沿着走，
+/// 跟界面的朱砂强调不再打架。s 是段内位置（0=束头，1=束尾）。
 fn beam_color(s: f32) -> (u8, u8, u8) {
     const STOPS: [(f32, (u8, u8, u8)); 4] = [
-        (0.0, (34, 211, 238)),
-        (1.0 / 3.0, (59, 130, 246)),
-        (2.0 / 3.0, (168, 85, 247)),
-        (1.0, (236, 72, 153)),
+        (0.0, (237, 233, 225)),
+        (1.0 / 3.0, (226, 138, 108)),
+        (2.0 / 3.0, (196, 87, 63)),
+        (1.0, (150, 64, 44)),
     ];
     let s = s.clamp(0.0, 1.0);
     for w in STOPS.windows(2) {
@@ -4648,10 +4689,12 @@ impl ShunSeekApp {
                 pal.name_text,
             );
             let div_x = drag_rect.left() + title_w + 14.0;
+            // v0.1.20：书眉那道竖分隔从灰描边换成朱砂薄线——整窗
+            // 唯一的「品牌记号」，也把朱砂只用在该用的地方。
             painter.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(div_x, cy - 7.0), Vec2::new(1.0, 14.0)),
                 Rounding::ZERO,
-                pal.edge_strong,
+                fade_alpha(pal.accent, 0.42),
             );
             painter.galley(
                 egui::pos2(div_x + 15.0, cy - cap_g.size().y / 2.0),
@@ -4770,7 +4813,7 @@ impl ShunSeekApp {
                 // 输入框宽度必须有界：右侧还要放 Enter 键帽，给
                 // INFINITY 会把键帽顶出框外被窗口切掉。
                 let edit = egui::TextEdit::singleline(&mut self.query)
-                    .desired_width((ui.available_width() - 64.0).max(60.0))
+                    .desired_width((ui.available_width() - 104.0).max(60.0))
                     .hint_text(hint_text)
                     .text_color(pal.search_text)
                     .frame(false)
@@ -4819,14 +4862,30 @@ impl ShunSeekApp {
                     });
             });
         });
-        // 焦点标记条：2px 朱砂竖条，左内缩 1、上下内缩 8，圆角 1；
-        // 聚焦淡入 / 失焦淡出（animate 0.18s 近似原版 150/200ms）。
+        // 焦点：v0.1.20 起不再画左侧 2px 朱砂竖条（在圆角框上就是
+        // 贴边的红杠，用户截图的「奇怪」之一），改成整圈描边随聚焦
+        // 渐变为朱砂，外加一圈极淡内辉光，框体自己亮起来。
         let rect = frame_resp.response.rect;
         // 拖动排除区（handle_window_press 的 blockers）：在搜索框
         // 里按下拖动留给文本选择，不触发窗口拖动
         self.blockers_cur.push(rect);
         // 上可拖带到这里为止（搜索框顶 = 标题栏下沿）
         self.drag_top_end = rect.top();
+        // 框内顶部 1px 暖白反光（左右渐隐，避开圆角）：深色下一块
+        // 纯色圆角矩形靠这道反光才「浮」得起来
+        paint_fade_hline(
+            &ui.painter_at(rect),
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 14.0, rect.top() + 1.0),
+                egui::pos2(rect.right() - 14.0, rect.top() + 2.0),
+            ),
+            Color32::from_rgba_unmultiplied(
+                pal.name_text.r(),
+                pal.name_text.g(),
+                pal.name_text.b(),
+                30,
+            ),
+        );
         let v = ui.ctx().animate_bool_with_time(
             ui.make_persistent_id("search_focus_bar"),
             self.search_focused,
@@ -4837,19 +4896,25 @@ impl ShunSeekApp {
                 .request_repaint_after(std::time::Duration::from_millis(16));
         }
         if v > 0.01 {
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + 1.0, rect.top() + 8.0),
-                egui::pos2(rect.left() + 3.0, rect.bottom() - 8.0),
+            let p = ui.painter_at(rect);
+            let ring = Color32::from_rgba_unmultiplied(
+                pal.accent.r(),
+                pal.accent.g(),
+                pal.accent.b(),
+                (150.0 * v) as u8,
             );
-            ui.painter().rect_filled(
-                bar,
-                Rounding::same(1.0),
-                Color32::from_rgba_unmultiplied(
-                    pal.accent.r(),
-                    pal.accent.g(),
-                    pal.accent.b(),
-                    (255.0 * v) as u8,
-                ),
+            p.rect_stroke(
+                rect.shrink(0.5),
+                Rounding::same(12.0),
+                Stroke::new(1.4_f32, ring),
+            );
+            p.rect_stroke(
+                rect.shrink(2.0),
+                Rounding::same(10.0),
+                Stroke::new(3.0_f32, {
+                    let (r, g, b) = (pal.accent.r(), pal.accent.g(), pal.accent.b());
+                    Color32::from_rgba_unmultiplied(r, g, b, (18.0 * v) as u8)
+                }),
             );
         }
         // 流光描边（v0.1.7 按用户裁决加回）：画在 Frame 边框之上
@@ -5833,11 +5898,11 @@ impl ShunSeekApp {
         let painter = ui.painter_at(rect);
         let selected = idx == self.selected;
         if selected {
-            painter.rect_filled(rect, Rounding::same(10.0), pal.pill_hover);
+            painter.rect_filled(rect, Rounding::same(10.0), pal.tile_sel_fill);
             painter.rect_stroke(
                 rect,
                 Rounding::same(10.0),
-                Stroke::new(1.0_f32, pal.pill_stroke),
+                Stroke::new(1.0_f32, pal.tile_sel_stroke),
             );
         } else {
             // hover 填充缓动（v0.1.10，150ms cubic_out，与结果行同款）
@@ -5846,7 +5911,7 @@ impl ShunSeekApp {
                 painter.rect_filled(
                     rect,
                     Rounding::same(10.0),
-                    fade_alpha(pal.pill_fill, hv),
+                    fade_alpha(pal.tile_hover_fill, hv),
                 );
             }
         }
@@ -6533,15 +6598,14 @@ impl ShunSeekApp {
             pal.path_text,
         );
 
-        // 行底发丝线：左 56 起、右 12 止；悬停/选中时隐藏（原版规则）
+        // 行底发丝线：左 56 起、右 12 止；悬停/选中时隐藏（原版规则）。
+        // v0.1.20 两端渐隐，行与行之间不再是一道道硬横线。
         if !selected && !response.hovered() {
-            ui.painter_at(rect).line_segment(
-                [
-                    egui::pos2(rect.left() + 56.0 + indent_x, rect.bottom() - 0.5),
-                    egui::pos2(rect.right() - 12.0, rect.bottom() - 0.5),
-                ],
-                Stroke::new(1.0_f32, pal.hairline),
+            let lr = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 56.0 + indent_x, rect.bottom() - 1.0),
+                egui::pos2(rect.right() - 12.0, rect.bottom()),
             );
+            paint_fade_hline(&ui.painter_at(rect), lr, pal.hairline);
         }
 
         if response.hovered() {
@@ -6669,8 +6733,7 @@ impl ShunSeekApp {
         // 顶部发丝线（其下留 7px，合计近似原版 Margin 上 11）
         let (line_rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
-        ui.painter_at(line_rect)
-            .rect_filled(line_rect, Rounding::ZERO, pal.hairline);
+        paint_fade_hline(&ui.painter_at(line_rect), line_rect, pal.hairline);
         ui.add_space(7.0);
 
         let (rect, _) =
@@ -8516,6 +8579,24 @@ impl eframe::App for ShunSeekApp {
         );
         // 顶部光晕（原版 TopGlow：顶部 220px 白色渐隐层，单个 Mesh）
         paint_top_glow(&bg_painter, screen, shell_radius, pal.top_highlight_peak);
+        // 外壳顶部一道 1px 玻璃反光（左右渐隐，最大化时不画）：
+        // 深色底上一整圈灰描边看着像「框」，顶部一道弱反光才像
+        // 一块压着桌面的玻璃。
+        if !self.maximized {
+            paint_fade_hline(
+                &bg_painter,
+                egui::Rect::from_min_max(
+                    egui::pos2(screen.left() + shell_radius, screen.top() + 1.0),
+                    egui::pos2(screen.right() - shell_radius, screen.top() + 2.0),
+                ),
+                Color32::from_rgba_unmultiplied(
+                    pal.name_text.r(),
+                    pal.name_text.g(),
+                    pal.name_text.b(),
+                    14,
+                ),
+            );
+        }
         // 注意：这里绝不能给 Frame 加 shadow。面板填充是透明的，egui 的
         // 阴影画在面板形状之后、内容之前，会整片透过透明面板压在渐变上
         // ——浅色下就是一层均匀的灰幕（v0.1.3 浅色「太灰」的真凶，深色下
@@ -8543,18 +8624,21 @@ impl eframe::App for ShunSeekApp {
                 // 一截，右侧内容被窗口边缘切掉（v0.1.3 预览里分类胶囊/
                 // 状态栏文字被切就是这个），按屏宽显式收住。
                 let content_w = (ctx.screen_rect().width() - 44.0).max(200.0);
-                ui.set_max_width(content_w);
+                // 内容宽按屏宽显式收住（set_width 同时钉住 min/max）：
+                // 某些环境下（虚拟屏 DPI 不一致等）面板给到的可用宽会
+                // 多出一截，右侧内容被窗口边缘切掉，按屏宽固定最稳。
+                ui.set_width(content_w);
                 self.draw_header(ui);
                 ui.add_space(5.0);
                 self.draw_search_box(ui);
                 ui.add_space(5.0);
-                // 搜索框下发丝线（原版：高 1、HairLine）
+                // 搜索框下发丝线（v0.1.20：左右两端渐隐，不再是一根
+                // 顶到底的硬线）
                 let (line_rect, _) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width(), 1.0),
                     egui::Sense::hover(),
                 );
-                ui.painter_at(line_rect)
-                    .rect_filled(line_rect, Rounding::ZERO, pal.hairline);
+                paint_fade_hline(&ui.painter_at(line_rect), line_rect, pal.hairline);
                 ui.add_space(5.0);
                 self.draw_toolbar(ui);
                 // 工具栏 → 内容区间距（v0.1.10 布局收紧统一 5；
