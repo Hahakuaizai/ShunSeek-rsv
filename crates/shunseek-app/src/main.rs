@@ -748,6 +748,104 @@ fn serif(size: f32) -> FontId {
     FontId::new(size, egui::FontFamily::Name(SERIF_FAMILY.into()))
 }
 
+/// 单行文本按最大宽度排版：放得下就原样，放不下按字符二分截断并补
+/// 尾省略号。用于类型标签、名字等必须在固定列宽内呆着的文字。
+fn layout_fit_ellipsis(
+    painter: &egui::Painter,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let full = painter.layout_no_wrap(text.to_string(), font.clone(), color);
+    if full.size().x <= max_w || text.is_empty() {
+        return full;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let s = format!("{}…", chars[..mid].iter().collect::<String>());
+        let g = painter.layout_no_wrap(s, font.clone(), color);
+        if g.size().x <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let s = format!("{}…", chars[..lo].iter().collect::<String>());
+    painter.layout_no_wrap(s, font, color)
+}
+
+/// 多行文本按宽度折行、最多 max_rows 行：超出按字符二分截断并补
+/// 尾省略号（二分时省略号本身也参与排版，保证最终行数不超）。
+fn layout_wrap_max_rows_ellipsis(
+    fonts: &egui::text::Fonts,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    wrap_w: f32,
+    max_rows: usize,
+) -> std::sync::Arc<egui::Galley> {
+    let full = fonts.layout(text.to_string(), font.clone(), color, wrap_w);
+    if full.rows.len() <= max_rows || text.is_empty() {
+        return full;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let s = format!("{}…", chars[..mid].iter().collect::<String>());
+        if fonts
+            .layout(s, font.clone(), color, wrap_w)
+            .rows
+            .len()
+            <= max_rows
+        {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let s = format!("{}…", chars[..lo].iter().collect::<String>());
+    fonts.layout(s, font, color, wrap_w)
+}
+
+/// 单行文本按最大宽度从尾部保留（头部补省略号），用于长路径：
+/// 用户更关心末级目录/文件名，所以切前面不切后面。
+fn layout_fit_ellipsis_tail(
+    painter: &egui::Painter,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let full = painter.layout_no_wrap(text.to_string(), font.clone(), color);
+    if full.size().x <= max_w || text.is_empty() {
+        return full;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let s = format!(
+            "…{}",
+            chars[chars.len() - mid..].iter().collect::<String>()
+        );
+        let g = painter.layout_no_wrap(s, font.clone(), color);
+        if g.size().x <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let s = format!("…{}", chars[chars.len() - lo..].iter().collect::<String>());
+    painter.layout_no_wrap(s, font, color)
+}
+
 fn install_cjk_font(ctx: &egui::Context) {
     // 仅加载一份系统 CJK 字体（Windows 优先微软雅黑），SERIF_FAMILY 直接复用，
     // 避免再读入 18MB+ 的第二份字体（simsun.ttc）导致双倍字体内存占用。
@@ -2335,7 +2433,7 @@ impl ShunSeekApp {
             fold_active: false,
             icons: icons::IconCache::new(&cc.egui_ctx),
             names: names::NameService::new(&cc.egui_ctx),
-            selected: 0,
+            selected: usize::MAX,
             status,
             status_alert: false,
             search_focused: false,
@@ -3015,7 +3113,13 @@ impl ShunSeekApp {
         if len == 0 {
             return;
         }
-        let next = (self.selected as i32 + delta).clamp(0, len as i32 - 1);
+        // usize::MAX = 无选中（空查询首页态）：按方向落到首/尾
+        let cur = if self.selected >= len {
+            if delta > 0 { -1i32 } else { len as i32 }
+        } else {
+            self.selected as i32
+        };
+        let next = (cur + delta).clamp(0, len as i32 - 1);
         self.selected = next as usize;
         self.scroll_to_selected = true;
     }
@@ -3763,7 +3867,13 @@ impl ShunSeekApp {
                 self.rows = rows;
                 self.fold_active = !empty_query;
                 self.rebuild_display();
-                self.selected = 0;
+                // 空查询回到首页：不预选第一个磁贴（之前 selected=0
+                // 会让「gemini」格一进首页就带选中底）
+                self.selected = if empty_query {
+                    usize::MAX
+                } else {
+                    0
+                };
                 // 结果集进场动画起点（v0.1.10）：draw_results 按它
                 // 做整组淡入 + 上浮（见 results_born 字段注释）
                 self.results_born = Some(ctx.input(|i| i.time));
@@ -5803,20 +5913,16 @@ impl ShunSeekApp {
                 matches!(item.category, Category::Folder | Category::InstallDir),
             )
             .unwrap_or_else(|| item.name.clone());
-        let mut display = tile_name.clone();
-        let mut galley =
-            ui.fonts(|f| f.layout(display.clone(), serif(12.5), pal.name_text, wrap_w));
-        if galley.rows.len() > 2 {
-            let mut chars: Vec<char> = tile_name.chars().collect();
-            while galley.rows.len() > 2 && !chars.is_empty() {
-                let cut = (chars.len() / 8).max(1);
-                chars.truncate(chars.len().saturating_sub(cut));
-                display = format!("{}…", chars.iter().collect::<String>());
-                galley = ui.fonts(|f| {
-                    f.layout(display.clone(), serif(12.5), pal.name_text, wrap_w)
-                });
-            }
-        }
+        let galley = ui.fonts(|f| {
+            layout_wrap_max_rows_ellipsis(
+                f,
+                &tile_name,
+                serif(12.5),
+                pal.name_text,
+                wrap_w,
+                2,
+            )
+        });
         np.galley(
             egui::pos2(rect.center().x - galley.size().x / 2.0, name_top),
             galley,
@@ -6041,7 +6147,9 @@ impl ShunSeekApp {
                         pal.accent,
                     );
                 }
-                // 名字：Serif 12，最多 2 行、超出省略、居中；
+                // 名字（v0.1.19 用户裁决）：宫格里只给一行，放不下就尾省略号，
+                // 全名靠悬停 0.4s 的详情卡；名字带 = 图标下沿 → 类型副行
+                // 上沿，竖向居中，裁在带内，绝不压到副行。
                 // 显示名解析到替换名时用替换名（v0.1.9 ShellNames）
                 let cell_name = self
                     .names
@@ -6050,28 +6158,37 @@ impl ShunSeekApp {
                         matches!(r.category, Category::Folder | Category::InstallDir),
                     )
                     .unwrap_or_else(|| r.name.clone());
-                let galley = ui.fonts(|f| {
-                    f.layout(
-                        cell_name,
-                        serif(12.0),
-                        pal.name_text,
-                        92.0,
-                    )
-                });
-                painter.galley(
-                    egui::pos2(
-                        rect.center().x - galley.size().x / 2.0,
-                        rect.top() + 50.0,
-                    ),
+                let name_clip = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 4.0, rect.top() + 47.0),
+                    egui::pos2(rect.right() - 4.0, rect.bottom() - 15.0),
+                );
+                let galley = layout_fit_ellipsis(
+                    &painter,
+                    &cell_name,
+                    serif(12.0),
+                    pal.name_text,
+                    rect.width() - 10.0,
+                );
+                let name_y = name_clip.top() + (name_clip.height() - galley.size().y) / 2.0;
+                painter.with_clip_rect(name_clip).galley(
+                    egui::pos2(rect.center().x - galley.size().x / 2.0, name_y),
                     galley,
                     pal.name_text,
                 );
-                // 类型副行（v0.1.8）：格子底部一行小字具体类型名
-                painter.text(
-                    egui::pos2(rect.center().x, rect.bottom() - 8.0),
-                    egui::Align2::CENTER_CENTER,
-                    r.type_label.clone(),
+                // 类型副行（v0.1.8）：格子底部一行小字具体类型名，限宽省略
+                let type_g = layout_fit_ellipsis(
+                    &painter,
+                    &r.type_label,
                     FontId::proportional(9.5),
+                    pal.path_text,
+                    rect.width() - 8.0,
+                );
+                painter.galley(
+                    egui::pos2(
+                        rect.center().x - type_g.size().x / 2.0,
+                        rect.bottom() - 8.0 - type_g.size().y / 2.0,
+                    ),
+                    type_g,
                     pal.path_text,
                 );
                 let mut act = None;
@@ -6106,22 +6223,25 @@ impl ShunSeekApp {
                     );
                     paint_folder_glyph(&painter, glyph, pal.path_text);
                 }
-                let galley = ui.fonts(|f| {
-                    f.layout(
-                        label.clone(),
-                        serif(12.0),
-                        pal.name_text,
-                        92.0,
-                    )
-                });
-                painter.galley(
-                    egui::pos2(
-                        rect.center().x - galley.size().x / 2.0,
-                        rect.top() + 50.0,
-                    ),
-                    galley,
-                    pal.name_text,
+                let name_clip = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 4.0, rect.top() + 47.0),
+                    egui::pos2(rect.right() - 4.0, rect.bottom() - 15.0),
                 );
+                let galley = layout_fit_ellipsis(
+                    &painter,
+                    label,
+                    serif(12.0),
+                    pal.name_text,
+                    rect.width() - 10.0,
+                );
+                let name_y = name_clip.top() + (name_clip.height() - galley.size().y) / 2.0;
+                painter
+                    .with_clip_rect(name_clip)
+                    .galley(
+                        egui::pos2(rect.center().x - galley.size().x / 2.0, name_y),
+                        galley,
+                        pal.name_text,
+                    );
                 painter.text(
                     egui::pos2(rect.center().x, rect.bottom() - 8.0),
                     egui::Align2::CENTER_CENTER,
@@ -6248,10 +6368,13 @@ impl ShunSeekApp {
         // 右侧簇（右 Margin 12 起向左）：类型标签 → 重要度点 → 固定标记
         // 类型标签 v0.1.8 起用具体类型名（filetype，如「Word 文档」），
         // 重要度点按三档取色（demoted 信号强制按 Low 显示）。
-        let type_galley = painter.layout_no_wrap(
-            row.type_label.clone(),
+        // 类型标签限宽 96：超长时截断加省略号，避免把名字区挤没
+        let type_galley = layout_fit_ellipsis(
+            &painter,
+            &row.type_label,
             FontId::proportional(10.0),
             pal.path_text,
+            96.0,
         );
         let type_x = rect.right() - 12.0 - type_galley.size().x;
         painter.galley(
@@ -6287,15 +6410,22 @@ impl ShunSeekApp {
             text_right = pc.x - 4.5 - 8.0;
         }
 
-        // 名字（命中段高亮）+ 路径，横向裁剪到右侧簇之前
+        // 名字（命中段高亮）+ 路径：都按可用宽度做省略号截断，
+        // 并各自裁剪到上下两条文字带里 —— 长文件名既不会压到右侧
+        // 类型标签，也不会和路径行串字重叠。
         let text_x = rect.left() + 60.0 + indent_x;
-        let text_clip = egui::Rect::from_min_max(
-            egui::pos2(text_x, rect.top()),
-            egui::pos2(text_right - 12.0, rect.bottom()),
+        let text_right_edge = (text_right - 16.0)
+            .max(text_x + 40.0)
+            .min(rect.right() - 8.0);
+        let avail_w = (text_right_edge - text_x).max(24.0);
+        let name_clip = egui::Rect::from_min_max(
+            egui::pos2(text_x, rect.top() + 5.0),
+            egui::pos2(text_right_edge, rect.top() + 30.0),
         );
-        let painter = painter.with_clip_rect(text_clip);
-        let name_font = serif(14.0);
-        let mut job = egui::text::LayoutJob::default();
+        let path_clip = egui::Rect::from_min_max(
+            egui::pos2(text_x, rect.top() + 30.0),
+            egui::pos2(text_right_edge, rect.bottom() - 3.0),
+        );
         // 显示名（v0.1.9 ShellNames 对齐）：解析到替换名（文件夹
         // 本地化名 / .lnk 显示名 / .exe 描述）就用它，并跳过高亮
         // ——高亮区间是按索引名算的字节量，套到替换名上必错位。
@@ -6315,38 +6445,89 @@ impl ShunSeekApp {
         } else {
             None
         };
-        let base_fmt = TextFormat {
-            font_id: name_font,
-            color: pal.name_text,
-            ..Default::default()
-        };
-        match hl {
-            Some((s, e)) => {
-                job.append(&name[..s], 0.0, base_fmt.clone());
+        // 按前 cut 个字符（cut == 全长时为原文）生成带高亮的布局；
+        // 截断时补尾省略号，高亮区间收敛到截断后的字符边界内。
+        let name_chars: Vec<char> = name.chars().collect();
+        let build_name_job = |cut: usize| -> egui::text::LayoutJob {
+            let keep = cut.min(name_chars.len());
+            let mut job = egui::text::LayoutJob::default();
+            let mut keep_text: String = name_chars[..keep].iter().collect();
+            let clipped = keep < name_chars.len();
+            let keep_bytes = keep_text.len();
+            let base_fmt = TextFormat {
+                font_id: serif(14.0),
+                color: pal.name_text,
+                ..Default::default()
+            };
+            let hl2 = match hl {
+                Some((s, e)) if s < keep_bytes => {
+                    let e2 = e.min(keep_bytes);
+                    if s < e2 { Some((s, e2)) } else { None }
+                }
+                _ => None,
+            };
+            match hl2 {
+                Some((s, e)) => {
+                    job.append(&keep_text[..s], 0.0, base_fmt.clone());
+                    job.append(
+                        &keep_text[s..e],
+                        0.0,
+                        TextFormat {
+                            font_id: serif(14.0),
+                            color: pal.highlight,
+                            underline: Stroke::new(1.0_f32, pal.highlight),
+                            ..Default::default()
+                        },
+                    );
+                    job.append(&keep_text[e..], 0.0, base_fmt);
+                }
+                None => job.append(&keep_text, 0.0, base_fmt),
+            }
+            if clipped {
+                keep_text.push('…');
                 job.append(
-                    &name[s..e],
+                    &keep_text[keep_bytes..],
                     0.0,
                     TextFormat {
                         font_id: serif(14.0),
-                        color: pal.highlight,
-                        underline: Stroke::new(1.0_f32, pal.highlight),
+                        color: pal.name_text,
                         ..Default::default()
                     },
                 );
-                job.append(&name[e..], 0.0, base_fmt);
             }
-            None => job.append(name, 0.0, base_fmt),
+            job.wrap.max_width = f32::INFINITY;
+            job
+        };
+        let mut name_galley = painter.layout_job(build_name_job(name_chars.len()));
+        if name_galley.size().x > avail_w && !name_chars.is_empty() {
+            // 二分找能放进可用宽度的最长前缀（只对超长行付出代价）
+            let mut lo = 0usize;
+            let mut hi = name_chars.len();
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2;
+                let g = painter.layout_job(build_name_job(mid));
+                if g.size().x <= avail_w {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            name_galley = painter.layout_job(build_name_job(lo));
         }
-        job.wrap.max_width = f32::INFINITY;
-        let galley = painter.layout_job(job);
-        painter.galley(egui::pos2(text_x, rect.top() + 8.0), galley, Color32::WHITE);
+        painter.with_clip_rect(name_clip).galley(
+            egui::pos2(text_x, rect.top() + 8.0),
+            name_galley,
+            Color32::WHITE,
+        );
 
-        let path_galley = painter.layout_no_wrap(
-            row.path.clone(),
+        let path_galley = layout_fit_ellipsis_tail(
+            &painter,
+            &row.path,
             FontId::proportional(10.0),
             pal.path_text,
+            avail_w,
         );
-        painter.galley(
+        painter.with_clip_rect(path_clip).galley(
             egui::pos2(text_x, rect.top() + 31.0),
             path_galley,
             pal.path_text,
@@ -8195,6 +8376,17 @@ impl eframe::App for ShunSeekApp {
                 // 中文文件能被索引命中。
                 "scope-kcb" => {
                     self.query = "课表".to_string();
+                    self.schedule_search();
+                }
+                // --ui-probe=q:<关键词> / ql:<关键词>（强制列表视图）：
+                // 通用查询探针（长文件名截断自检用），只影响本次运行
+                _ if p.starts_with("ql:") => {
+                    self.query = p[3..].to_string();
+                    self.view_mode = ViewMode::List;
+                    self.schedule_search();
+                }
+                _ if p.starts_with("q:") => {
+                    self.query = p[2..].to_string();
                     self.schedule_search();
                 }
                 _ => {}
