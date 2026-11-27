@@ -1,5 +1,10 @@
+# 编译产物与打包产物已移到仓库外的 ../build/（见 .cargo/config.toml）
+# 下面两条只为兼容旧布局 / 误放产物的情况
 /target
 *.bin
 
 # 本地产物
 dist/
+
+# 兜底：万一 build/ 被放进仓库也不进版本库
+build/

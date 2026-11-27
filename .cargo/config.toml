@@ -1,0 +1,5 @@
+# 编译产物与打包产物统一放在仓库外的 ../build/，源码目录只留开发文件：
+#   ../build/target   cargo 编译目录（约 1.4 GB，可整删重建）
+#   ../build/dist     免安装包与 zip
+[build]
+target-dir = "../build/target"
