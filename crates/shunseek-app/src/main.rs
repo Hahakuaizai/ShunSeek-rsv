@@ -1274,6 +1274,58 @@ fn portable_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// 用户在范围面板里勾选的根（预设 / 磁盘 / 自定义文件夹）。索引建立
+/// 时必须一并扫描：便携模式默认只索引 %USERPROFILE% 一带，用户把
+/// D:\某文件夹设成范围后，索引里根本没有它，过滤下来就是「0 项」。
+#[cfg(windows)]
+fn scope_extra_roots() -> Vec<PathBuf> {
+    let s = load_settings();
+    let base = PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default());
+    let mut out: Vec<PathBuf> = Vec::new();
+    for (key, sub, _) in PRESET_KEYS {
+        if s.scope_presets.iter().any(|k| k == key) {
+            out.push(if sub.is_empty() {
+                base.clone()
+            } else {
+                base.join(sub)
+            });
+        }
+    }
+    for d in &s.scope_drives {
+        out.push(PathBuf::from(format!("{d}:\\")));
+    }
+    for c in &s.scope_custom {
+        out.push(PathBuf::from(c));
+    }
+    out.retain(|p| p.is_dir());
+    out
+}
+
+/// 筛掉已经被某个既有根覆盖的路径（前缀 + 目录边界），避免把
+/// %USERPROFILE% 整树再走一遍。
+#[cfg(windows)]
+fn uncovered_roots(extra: Vec<PathBuf>, covered: &[PathBuf]) -> Vec<PathBuf> {
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .to_lowercase()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_string()
+    };
+    let cov: Vec<String> = covered.iter().map(|p| norm(p)).collect();
+    extra
+        .into_iter()
+        .filter(|p| {
+            let s = norm(p);
+            s.is_empty()
+                || !cov.iter().any(|c| {
+                    s == *c
+                        || (s.starts_with(c.as_str()) && s.as_bytes().get(c.len()) == Some(&b'\\'))
+                })
+        })
+        .collect()
+}
+
 /// 便携模式排除前缀（v0.1.8，对齐原版 IndexService 的 13 项，
 /// 以 LOCALAPPDATA / APPDATA 为基拼出；基为空的项自动丢弃）。
 #[cfg(windows)]
@@ -1413,8 +1465,10 @@ fn rebuild_windows(_dir: &PathBuf, tx: &Sender<IndexMsg>, ctx: &egui::Context) {
         if mft_total == 0 {
             // MFT 全灭：退便携范围，别让索引只剩应用 + 浅层
             watch_plan.clear();
+            let mut walk_roots = portable_roots();
+            walk_roots.extend(uncovered_roots(scope_extra_roots(), &walk_roots));
             let v = guarded(|| {
-                walker::walk_with_excludes(&portable_roots(), true, &portable_excludes())
+                walker::walk_with_excludes(&walk_roots, true, &portable_excludes())
             })
             .unwrap_or_default();
             walk_count += v.len();
@@ -1422,8 +1476,11 @@ fn rebuild_windows(_dir: &PathBuf, tx: &Sender<IndexMsg>, ctx: &egui::Context) {
         }
     } else {
         // ---- 便携模式：便携范围遍历（噪音跳过 + 排除前缀）----
+        // 范围面板勾选的根一并走：否则自定义文件夹永远搜不到。
+        let mut walk_roots = portable_roots();
+        walk_roots.extend(uncovered_roots(scope_extra_roots(), &walk_roots));
         let v = guarded(|| {
-            walker::walk_with_excludes(&portable_roots(), true, &portable_excludes())
+            walker::walk_with_excludes(&walk_roots, true, &portable_excludes())
         })
         .unwrap_or_default();
         walk_count = v.len();
@@ -4570,11 +4627,8 @@ impl ShunSeekApp {
         } else if resp.hovered() {
             painter.rect_filled(rect, rr, pal.surface_hover);
         }
-        let icon_col = if !full || open {
-            pal.accent
-        } else {
-            pal.text_mid
-        };
+        // 图标恒朱砂（与范围按钮同一语言），全类型时右下角不加角标。
+        let icon_col = pal.accent;
         paint_filter_lines(&painter, rect.center(), 18.0, icon_col);
         // 单选：右下角一枚 3px 分类色点，保留类型识别又不糊满整块
         if self.cat_set.len() == 1 && !open {
@@ -4762,10 +4816,13 @@ impl ShunSeekApp {
         let open = expanded || self.filter_anim_t[1] > 0.0;
         let all = self.scope_is_all();
         let summary = self.scope_summary();
-        let show_summary = !all || open;
+        // v0.1.16：摘要胶囊常显（含「全部」）。旧版全盘时工具栏只剩
+        // 一个灰色的文件夹图标，看起来像被禁用了，用户会怀疑范围没生效。
+        let show_summary = true;
         let font = FontId::proportional(11.0);
+        let sum_col = if all { pal.esc_text } else { pal.accent };
         let sum_galley =
-            ui.fonts(|f| f.layout_no_wrap(summary.clone(), font, pal.esc_text));
+            ui.fonts(|f| f.layout_no_wrap(summary.clone(), font, sum_col));
         let sum_w = if show_summary {
             sum_galley.size().x + 18.0
         } else {
@@ -4788,11 +4845,8 @@ impl ShunSeekApp {
         } else if resp.hovered() {
             painter.rect_filled(btn, rr, pal.surface_hover);
         }
-        let icon_col = if all && !open {
-            pal.text_mid
-        } else {
-            pal.accent
-        };
+        // 图标恒朱砂：这两个按钮是「可用控件」，不该有半点禁用感。
+        let icon_col = pal.accent;
         let tile = egui::Rect::from_center_size(btn.center(), Vec2::splat(18.0));
         paint_folder_glyph(&painter, tile, icon_col);
         if show_summary {
@@ -4801,7 +4855,16 @@ impl ShunSeekApp {
                 Vec2::new(sum_w, 20.0),
             );
             if !open {
-                painter.rect_filled(pill, Rounding::same(7.0), pal.esc_fill);
+                if all {
+                    painter.rect_filled(pill, Rounding::same(7.0), pal.esc_fill);
+                } else {
+                    painter.rect_filled(pill, Rounding::same(7.0), pal.pill_fill);
+                    painter.rect_stroke(
+                        pill,
+                        Rounding::same(7.0),
+                        Stroke::new(1.0_f32, pal.pill_stroke),
+                    );
+                }
             }
             painter.galley(
                 egui::pos2(
@@ -4809,7 +4872,7 @@ impl ShunSeekApp {
                     pill.center().y - sum_galley.size().y / 2.0,
                 ),
                 sum_galley,
-                pal.esc_text,
+                sum_col,
             );
         }
         if resp.clicked() {
@@ -4859,6 +4922,9 @@ impl ShunSeekApp {
         let mut drives = self.scope_drives.clone();
         let mut custom = self.scope_custom.clone();
         let mut sel: HashSet<String> = self.scope_custom_sel.clone();
+        // 自定义列表的滚动条区域要在窗口之后登记成「不可拖动区」，
+        // 否则拖条滚动会变成拖窗口。
+        let mut sc_out: Option<egui::scroll_area::ScrollAreaOutput<()>> = None;
         let mut changed = false;
         let mut add_folder = false;
         let area = egui::Area::new(egui::Id::new("ss_scope_panel"))
@@ -4969,7 +5035,7 @@ impl ShunSeekApp {
                     let mut open_dir: Option<String> = None;
                     // 跨帧保留「第一次单击」快照，双击时回滚。
                     let mut memo = self.scope_click_memo.take();
-                    egui::ScrollArea::vertical()
+                    sc_out = Some(egui::ScrollArea::vertical()
                         .id_salt("ss_scope_custom_scroll")
                         .max_height(196.0)
                         .auto_shrink([false, true])
@@ -5011,7 +5077,7 @@ impl ShunSeekApp {
                                     toggled = Some(path.clone());
                                 }
                             }
-                        });
+                        }));
                     self.scope_click_memo = memo;
                     if let Some(i) = remove {
                         let p = custom.remove(i);
@@ -5050,11 +5116,15 @@ impl ShunSeekApp {
                 });
             });
         self.filter_panel_full[1] = area.response.rect.size();
+        if let Some(o) = &sc_out {
+            self.push_scroll_blocker(o);
+        }
         let vis = egui::Rect::from_min_size(pos, Vec2::new(vis_w, vis_h));
         if self.expanded_filter == Some(FilterKind::Scope) {
             self.filter_panel_rect = Some(vis);
         }
         self.blockers_cur.push(vis);
+        let mut added_root = false;
         if add_folder {
             #[cfg(windows)]
             {
@@ -5076,6 +5146,7 @@ impl ShunSeekApp {
                         presets.clear();
                         drives.clear();
                         changed = true;
+                        added_root = true;
                     }
                 }
             }
@@ -5087,6 +5158,11 @@ impl ShunSeekApp {
             self.scope_custom_sel = sel;
             self.save_settings();
             self.schedule_search();
+        }
+        if added_root {
+            // 新文件夹很可能不在现有索引里（便携模式只索引
+            // %USERPROFILE% 一带）→ 立刻重建，否则选中也搜不到。
+            self.start_rebuild();
         }
     }
 
@@ -7895,6 +7971,12 @@ impl eframe::App for ShunSeekApp {
                     self.scope_drives.clear();
                     self.query = "shun".to_string();
                     self.expanded_filter = Some(FilterKind::Scope);
+                    self.schedule_search();
+                }
+                // 自检探针：不改范围，只搜一个中文词，验证自定义根内的
+                // 中文文件能被索引命中。
+                "scope-kcb" => {
+                    self.query = "课表".to_string();
                     self.schedule_search();
                 }
                 _ => {}
