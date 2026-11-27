@@ -1,2 +1,5 @@
 /target
 *.bin
+
+# 本地产物
+dist/
