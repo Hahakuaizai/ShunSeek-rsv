@@ -114,6 +114,31 @@ impl IndexStore {
         self.dir_count as usize
     }
 
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.backing, Backing::Mapped(_))
+    }
+
+    /// 将当前存储（含 Mmap 态）深拷贝为独立的内存 OwnedData，从而立即解除对磁盘文件的映射锁定。
+    pub fn to_owned_store(&self) -> IndexStore {
+        IndexStore {
+            count: self.count,
+            dir_count: self.dir_count,
+            backing: Backing::Owned(OwnedData {
+                dirs_off: self.dirs_off().to_vec(),
+                dirs_pool: self.dirs_pool().to_vec(),
+                name_off: self.name_off().to_vec(),
+                name_pool: self.name_pool().to_vec(),
+                init_off: self.init_off().to_vec(),
+                init_pool: self.init_pool().to_vec(),
+                dir_ids: self.dir_ids().to_vec(),
+                cats: self.cats().to_vec(),
+                refs: self.refs().to_vec(),
+                full_off: self.full_off().to_vec(),
+                full_pool: self.full_pool().to_vec(),
+            }),
+        }
+    }
+
     // ---- 区段切片（Owned 直接借 Vec；Mapped 按区段表切 mmap，u32/u64 用小端重组视图）----
 
     // ---- 区段切片（Owned 直接借 Vec；Mapped 按区段表切 mmap 重解释）----
@@ -346,19 +371,50 @@ impl IndexStore {
         let mut sections = [Section::default(); SECTIONS];
         for i in 0..SECTIONS {
             let base = 32 + i * 16;
-            sections[i] = Section {
-                off: rd64(base),
-                len: rd64(base + 8),
-            };
-            if (sections[i].off + sections[i].len) as usize > mmap.len() {
+            let off = rd64(base);
+            let len = rd64(base + 8);
+            let end = off.checked_add(len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（区段溢出）")
+            })?;
+            if end as usize > mmap.len() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（区段越界）"));
             }
+            sections[i] = Section { off, len };
         }
-        Ok(IndexStore {
+        // 对齐与长度一致性校验，杜绝损坏缓存引发 UB / panic
+        for idx in [0usize, 2, 4, 6, 9] {
+            if sections[idx].off % 4 != 0 || sections[idx].len % 4 != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（u32 对齐错误）"));
+            }
+        }
+        if sections[8].off % 8 != 0 || sections[8].len % 8 != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（u64 对齐错误）"));
+        }
+        let c = count as u64;
+        let dc = dir_count as u64;
+        if sections[0].len != (dc + 1) * 4
+            || sections[2].len != (c + 1) * 4
+            || sections[4].len != (c + 1) * 4
+            || sections[6].len != c * 4
+            || sections[7].len != c
+            || sections[8].len != c * 8
+            || sections[9].len != (c + 1) * 4
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（区段长度不匹配）"));
+        }
+        let store = IndexStore {
             count,
             dir_count,
             backing: Backing::Mapped(MappedData { mmap, sections }),
-        })
+        };
+        if store.dirs_off().last().copied().unwrap_or(0) as usize > store.dirs_pool().len()
+            || store.name_off().last().copied().unwrap_or(0) as usize > store.name_pool().len()
+            || store.init_off().last().copied().unwrap_or(0) as usize > store.init_pool().len()
+            || store.full_off().last().copied().unwrap_or(0) as usize > store.full_pool().len()
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（偏移哨兵越界）"));
+        }
+        Ok(store)
     }
 
     /// 只读缓存信任字段（v0.1.9）：返回 (scope, built_unix)。
@@ -377,11 +433,14 @@ impl IndexStore {
         }
         let built_unix = rd64(20);
         let base = 32 + 11 * 16; // scope_pool 是第 12 区段（下标 11）
-        let (off, len) = (rd64(base) as usize, rd64(base + 8) as usize);
-        if off + len > mmap.len() {
+        let (off, len) = (rd64(base), rd64(base + 8));
+        let end = off.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（scope 溢出）")
+        })?;
+        if end as usize > mmap.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "索引文件损坏（scope 越界）"));
         }
-        let scope = String::from_utf8_lossy(&mmap[off..off + len]).into_owned();
+        let scope = String::from_utf8_lossy(&mmap[off as usize..end as usize]).into_owned();
         Ok((scope, built_unix))
     }
 }

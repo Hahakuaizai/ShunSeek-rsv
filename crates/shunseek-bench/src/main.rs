@@ -251,5 +251,7 @@ fn main() {
     println!("mmap 加载: {} µs   条目: {}", load_us, loaded.count());
     let engine2 = SearchEngine::new(&loaded, None);
     run_query(&engine2, "wzry", None);
+    drop(engine2);
+    drop(loaded);
     let _ = std::fs::remove_file(&path);
 }

@@ -1,47 +1,12 @@
-//! 全局点外隐藏（v0.1.10，照原版 .NET GlobalClickWatcher 的机制）：
-//! WH_MOUSE_LL 低级鼠标钩子装在专职线程上（带自己的消息泵——
-//! 低级钩子靠安装线程的消息队列投递），全局左/右/中键按下时，
-//! 落点不在主窗口/设置窗口/托盘图标矩形内 → 点外命中。
-//! v0.1.12 起命中即由钩子线程**当场**调 winvis::hide_from_hook()
-//! （ShowWindowAsync(SW_HIDE)）把主窗藏掉，不再置标志等 UI
-//! 下一帧 hide()——那段排队正是旧可见性链的唤醒依赖（见
-//! winvis 模块头）。点哪还是哪，钩子从不吞点击（永远
-//! CallNextHookEx 放行）。
-//!
-//! 为什么不用失焦事件（v0.1.6–v0.1.9 的老路）：egui 的
-//! viewport.focused 是 winit 焦点状态，点任务栏/托盘/开始菜单
-//! 等系统外壳区域时焦点语义混乱，由此衍生出最小化互斥、恢复
-//! 宽限期、指针守卫一摞补丁，真机仍然「点别处就消失且唤不回」。
-//! 原版自始至终用的是几何判定：点击坐标 vs 窗口矩形，没有
-//! 任何焦点推断——本模块就是把它搬过来，焦点从此不参与
-//! 隐藏判定。
-//!
-//! 钩子纪律（低级钩子超时会被系统静默摘除）：
-//!  - 回调里只做：读 MSLLHOOKSTRUCT 坐标 → 读几个原子量做
-//!    矩形包含判断 → 命中时至多一次 ShowWindowAsync（投递即
-//!    返回，专为非属主线程发起显示变更设计）。不分配、不加锁、
-//!    不做任何 I/O。
-//!  - 「点外」标志（outside_pending）退为降级兜底：只在命中
-//!    时 HWND 尚未存入（winvis 无从下手）才置位 + repaint，
-//!    由 UI 在帧首消费一次 hide()。正常路径不置标志——
-//!    v0.1.11 的「托盘呼出被陈旧标志同帧反杀」就此断根：
-//!    钩子能当场藏窗时，世上不存在能反杀呼出的陈旧标志。
-//!  - 矩形由 UI 线程每帧以「物理像素」发布（egui 的 outer_rect
-//!    是监控器空间的点坐标 × native_pixels_per_point 换算），
-//!    回调只读原子量，不回调 UI。
-//!  - 主窗口矩形取不到（outer_rect 为 None）时 UI 侧直接把
-//!    armed 发成 false——宁可不藏，不可乱藏。
-//!  - 托盘菜单打开期间由 tray.rs 调 set_suspended(true) 挂起：
-//!    菜单本身在两个窗口矩形之外，点菜单条目不该顺带把主窗藏掉。
-//!  - 托盘图标矩形是第三个豁免区（v0.1.11）：点托盘图标本身
-//!    （左键 Toggle、右键开菜单）永远不算「点外」——否则图标
-//!    点击攒下的点外标志会在同一帧反杀托盘的显式呼出（真机
-//!    实测：托盘只有「退出」起作用，「打开」永远打不开）。
-//!
-//! 非 Windows：无钩子（演示环境），接口同形、恒无事件。
+//! 全局点外隐藏（照原版 .NET GlobalClickWatcher 机制）：
+//! WH_MOUSE_LL 低级鼠标钩子装在专职线程上（带自己的消息泵），
+//! 全局左/右/中键按下时，落点不在主窗口/设置窗口/托盘图标矩形内 → 点外命中。
+//! 命中时先立即撤防（disarm），再通过 winvis::hide_from_hook() 异步
+//! PostMessage 给 UI 线程执行 SW_HIDE，钩子回调微秒返回、绝不阻塞系统鼠标流。
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// 一个窗口矩形（物理像素，[left, top, right, bottom]）的原子发布槽。
 struct RectSlot {
@@ -87,31 +52,81 @@ impl RectSlot {
 
 struct Shared {
     ctx: egui::Context,
-    /// 主窗口当前可见才武装（隐藏时点外点击毫无意义，还会攒下
-    /// 陈旧标志坑下一次呼出——UI 侧隐藏时也会主动 drain）。
     armed: AtomicBool,
-    /// 托盘菜单打开期间挂起（见模块头）。
     suspended: AtomicBool,
+    suspend_depth: AtomicUsize,
     main_rect: RectSlot,
     sub_rect: RectSlot,
-    /// 托盘图标矩形（v0.1.11 第三个豁免区，见模块头）。
     tray_rect: RectSlot,
     outside_pending: AtomicBool,
+    shown_at_ms: AtomicU64,
 }
 
-/// 进程级共享（钩子回调是 extern "system" 裸函数，拿不到捕获，
-/// 与 tray.rs 同款 OnceLock 静态）。全程只建一次。
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn now_ms() -> u64 {
+    let base = EPOCH.get_or_init(Instant::now);
+    // 偏移 1000ms，保证 0 永远代表「从未记录」
+    base.elapsed().as_millis() as u64 + 1000
+}
 
 fn shared() -> Option<&'static Arc<Shared>> {
     SHARED.get()
 }
 
-/// 托盘菜单挂起开关（tray.rs 在 TrackPopupMenu 前后调用）。
-/// 非 Windows / 钩子未建时是空操作。
+/// 托盘菜单 / 系统文件框打开期间挂起（支持嵌套计数）。
 pub fn set_suspended(on: bool) {
     if let Some(sh) = shared() {
-        sh.suspended.store(on, Ordering::SeqCst);
+        if on {
+            sh.suspend_depth.fetch_add(1, Ordering::SeqCst);
+            sh.suspended.store(true, Ordering::SeqCst);
+        } else {
+            let prev = sh.suspend_depth.load(Ordering::SeqCst);
+            if prev > 0 {
+                let next = sh.suspend_depth.fetch_sub(1, Ordering::SeqCst) - 1;
+                if next == 0 {
+                    sh.suspended.store(false, Ordering::SeqCst);
+                }
+            } else {
+                sh.suspended.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// RAII 挂起守卫：构造时挂起钩子，析构时恢复并清理残留标志。
+pub struct SuspendGuard;
+
+impl SuspendGuard {
+    pub fn new() -> Self {
+        set_suspended(true);
+        SuspendGuard
+    }
+}
+
+impl Drop for SuspendGuard {
+    fn drop(&mut self) {
+        set_suspended(false);
+        if let Some(sh) = shared() {
+            sh.outside_pending.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// 立即撤防：窗口隐藏/最小化时调用，防止隐藏状态下每次系统点击仍触发隐藏。
+pub fn disarm() {
+    if let Some(sh) = shared() {
+        sh.armed.store(false, Ordering::SeqCst);
+        sh.outside_pending.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 记录刚完成一次显式呼出，200ms 内免除点外隐藏（防 Win11 折叠托盘拿不到图标矩形时反杀）。
+pub fn note_shown() {
+    if let Some(sh) = shared() {
+        sh.shown_at_ms.store(now_ms(), Ordering::SeqCst);
+        sh.outside_pending.store(false, Ordering::SeqCst);
     }
 }
 
@@ -125,12 +140,13 @@ impl ClickWatch {
             ctx,
             armed: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
+            suspend_depth: AtomicUsize::new(0),
             main_rect: RectSlot::new(),
             sub_rect: RectSlot::new(),
             tray_rect: RectSlot::new(),
             outside_pending: AtomicBool::new(false),
+            shown_at_ms: AtomicU64::new(0),
         });
-        // 只建一次：重复 start 直接复用既有共享（钩子线程不重开）
         let shared = match SHARED.set(sh.clone()) {
             Ok(()) => {
                 platform::spawn();
@@ -141,11 +157,6 @@ impl ClickWatch {
         ClickWatch { shared }
     }
 
-    /// UI 每帧发布：主窗口 / 设置窗口 / 托盘图标矩形（物理像素）
-    /// + 是否武装。main 为 None（outer_rect 取不到）时强制不武装
-    /// ——判定失去依据就整体停用，绝不凭空藏窗口。tray 为 None
-    /// （图标矩形取不到，如图标暂未建成）时该豁免区自动失效，
-    /// 呼出链还有 update() 侧的 drain 兜底（见模块头）。
     pub fn publish(
         &self,
         main: Option<[i32; 4]>,
@@ -161,30 +172,33 @@ impl ClickWatch {
             .store(armed && main.is_some(), Ordering::SeqCst);
     }
 
-    /// 取走一次「点外点击」（取后清零）。UI 每帧调用；v0.1.12
-    /// 起正常路径钩子当场藏窗不置标志，这里只会拿到 HWND 未
-    /// 存入时攒下的降级兜底标志（见模块头）。
     pub fn take_outside(&self) -> bool {
         self.shared.outside_pending.swap(false, Ordering::SeqCst)
     }
 
-    /// 丢弃攒下的点外标志（系统文件对话框关闭后调用：对话框是
-    /// 独立窗口，点它属于「点外」，但那是用户在跟我们自己的
-    /// 流程交互，绝不能一关对话框就把主窗藏了）。
     pub fn drain(&self) {
         self.shared.outside_pending.store(false, Ordering::SeqCst);
     }
 }
 
 /// 钩子回调的判定核心（与平台无关，单测覆盖）：武装且未挂起、
-/// 落点不在任何已发布矩形内 → 点外。
-fn is_outside(sh: &Shared, x: i32, y: i32) -> bool {
+/// 不在呼出保护期、落点不在任何已发布矩形内 → 点外。
+fn is_outside_at(sh: &Shared, x: i32, y: i32, cur_ms: u64) -> bool {
     if !sh.armed.load(Ordering::SeqCst) || sh.suspended.load(Ordering::SeqCst) {
+        return false;
+    }
+    let shown = sh.shown_at_ms.load(Ordering::SeqCst);
+    if shown != 0 && cur_ms.saturating_sub(shown) < 200 {
         return false;
     }
     !sh.main_rect.contains(x, y)
         && !sh.sub_rect.contains(x, y)
         && !sh.tray_rect.contains(x, y)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_outside(sh: &Shared, x: i32, y: i32) -> bool {
+    is_outside_at(sh, x, y, now_ms())
 }
 
 #[cfg(windows)]
@@ -199,8 +213,6 @@ mod platform {
         WM_MBUTTONDOWN, WM_RBUTTONDOWN,
     };
 
-    /// 低级鼠标钩子回调：只读坐标 + 原子判定 + 命中当场隐藏，
-    /// 然后无条件放行（见模块头纪律）。
     unsafe extern "system" fn hook_proc(
         code: i32,
         wparam: WPARAM,
@@ -212,16 +224,11 @@ mod platform {
                 if let Some(sh) = shared() {
                     let info = &*(lparam as *const MSLLHOOKSTRUCT);
                     if is_outside(sh, info.pt.x, info.pt.y) {
+                        // 立即撤防，避免连续点击重复投递
+                        sh.armed.store(false, Ordering::SeqCst);
                         if crate::winvis::hwnd() != 0 {
-                            // 当场藏窗（v0.1.12）：窗口属主是 UI
-                            // 线程，用 Async 版投递即返回，钩子不
-                            // 等待、不阻塞；UI 事后在帧首 OS 同步
-                            // 里发现状态变化并补清理。
                             crate::winvis::hide_from_hook();
                         } else {
-                            // 降级兜底：HWND 还没存入（启动极早
-                            // 期），退回旧置标志路径，UI 帧首
-                            // 消费一次 hide()。
                             sh.outside_pending.store(true, Ordering::SeqCst);
                             sh.ctx.request_repaint();
                         }
@@ -236,15 +243,13 @@ mod platform {
         std::thread::Builder::new()
             .name("shunseek-clickwatch".into())
             .spawn(move || unsafe {
-                // 先摸一下消息队列让它建起来，钩子的投递才有落点
                 let mut msg: MSG = std::mem::zeroed();
                 PeekMessageW(&mut msg, 0, 0, 0, PM_NOREMOVE);
                 let hmod = GetModuleHandleW(std::ptr::null());
                 let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hmod, 0);
                 if hook == 0 {
-                    return; // 装不上就没点外隐藏，应用其余照常
+                    return;
                 }
-                // 消息泵：低级钩子回调在本线程上下文执行，必须泵。
                 loop {
                     let r = GetMessageW(&mut msg, 0, 0, 0);
                     if r <= 0 {
@@ -260,9 +265,7 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    pub fn spawn() {
-        // 无全局钩子：见模块头注释。
-    }
+    pub fn spawn() {}
 }
 
 #[cfg(test)]
@@ -274,10 +277,12 @@ mod tests {
             ctx: egui::Context::default(),
             armed: AtomicBool::new(true),
             suspended: AtomicBool::new(false),
+            suspend_depth: AtomicUsize::new(0),
             main_rect: RectSlot::new(),
             sub_rect: RectSlot::new(),
             tray_rect: RectSlot::new(),
             outside_pending: AtomicBool::new(false),
+            shown_at_ms: AtomicU64::new(0),
         }
     }
 
@@ -285,31 +290,34 @@ mod tests {
     fn outside_only_when_armed_and_beyond_all_rects() {
         let sh = test_shared();
         sh.main_rect.publish(Some([100, 100, 500, 400]));
-        // 窗口内（含边界左上）不算点外
-        assert!(!is_outside(&sh, 100, 100));
-        assert!(!is_outside(&sh, 499, 399));
-        // 窗口外算点外
-        assert!(is_outside(&sh, 99, 200));
-        assert!(is_outside(&sh, 500, 200));
-        assert!(is_outside(&sh, 300, 400));
-        // 设置窗口矩形内也不算
+        assert!(!is_outside_at(&sh, 100, 100, 5000));
+        assert!(!is_outside_at(&sh, 499, 399, 5000));
+        assert!(is_outside_at(&sh, 99, 200, 5000));
+        assert!(is_outside_at(&sh, 500, 200, 5000));
+        assert!(is_outside_at(&sh, 300, 400, 5000));
+
         sh.sub_rect.publish(Some([600, 100, 900, 500]));
-        assert!(!is_outside(&sh, 700, 300));
-        assert!(is_outside(&sh, 950, 300));
-        // 托盘图标矩形内永不算点外（v0.1.11 豁免）
+        assert!(!is_outside_at(&sh, 700, 300, 5000));
+        assert!(is_outside_at(&sh, 950, 300, 5000));
+
         sh.tray_rect.publish(Some([1000, 740, 1024, 764]));
-        assert!(!is_outside(&sh, 1010, 750));
-        assert!(is_outside(&sh, 1030, 750));
-        // 挂起（托盘菜单）时永不算点外
+        assert!(!is_outside_at(&sh, 1010, 750, 5000));
+        assert!(is_outside_at(&sh, 1030, 750, 5000));
+
         sh.suspended.store(true, Ordering::SeqCst);
-        assert!(!is_outside(&sh, 950, 300));
+        assert!(!is_outside_at(&sh, 950, 300, 5000));
         sh.suspended.store(false, Ordering::SeqCst);
-        // 未武装时永不算点外
+
+        // 呼出 200ms 保护期内不判点外
+        sh.shown_at_ms.store(4900, Ordering::SeqCst);
+        assert!(!is_outside_at(&sh, 950, 300, 5050));
+        assert!(is_outside_at(&sh, 950, 300, 5200));
+
         sh.armed.store(false, Ordering::SeqCst);
-        assert!(!is_outside(&sh, 950, 300));
-        // 主矩形失效（取不到）时整槽不认——publish(None) 清 valid
+        assert!(!is_outside_at(&sh, 950, 300, 5200));
+
         sh.armed.store(true, Ordering::SeqCst);
         sh.main_rect.publish(None);
-        assert!(is_outside(&sh, 300, 200));
+        assert!(is_outside_at(&sh, 300, 200, 5200));
     }
 }

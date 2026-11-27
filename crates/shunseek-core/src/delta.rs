@@ -11,19 +11,13 @@ use crate::builder::build_index;
 use crate::category::Category;
 use crate::store::{IndexStore, RawEntry};
 
-/// 重建触发阈值（原版 SearchIndex.RebuildDeadThreshold /
-/// RebuildDirDeadThreshold）。
 const REBUILD_DEAD_THRESHOLD: usize = 20_000;
 const REBUILD_DIR_DEAD_THRESHOLD: usize = 32;
 
-/// 墓碑集合：标记主索引中已失效的条目。搜索扫描命中时逐条过滤。
 #[derive(Clone, Default)]
 pub struct Tombstones {
-    /// 按 NTFS 文件引用号杀（卷内唯一；引用号会复用，配合路径墓碑兜底）。
     pub dead_refs: HashSet<u64>,
-    /// 按完整路径杀（小写）。
     pub dead_paths: HashSet<String>,
-    /// 按目录前缀杀（小写、带尾随 '\'）：整棵子树失效。
     pub dead_dir_prefixes: Vec<String>,
 }
 
@@ -34,12 +28,10 @@ impl Tombstones {
             && self.dead_dir_prefixes.is_empty()
     }
 
-    /// 墓碑总量（不含目录前缀，原版 TotalChanges 的死条目部分）。
     pub fn dead_count(&self) -> usize {
         self.dead_refs.len() + self.dead_paths.len()
     }
 
-    /// 索引 i 在主索引里是否已被墓碑杀掉。
     pub fn is_dead(&self, store: &IndexStore, i: usize) -> bool {
         if self.is_empty() {
             return false;
@@ -63,9 +55,6 @@ impl Tombstones {
     }
 }
 
-/// 增量层：新增条目（按引用号/路径各一份映射，值 = add 索引行号）
-/// + 墓碑。app 侧由 flush 线程独占持有，周期性 freeze 成
-/// (IndexStore, Tombstones) 快照给搜索线程用。
 #[derive(Default)]
 pub struct DeltaIndex {
     add_by_ref: HashMap<u64, usize>,
@@ -74,7 +63,6 @@ pub struct DeltaIndex {
     dead_refs: HashSet<u64>,
     dead_paths: HashSet<String>,
     dead_dir_prefixes: Vec<String>,
-    /// 累计变更计数（页脚「增量 M」的口径基础：当前增量层规模）。
     total_changes: usize,
     force_rebuild: bool,
 }
@@ -84,7 +72,6 @@ impl DeltaIndex {
         DeltaIndex::default()
     }
 
-    /// 增量层条目数（页脚「增量 M」显示值）。
     pub fn count(&self) -> usize {
         self.add_rows.len()
     }
@@ -104,7 +91,6 @@ impl DeltaIndex {
             && self.dead_dir_prefixes.is_empty()
     }
 
-    /// 是否已到必须全量重建的程度（原版 NeedsRebuild 口径）。
     pub fn requires_rebuild(&self) -> bool {
         self.force_rebuild
             || self.dead_refs.len() + self.dead_paths.len() > REBUILD_DEAD_THRESHOLD
@@ -115,9 +101,21 @@ impl DeltaIndex {
         self.force_rebuild = true;
     }
 
+    fn clear_row_indices(&mut self, row: usize) {
+        let old = &self.add_rows[row];
+        if old.file_ref != 0 && self.add_by_ref.get(&old.file_ref) == Some(&row) {
+            self.add_by_ref.remove(&old.file_ref);
+        }
+        if let Some(p) = &old.full_path {
+            let k = p.to_lowercase();
+            if !k.is_empty() && self.add_by_path.get(&k) == Some(&row) {
+                self.add_by_path.remove(&k);
+            }
+        }
+    }
+
     /// 新增/更新一条（同引用号或同路径已有增量行 → 原地更新该行）。
-    /// entry.category 若为 Other 则按扩展名/目录分类兜底（与
-    /// store::Builder 对 RawEntry 的处理一致，freeze 时再走 Builder）。
+    /// 同时给主索引加墓碑，确保主索引里的旧版本被屏蔽、不会出现双份结果。
     pub fn upsert(&mut self, mut entry: RawEntry) {
         if entry.category == Category::Other {
             entry.category = if entry.is_dir {
@@ -143,15 +141,18 @@ impl DeltaIndex {
                 self.add_by_path.get(&path_key).copied()
             }
         });
-        // 复活：同一条目若此前被墓碑杀过（主索引侧），撤销对应墓碑
+
+        // 屏蔽主索引中可能存在的同 ref / 同路径旧条目，防止合并搜索出现重复
         if entry.file_ref != 0 {
-            self.dead_refs.remove(&entry.file_ref);
+            self.dead_refs.insert(entry.file_ref);
         }
         if !path_key.is_empty() {
-            self.dead_paths.remove(&path_key);
+            self.dead_paths.insert(path_key.clone());
         }
+
         match existing {
             Some(row) => {
+                self.clear_row_indices(row);
                 self.add_rows[row] = entry.clone();
                 if entry.file_ref != 0 {
                     self.add_by_ref.insert(entry.file_ref, row);
@@ -174,19 +175,24 @@ impl DeltaIndex {
         self.total_changes += 1;
     }
 
-    /// 删除一条：增量层里有该行就清空它（freeze 时空名行被跳过，
-    /// 等效移除）；同时给主索引侧加 ref/路径墓碑杀旧条目。
+    /// 删除一条：增量层里有该行就清空它并清理双向映射；同时给主索引侧加 ref/路径墓碑。
     pub fn remove(&mut self, file_ref: u64, path: &str) {
         let path_key = path.to_lowercase();
-        let mut row = None;
+        let mut rows_to_clear = Vec::new();
         if file_ref != 0 {
-            row = self.add_by_ref.remove(&file_ref);
+            if let Some(r) = self.add_by_ref.remove(&file_ref) {
+                rows_to_clear.push(r);
+            }
         }
-        if row.is_none() && !path_key.is_empty() {
-            row = self.add_by_path.remove(&path_key);
+        if !path_key.is_empty() {
+            if let Some(r) = self.add_by_path.remove(&path_key) {
+                if !rows_to_clear.contains(&r) {
+                    rows_to_clear.push(r);
+                }
+            }
         }
-        if let Some(r) = row {
-            // 行内容清空（freeze 时空名行被跳过，等效移除）
+        for r in rows_to_clear {
+            self.clear_row_indices(r);
             self.add_rows[r] = RawEntry {
                 name: String::new(),
                 full_path: None,
@@ -205,8 +211,8 @@ impl DeltaIndex {
         self.total_changes += 1;
     }
 
-    /// 删除整个目录：主索引侧加目录前缀墓碑（整树失效）；增量层里
-    /// 路径在该目录下的行一并清空。
+    /// 删除整个目录：主索引侧加目录前缀墓碑 + 目录本身路径墓碑；
+    /// 增量层里路径在该目录下（或目录本身）的行一并清空。
     pub fn remove_directory(&mut self, dir_path: &str, _is_dir_event: bool) {
         let mut prefix = dir_path.to_lowercase();
         if !prefix.ends_with('\\') {
@@ -216,6 +222,9 @@ impl DeltaIndex {
             self.dead_dir_prefixes.push(prefix.clone());
         }
         let bare = prefix.trim_end_matches('\\').to_string();
+        if !bare.is_empty() {
+            self.dead_paths.insert(bare.clone());
+        }
         let keys: Vec<String> = self
             .add_by_path
             .keys()
@@ -224,14 +233,15 @@ impl DeltaIndex {
             .collect();
         for k in keys {
             if let Some(r) = self.add_by_path.remove(&k) {
+                self.clear_row_indices(r);
                 self.add_rows[r].name.clear();
                 self.add_rows[r].full_path = None;
+                self.add_rows[r].file_ref = 0;
             }
         }
         self.total_changes += 1;
     }
 
-    /// 冻结成搜索可用的快照：增量小索引 + 墓碑集。
     pub fn freeze(&self) -> (IndexStore, Tombstones) {
         let rows: Vec<RawEntry> = self
             .add_rows
@@ -273,9 +283,22 @@ mod tests {
         let mut d = DeltaIndex::new();
         d.upsert(entry("新文件.txt", "C:\\d\\新文件.txt", 42));
         assert_eq!(d.count(), 1);
-        let (store, _) = d.freeze();
+        let (store, tombs) = d.freeze();
         assert_eq!(store.count(), 1);
         assert_eq!(store.name(0), "新文件.txt");
+        assert!(tombs.dead_refs.contains(&42));
+        assert!(tombs.dead_paths.contains("c:\\d\\新文件.txt"));
+    }
+
+    #[test]
+    fn upsert_rename_clears_old_path_mapping() {
+        let mut d = DeltaIndex::new();
+        d.upsert(entry("a.txt", "C:\\d\\a.txt", 7));
+        d.upsert(entry("b.txt", "C:\\d\\b.txt", 7));
+        // 在原路径建新文件不能覆盖掉 b.txt
+        d.upsert(entry("a.txt", "C:\\d\\a.txt", 8));
+        let (store, _) = d.freeze();
+        assert_eq!(store.count(), 2);
     }
 
     #[test]
@@ -290,11 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn remove_directory_prefix_tombstone() {
+    fn remove_directory_tombstones_dir_itself_and_prefix() {
         let mut d = DeltaIndex::new();
         d.remove_directory("C:\\Gone", true);
         let (_, tombs) = d.freeze();
         assert_eq!(tombs.dead_dir_prefixes, vec!["c:\\gone\\".to_string()]);
+        assert!(tombs.dead_paths.contains("c:\\gone"));
     }
 
     #[test]

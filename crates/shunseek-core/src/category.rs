@@ -85,7 +85,7 @@ pub fn classify_by_extension(name: &str) -> Category {
         ".jpg" | ".jpeg" | ".png" | ".gif" | ".webp" | ".bmp" | ".svg" | ".ico" | ".tif"
         | ".tiff" | ".heic" | ".heif" | ".avif" | ".raw" | ".psd" | ".ai" => Category::Image,
         ".mp4" | ".mkv" | ".avi" | ".mov" | ".wmv" | ".flv" | ".webm" | ".m4v" | ".mpg"
-        | ".mpeg" | ".3gp" | ".ts" | ".rm" | ".rmvb" | ".vob" | ".swf" => Category::Video,
+        | ".mpeg" | ".3gp" | ".rm" | ".rmvb" | ".vob" | ".swf" => Category::Video,
         ".mp3" | ".flac" | ".wav" | ".ogg" | ".m4a" | ".aac" | ".wma" | ".ape" | ".opus"
         | ".aiff" | ".mid" | ".midi" => Category::Audio,
         ".doc" | ".docx" | ".pdf" | ".txt" | ".md" | ".markdown" | ".rtf" | ".odt" | ".xls"

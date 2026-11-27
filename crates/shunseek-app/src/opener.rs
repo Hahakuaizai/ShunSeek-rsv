@@ -5,6 +5,7 @@
 //!    定位到文件本身；非 Windows 退化为打开父目录。
 //! 打开失败只记日志不弹窗崩溃（演示数据路径是假的，打不开属预期）。
 
+#[cfg(not(windows))]
 use std::path::Path;
 
 /// path 为空（App 类条目只在注册表里有名字、没有可执行路径时）退回用 name 兜底。
@@ -69,9 +70,10 @@ fn launch(target: &str) {
 
 #[cfg(windows)]
 fn locate(target: &str) {
-    // explorer /select,"<路径>"：打开父目录并选中该文件
-    let arg = format!("/select,{target}");
-    if let Err(e) = std::process::Command::new("explorer.exe").arg(arg).spawn() {
+    use std::os::windows::process::CommandExt;
+    // explorer /select,"<路径>"：用 raw_arg 避免 Command::arg 自动给整段加引号导致空格路径失效
+    let raw = format!("/select,\"{target}\"");
+    if let Err(e) = std::process::Command::new("explorer.exe").raw_arg(raw).spawn() {
         eprintln!("ShunSeek: explorer 定位失败: {target} ({e})");
     }
 }

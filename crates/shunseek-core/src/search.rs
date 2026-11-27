@@ -491,8 +491,7 @@ impl<'a> SearchEngine<'a> {
             }
             for (dst, extra) in locals.iter_mut().zip(pin_locals) {
                 for h in extra {
-                    if !seen.contains(&h.index) {
-                        pinyin_seen.insert(h.index);
+                    if !seen.contains(&h.index) && pinyin_seen.insert(h.index) {
                         dst.push(h);
                     }
                 }
@@ -579,8 +578,13 @@ impl<'a> SearchEngine<'a> {
         // 原版数值），再走综合分。
         if pq.dir_only {
             let mut local: Vec<SearchHit> = Vec::new();
+            let is_drive_root = pq.anchored && pq.path_segs.len() == 1;
             for entry in start..end {
-                if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
+                if (entry - start) & 4095 == 0 && cancelled.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
+                let bit = 1u16.checked_shl(cats[entry] as u32).unwrap_or(0);
+                if cat_mask != 0 && (cat_mask & bit) == 0 {
                     continue;
                 }
                 if cats[entry] != Category::Folder as u8 {
@@ -594,10 +598,17 @@ impl<'a> SearchEngine<'a> {
                         continue;
                     }
                 }
-                let mut segs = dir_segs_lower(store.dir_path(entry));
-                segs.push(store.name(entry).to_lowercase());
-                if !frag_aligns_end(&segs, &pq.path_segs, pq.anchored) {
-                    continue;
+                if is_drive_root {
+                    let segs = dir_segs_lower(store.dir_path(entry));
+                    if segs != pq.path_segs {
+                        continue;
+                    }
+                } else {
+                    let mut segs = dir_segs_lower(store.dir_path(entry));
+                    segs.push(store.name(entry).to_lowercase());
+                    if !frag_aligns_end(&segs, &pq.path_segs, pq.anchored) {
+                        continue;
+                    }
                 }
                 let (score, demoted) = self.finish_score(entry, 70.0);
                 local.push(SearchHit {
@@ -628,7 +639,11 @@ impl<'a> SearchEngine<'a> {
             wrapped.push('*');
             let mut local: Vec<SearchHit> = Vec::new();
             for entry in start..end {
-                if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
+                if (entry - start) & 4095 == 0 && cancelled.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
+                let bit = 1u16.checked_shl(cats[entry] as u32).unwrap_or(0);
+                if cat_mask != 0 && (cat_mask & bit) == 0 {
                     continue;
                 }
                 if self.is_dead(entry) {
@@ -694,10 +709,11 @@ impl<'a> SearchEngine<'a> {
             }
             // 候选可能落在 entry 的名字之外（偏移间隙不存在，池是紧挨的，所以 pos 必在某条目内；
             // 但 entry 推进只到 end-1 为止，越界候选丢弃）
-            if pos >= name_off[entry + 1] as usize {
+            if pos >= name_off[entry + 1] as usize || matched[entry - start] {
                 continue;
             }
-            if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
+            let bit = 1u16.checked_shl(cats[entry] as u32).unwrap_or(0);
+            if cat_mask != 0 && (cat_mask & bit) == 0 {
                 continue;
             }
             if self.is_dead(entry) {
@@ -748,7 +764,12 @@ impl<'a> SearchEngine<'a> {
             let iseg_end = init_off[end] as usize;
             let isegment = &init_pool[iseg_start..iseg_end];
             let mut ientry = start;
+            let mut ichecked = 0usize;
             for rel in memchr::memchr_iter(qb[0], isegment) {
+                ichecked += 1;
+                if ichecked & 4095 == 0 && cancelled.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
                 let pos = iseg_start + rel;
                 while ientry + 1 < end && (init_off[ientry + 1] as usize) <= pos {
                     ientry += 1;
@@ -756,7 +777,8 @@ impl<'a> SearchEngine<'a> {
                 if pos >= init_off[ientry + 1] as usize || matched[ientry - start] {
                     continue;
                 }
-                if cat_mask != 0 && (cat_mask & (1u16 << cats[ientry])) == 0 {
+                let bit = 1u16.checked_shl(cats[ientry] as u32).unwrap_or(0);
+                if cat_mask != 0 && (cat_mask & bit) == 0 {
                     continue;
                 }
                 if self.is_dead(ientry) {
@@ -804,10 +826,14 @@ impl<'a> SearchEngine<'a> {
         // 第一遍（enable_fuzzy=false）命中总数不足时才开第二遍。
         if enable_fuzzy && q.chars().count() >= 2 {
             for entry in start..end {
+                if (entry - start) & 4095 == 0 && cancelled.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
                 if matched[entry - start] {
                     continue;
                 }
-                if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
+                let bit = 1u16.checked_shl(cats[entry] as u32).unwrap_or(0);
+                if cat_mask != 0 && (cat_mask & bit) == 0 {
                     continue;
                 }
                 if self.is_dead(entry) {
@@ -875,6 +901,7 @@ impl<'a> SearchEngine<'a> {
         let seg_end = full_off[end] as usize;
         let segment = &full_pool[seg_start..seg_end];
         let mut local: Vec<SearchHit> = Vec::new();
+        let mut p_matched = vec![false; end - start];
         let mut entry = start;
         let mut checked = 0usize;
         for rel in memchr::memchr_iter(qb[0], segment) {
@@ -882,10 +909,11 @@ impl<'a> SearchEngine<'a> {
             while entry + 1 < end && (full_off[entry + 1] as usize) <= pos {
                 entry += 1;
             }
-            if pos >= full_off[entry + 1] as usize {
+            if pos >= full_off[entry + 1] as usize || p_matched[entry - start] {
                 continue;
             }
-            if cat_mask != 0 && (cat_mask & (1u16 << cats[entry])) == 0 {
+            let bit = 1u16.checked_shl(cats[entry] as u32).unwrap_or(0);
+            if cat_mask != 0 && (cat_mask & bit) == 0 {
                 continue;
             }
             if self.is_dead(entry) {
@@ -932,6 +960,7 @@ impl<'a> SearchEngine<'a> {
                 score += u.boost(&full_path);
             }
             let demoted = junk_penalty(name, &full_path) > 0.0;
+            p_matched[entry - start] = true;
             local.push(SearchHit {
                 index: entry as u32,
                 score,
@@ -1108,11 +1137,14 @@ pub fn search_merged(
     cancelled: &AtomicBool,
     scope: Option<&ScopeFilter>,
 ) -> Vec<SearchHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut hits = match dead {
         Some(d) => SearchEngine::with_tombstones(base, usage, d)
-            .search_scoped(query, cat_mask, usize::MAX, cancelled, scope),
+            .search_scoped(query, cat_mask, limit, cancelled, scope),
         None => SearchEngine::new(base, usage)
-            .search_scoped(query, cat_mask, usize::MAX, cancelled, scope),
+            .search_scoped(query, cat_mask, limit, cancelled, scope),
     };
     let base_count = base.count();
     if let Some(dstore) = delta {
@@ -1120,7 +1152,7 @@ pub fn search_merged(
             let mut dh = SearchEngine::new(dstore, usage).search_scoped(
                 query,
                 cat_mask,
-                usize::MAX,
+                limit,
                 cancelled,
                 scope,
             );

@@ -87,6 +87,12 @@ mod win {
         let spawned = std::thread::Builder::new()
             .name("shunseek-names".into())
             .spawn(move || {
+                let com_hr = unsafe {
+                    windows_sys::Win32::System::Com::CoInitializeEx(
+                        std::ptr::null(),
+                        windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
+                    )
+                };
                 while let Ok((path, is_dir)) = req_rx.recv() {
                     let name = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         resolve(&path, is_dir)
@@ -96,6 +102,11 @@ mod win {
                         break; // UI 已退出，线程跟着收工
                     }
                     ctx.request_repaint();
+                }
+                if com_hr == 0 || com_hr == 1 {
+                    unsafe {
+                        windows_sys::Win32::System::Com::CoUninitialize();
+                    }
                 }
             });
         match spawned {
@@ -210,9 +221,11 @@ mod win {
                 && !ptr.is_null()
                 && len >= 4
             {
-                let words = std::slice::from_raw_parts(ptr as *const u16, (len / 2) as usize);
-                for pair in words.chunks_exact(2) {
-                    pairs.push((pair[0], pair[1]));
+                let bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+                for chunk in bytes.chunks_exact(4) {
+                    let lang = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    let cp = u16::from_le_bytes([chunk[2], chunk[3]]);
+                    pairs.push((lang, cp));
                 }
             }
             pairs.push((0x0804, 0x04B0)); // 简体中文 + Unicode
@@ -235,9 +248,12 @@ mod win {
                     && !ptr.is_null()
                     && len > 0
                 {
-                    let chars =
-                        std::slice::from_raw_parts(ptr as *const u16, len as usize);
-                    let text = String::from_utf16_lossy(chars)
+                    let bytes = std::slice::from_raw_parts(ptr as *const u8, (len as usize) * 2);
+                    let chars: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let text = String::from_utf16_lossy(&chars)
                         .trim_matches('\0')
                         .trim()
                         .to_string();

@@ -88,7 +88,10 @@ mod win {
             let exe = std::env::current_exe()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            !exe.is_empty() && value.to_lowercase().contains(&exe.to_lowercase())
+            let val_lower = value.to_lowercase();
+            !exe.is_empty()
+                && val_lower.contains(&exe.to_lowercase())
+                && val_lower.contains("--tray")
         }
     }
 

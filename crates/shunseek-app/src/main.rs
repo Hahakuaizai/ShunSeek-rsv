@@ -566,11 +566,50 @@ const PRESET_KEYS: [(&str, &str, &str); 4] = [
     ("home", "", "用户主目录"),
 ];
 
-/// 当前实际存在的固定盘盘符（范围面板的磁盘列表 / 全部判定用）。
+/// 当前实际存在的固定盘盘符（带 30s 缓存，Windows 上用 GetLogicalDrives + DRIVE_FIXED 避免探测网络/休眠盘）。
 fn existing_drives() -> Vec<char> {
-    ('C'..='Z')
-        .filter(|d| std::path::Path::new(&format!("{d}:\\")).exists())
-        .collect()
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<(Instant, Vec<char>)>> = OnceLock::new();
+    let lock = CACHE.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(60), Vec::new())));
+    let mut g = lock_rec(lock);
+    if !g.1.is_empty() && g.0.elapsed() < Duration::from_secs(30) {
+        return g.1.clone();
+    }
+    let list = compute_existing_drives();
+    *g = (Instant::now(), list.clone());
+    list
+}
+
+fn compute_existing_drives() -> Vec<char> {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+        const DRIVE_FIXED: u32 = 3;
+        let mask = unsafe { GetLogicalDrives() };
+        let mut out = Vec::new();
+        for i in 2..26u32 {
+            if (mask & (1 << i)) == 0 {
+                continue;
+            }
+            let d = (b'A' + i as u8) as char;
+            let root: Vec<u16> = OsStr::new(&format!("{d}:\\"))
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            if unsafe { GetDriveTypeW(root.as_ptr()) } == DRIVE_FIXED {
+                out.push(d);
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        ('C'..='Z')
+            .filter(|d| std::path::Path::new(&format!("{d}:\\")).exists())
+            .collect()
+    }
 }
 
 /// 全部 12 个分类（类型筛选的全集状态）。
@@ -820,36 +859,24 @@ fn group_thousands(n: usize) -> String {
 
 // ---------------------------------------------------------------- 索引装配
 enum IndexMsg {
-    /// 后台重建（阶段性或最终）完成：新索引本体直接随消息传给 UI 线程
-    /// 换入（内存直传，不再走 rename + mmap 的文件换入——那条路一旦
-    /// save/rename/load 任一步失败就会把新索引丢掉、沿用旧的空索引，
-    /// 还不给任何提示）。
-    /// v0.1.5 分级建立：冷启动先发第一级（应用 + 浅层，final_stage=
-    /// false），逐盘 MFT 完成再逐级发合并索引，最终一级才置 true。
-    /// saved 只对最终一级有意义：缓存 index.bin 有没有存上（save_to
-    /// 自带 tmp 写 + rename 原子换入），失败不影响本次使用、但会进
-    /// 状态栏提示，避免用户次次冷启动还找不出原因；
-    /// summary 是来源摘要 / 建立进度文案，进状态栏。
     Rebuilt {
         store: IndexStore,
         count: usize,
-        saved: bool,
         summary: String,
         final_stage: bool,
-        /// USN 监视计划（v0.1.8）：仅最终一级且 MFT 模式时非空——
-        /// (盘符, 建索引时记下的 NextUsn 起点)。UI 收到后起监视
-        /// supervisor；便携模式恒空（无增量、仅手动重建）。
         watch: Vec<(char, Option<i64>)>,
     },
-    /// 增量 flush 完成（v0.1.8）：增量层规模与累计变更、更新时刻。
-    /// UI 据此刷页脚「{总数} 项 · 增量 M · HH:mm 更新」并重搜。
+    /// 最终缓存落盘结果（在 UI 换入新索引、释放旧 Mmap 后由后台保存回传）。
+    CacheSaved(bool),
     Delta {
+        gen: u64,
         delta_count: usize,
         total_count: usize,
         updated_hhmm: String,
     },
-    /// 增量层要求全量重建（墓碑超限 / 目录改名等，见 DeltaIndex）。
-    NeedRebuild,
+    NeedRebuild {
+        gen: u64,
+    },
 }
 
 /// 单个数据源的隔离包装：某个源 panic / 报错只丢它自己的数据，
@@ -937,30 +964,27 @@ fn spawn_exit_watchdog() {
     });
 }
 
-fn spawn_rebuild(dir: PathBuf, tx: Sender<IndexMsg>) {
+fn spawn_rebuild(dir: PathBuf, tx: Sender<IndexMsg>, ctx: egui::Context) {
     std::thread::Builder::new()
         .name("shunseek-index".into())
         .spawn(move || {
-            // 整个重建体再套一层隔离：就算中途出了意外，也要把
-            // 「空索引 + 异常摘要」的最终消息发出去，让 UI 的空索引
-            // 护栏能亮红字、托盘「重新建立索引」能解灰，而不是消息
-            // 永不达、用户对着旧索引干瞪眼。
             #[cfg(windows)]
             {
-                if guarded(|| rebuild_windows(&dir, &tx)).is_none() {
+                if guarded(|| rebuild_windows(&dir, &tx, &ctx)).is_none() {
                     let store = build_index(Vec::new(), None);
                     let _ = tx.send(IndexMsg::Rebuilt {
                         store,
                         count: 0,
-                        saved: true,
                         summary: "重建线程异常".to_string(),
                         final_stage: true,
                         watch: Vec::new(),
                     });
+                    ctx.request_repaint();
                 }
             }
             #[cfg(not(windows))]
             {
+                let _ = &dir;
                 let built = guarded(|| {
                     let (entries, roots, summary) = collect_entries();
                     let store = build_index(entries, roots.as_ref());
@@ -975,46 +999,34 @@ fn spawn_rebuild(dir: PathBuf, tx: Sender<IndexMsg>) {
                         "重建线程异常".to_string(),
                     ),
                 };
-                // 缓存尽力存 index.bin（save 自带 tmp+rename 原子
-                // 换入）：失败只丢缓存（saved=false），store 本体照常直传。
-                // v0.1.9：带信任字段（scope + 建表时间）存。
-                let saved = store
-                    .save_with_meta(&dir.join("index.bin"), &current_scope(), now_unix())
-                    .is_ok();
                 let _ = tx.send(IndexMsg::Rebuilt {
                     store,
                     count,
-                    saved,
                     summary,
                     final_stage: true,
                     watch: Vec::new(),
                 });
+                ctx.request_repaint();
             }
         })
         .ok();
 }
 
-/// 把当前累积条目建成索引发给 UI 换入。final_stage 时顺带把缓存存到
-/// index.bin——旧版存的是 index-next.bin 而启动只读 index.bin，缓存
-/// 写了永远读不到、次次冷启动，v0.1.5 改直存（save_to 内部 tmp 写 +
-/// rename，进程中途被杀也不会留下写一半的缓存）。
 fn send_index_stage(
     tx: &Sender<IndexMsg>,
-    dir: &PathBuf,
+    ctx: &egui::Context,
     entries: &[RawEntry],
     roots: &HashMap<char, String>,
     summary: String,
     final_stage: bool,
 ) {
-    send_index_stage_watch(tx, dir, entries, roots, summary, final_stage, Vec::new());
+    send_index_stage_watch(tx, ctx, entries, roots, summary, final_stage, Vec::new());
 }
 
-/// send_index_stage 的带监视计划版（v0.1.8）：只有最终一级且
-/// MFT 模式才传非空 watch，其余阶段恒空。
 #[allow(clippy::too_many_arguments)]
 fn send_index_stage_watch(
     tx: &Sender<IndexMsg>,
-    dir: &PathBuf,
+    ctx: &egui::Context,
     entries: &[RawEntry],
     roots: &HashMap<char, String>,
     summary: String,
@@ -1024,21 +1036,14 @@ fn send_index_stage_watch(
     let roots = if roots.is_empty() { None } else { Some(roots) };
     let store = build_index(entries.to_vec(), roots);
     let count = store.count();
-    let saved = if final_stage {
-        store
-            .save_with_meta(&dir.join("index.bin"), &current_scope(), now_unix())
-            .is_ok()
-    } else {
-        true
-    };
     let _ = tx.send(IndexMsg::Rebuilt {
         store,
         count,
-        saved,
         summary,
         final_stage,
         watch,
     });
+    ctx.request_repaint();
 }
 
 /// 浅层扫描一棵目录（depth = 向下层数）：只用 read_dir 不进深处，
@@ -1207,8 +1212,10 @@ fn hhmm_of_unix(secs: u64) -> String {
     #[cfg(windows)]
     {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-        let full = win_time::to_local_string(t).unwrap_or_else(|| "--:--".to_string());
-        full.chars().skip(11).take(5).collect()
+        win_time::to_local_string(t)
+            .map(|full| full.chars().skip(11).take(5).collect())
+            .filter(|s: &String| !s.is_empty())
+            .unwrap_or_else(|| "--:--".to_string())
     }
     #[cfg(not(windows))]
     {
@@ -1278,7 +1285,7 @@ fn portable_excludes() -> Vec<String> {
 /// 兜底语义与旧版一致：MFT 总数为 0 → 全遍历 %USERPROFILE%；条目仍
 /// 为 0 → 每个固定盘根全盘遍历。最终一级存缓存 index.bin。
 #[cfg(windows)]
-fn rebuild_windows(dir: &PathBuf, tx: &Sender<IndexMsg>) {
+fn rebuild_windows(_dir: &PathBuf, tx: &Sender<IndexMsg>, ctx: &egui::Context) {
     use shunseek_core::sources::{appscan, mft, usn, walker};
     let mut entries: Vec<RawEntry> = Vec::new();
     let mut roots: HashMap<char, String> = HashMap::new();
@@ -1300,7 +1307,7 @@ fn rebuild_windows(dir: &PathBuf, tx: &Sender<IndexMsg>) {
     entries.extend(shallow);
     send_index_stage(
         tx,
-        dir,
+        ctx,
         &entries,
         &roots,
         format!("索引：应用 {apps} · 浅层 {shallow_n} · 全量建立中…"),
@@ -1359,7 +1366,7 @@ fn rebuild_windows(dir: &PathBuf, tx: &Sender<IndexMsg>) {
                     .collect();
                 send_index_stage(
                     tx,
-                    dir,
+                    ctx,
                     &entries,
                     &roots,
                     format!(
@@ -1415,22 +1422,20 @@ fn rebuild_windows(dir: &PathBuf, tx: &Sender<IndexMsg>) {
         parts.push(format!("全盘遍历 {full_count}"));
     }
 
-    // ---- 最终一级：存缓存 + 换入（MFT 成功时带监视计划）----
+    // ---- 最终一级：换入后由 UI 释放旧 Mmap 再异步写缓存 ----
     if mft_mode && mft_total > 0 {
-        send_index_stage_watch(tx, dir, &entries, &roots, parts.join(" · "), true, watch_plan);
+        send_index_stage_watch(tx, ctx, &entries, &roots, parts.join(" · "), true, watch_plan);
     } else {
-        send_index_stage(tx, dir, &entries, &roots, parts.join(" · "), true);
+        send_index_stage(tx, ctx, &entries, &roots, parts.join(" · "), true);
     }
 }
 
-// ---------------------------------------------------------------- 增量监视（v0.1.8）
-
-/// 本地时间 "HH:MM"（页脚增量状态用；复用 win_time 的本地转换）。
 #[cfg(windows)]
 fn now_hhmm() -> String {
-    let full = win_time::to_local_string(std::time::SystemTime::now())
-        .unwrap_or_else(|| "--:--".to_string());
-    full.chars().skip(11).take(5).collect()
+    win_time::to_local_string(std::time::SystemTime::now())
+        .map(|full| full.chars().skip(11).take(5).collect())
+        .filter(|s: &String| !s.is_empty())
+        .unwrap_or_else(|| "--:--".to_string())
 }
 
 /// USN 监视 supervisor（v0.1.8，仅 MFT 模式）：每卷一个
@@ -1448,50 +1453,49 @@ fn now_hhmm() -> String {
 fn spawn_watch_supervisor(
     gen: u64,
     plan: Vec<(char, Option<i64>)>,
-    store: Arc<Mutex<IndexStore>>,
+    store: Arc<Mutex<Arc<IndexStore>>>,
     delta_state: Arc<Mutex<(IndexStore, Tombstones)>>,
     watch_gen: Arc<std::sync::atomic::AtomicU64>,
     flush_now: Arc<AtomicBool>,
     tx: Sender<IndexMsg>,
+    ctx: egui::Context,
     base_count: usize,
 ) {
     use shunseek_core::sources::usn::{UsnChange, UsnChangeKind, UsnWatcher};
-    // 文件夹 ref（已打标签）→ 完整路径；卷根 ref=5 单独登记
-    let mut dir_paths: HashMap<u64, String> = HashMap::new();
-    {
-        let st = lock_rec(&store);
-        for i in 0..st.count() {
-            let r = st.file_ref(i);
-            if r != 0 && st.category(i) == Category::Folder {
-                dir_paths.insert(r, st.full_path(i));
-            }
-        }
-    }
-    for (drive, _) in &plan {
-        dir_paths.insert(tag_ref(*drive, 5), format!("{drive}:\\"));
-    }
-    let (ch_tx, ch_rx) = std::sync::mpsc::channel::<(char, UsnChange)>();
-    let mut watchers: Vec<Arc<UsnWatcher>> = Vec::new();
-    for (drive, start) in &plan {
-        let w = Arc::new(UsnWatcher::with_start(*drive, *start));
-        watchers.push(w.clone());
-        let ch_tx = ch_tx.clone();
-        let drive = *drive;
-        std::thread::Builder::new()
-            .name(format!("shunseek-usn-{drive}"))
-            .spawn(move || {
-                let _ = w.run(|ch| {
-                    let _ = ch_tx.send((drive, ch));
-                });
-            })
-            .ok();
-    }
-    drop(ch_tx);
     std::thread::Builder::new()
         .name("shunseek-usn-flush".into())
         .spawn(move || {
+            let mut dir_paths: HashMap<u64, String> = HashMap::new();
+            {
+                let st = lock_rec(&store).clone();
+                for i in 0..st.count() {
+                    let r = st.file_ref(i);
+                    if r != 0 && st.category(i) == Category::Folder {
+                        dir_paths.insert(r, st.full_path(i));
+                    }
+                }
+            }
+            for (drive, _) in &plan {
+                dir_paths.insert(tag_ref(*drive, 5), format!("{drive}:\\"));
+            }
+            let (ch_tx, ch_rx) = std::sync::mpsc::channel::<(char, UsnChange)>();
+            let mut watchers: Vec<Arc<UsnWatcher>> = Vec::new();
+            for (drive, start) in &plan {
+                let w = Arc::new(UsnWatcher::with_start(*drive, *start));
+                watchers.push(w.clone());
+                let ch_tx = ch_tx.clone();
+                let drive = *drive;
+                std::thread::Builder::new()
+                    .name(format!("shunseek-usn-{drive}"))
+                    .spawn(move || {
+                        let _ = w.run(|ch| {
+                            let _ = ch_tx.send((drive, ch));
+                        });
+                    })
+                    .ok();
+            }
+            drop(ch_tx);
             let mut delta = DeltaIndex::new();
-            let mut dir_paths = dir_paths;
             let mut last_changes = 0usize;
             let mut rebuild_sent = false;
             let join = |parent: &str, name: &str| -> String {
@@ -1517,8 +1521,6 @@ fn spawn_watch_supervisor(
                     let tparent = tag_ref(drive, ch.parent_ref);
                     match ch.kind {
                         UsnChangeKind::Created | UsnChangeKind::RenamedNewName => {
-                            // 目录改名：子树里所有路径都变了，增量层
-                            // 拼不全 → 请求全量重建兜底（原版口径）
                             if ch.is_dir
                                 && matches!(ch.kind, UsnChangeKind::RenamedNewName)
                             {
@@ -1552,7 +1554,10 @@ fn spawn_watch_supervisor(
                                     delta.request_rebuild();
                                 }
                                 match dir_paths.remove(&tref) {
-                                    Some(p) => delta.remove_directory(&p, true),
+                                    Some(p) => {
+                                        delta.remove_directory(&p, true);
+                                        delta.remove(tref, &p);
+                                    }
                                     None => delta.remove(tref, ""),
                                 }
                             } else {
@@ -1582,14 +1587,16 @@ fn spawn_watch_supervisor(
                 let dead = tombs.dead_count();
                 *lock_rec(&delta_state) = (frozen, tombs);
                 let _ = tx.send(IndexMsg::Delta {
+                    gen,
                     delta_count: dcount,
                     total_count: base_count.saturating_sub(dead) + dcount,
                     updated_hhmm: now_hhmm(),
                 });
                 if delta.requires_rebuild() && !rebuild_sent {
                     rebuild_sent = true;
-                    let _ = tx.send(IndexMsg::NeedRebuild);
+                    let _ = tx.send(IndexMsg::NeedRebuild { gen });
                 }
+                ctx.request_repaint();
             }
         })
         .ok();
@@ -1791,7 +1798,8 @@ struct ShunSeekApp {
     status_alert: bool,
     /// 搜索框上一帧是否聚焦（放大镜着色读它，一帧延迟无感）。
     search_focused: bool,
-    store: Arc<Mutex<IndexStore>>,
+    egui_ctx: egui::Context,
+    store: Arc<Mutex<Arc<IndexStore>>>,
     usage: Arc<Mutex<UsageStore>>,
     /// 增量索引冻结快照（v0.1.8）：(增量小索引, 墓碑集)，flush
     /// 线程每 300ms 换新，搜索线程与主索引一起走 search_merged。
@@ -1800,9 +1808,10 @@ struct ShunSeekApp {
     watch_gen: Arc<std::sync::atomic::AtomicU64>,
     /// 托盘「立即刷新索引」：置位后 flush 线程立刻合并一次。
     flush_now: Arc<AtomicBool>,
-    /// USN 监视是否在跑（最终重建带了监视计划才为 true）：
-    /// 托盘「立即刷新索引」据此决定走 flush 还是直接全量重建。
-    watch_active: bool,
+    /// USN 监视是否在跑（共享给托盘后台回调）。
+    watch_active: Arc<AtomicBool>,
+    /// 是否有重建正在跑（共享给托盘菜单置灰与后台回调）。
+    rebuilding: Arc<AtomicBool>,
     /// 展开折叠组时的一次性结果上限提升（→300，见 toggle_group）：
     /// Some 时 schedule_search 用它代替 result_limit；查询文本一变
     /// 即失效（override_query 记武装时的查询）。
@@ -1826,8 +1835,6 @@ struct ShunSeekApp {
     data_dir: PathBuf,
     /// 索引消息发送端（同上，App 持一份 clone）。
     index_tx: Sender<IndexMsg>,
-    /// 是否有重建正在跑（托盘重建项置灰 + 并发护栏）。
-    rebuilding: bool,
     /// 本帧被悬停的行/格（绘制时写，帧末 update_hover_card 消费）。
     hover_seen: Option<HoverTarget>,
     /// 正在计时的悬停目标与起始时刻（egui time，秒）。
@@ -1963,6 +1970,7 @@ impl ShunSeekApp {
                 }
             }
         }
+        winvis::store_ctx(cc.egui_ctx.clone());
         let dir = data_dir();
         let _ = std::fs::create_dir_all(&dir);
 
@@ -2013,7 +2021,10 @@ impl ShunSeekApp {
         let (search_tx, search_rx) = std::sync::mpsc::channel();
         let (index_tx, index_rx) = std::sync::mpsc::channel();
         let index_tx_app = index_tx.clone();
-        spawn_rebuild(dir.clone(), index_tx);
+        let rebuilding = Arc::new(AtomicBool::new(true));
+        let watch_active = Arc::new(AtomicBool::new(false));
+        let flush_now = Arc::new(AtomicBool::new(false));
+        spawn_rebuild(dir.clone(), index_tx.clone(), cc.egui_ctx.clone());
 
         // 单实例唤醒等待线程（v0.1.8，Windows）：main 建好的命名
         // 事件句柄在这里等——第二进程 SetEvent 后，本线程**直接**
@@ -2054,6 +2065,39 @@ impl ShunSeekApp {
         let theme = settings.theme;
         let view_mode = settings.view;
 
+        let bg_dir = dir.clone();
+        let bg_tx = index_tx_app.clone();
+        let bg_ctx = cc.egui_ctx.clone();
+        let bg_rebuilding = rebuilding.clone();
+        let bg_watch_active = watch_active.clone();
+        let bg_flush_now = flush_now.clone();
+        let on_bg_action: Arc<dyn Fn(tray::TrayBgAction) + Send + Sync> =
+            Arc::new(move |act| match act {
+                tray::TrayBgAction::RebuildIndex => {
+                    if !bg_rebuilding.swap(true, Ordering::SeqCst) {
+                        spawn_rebuild(bg_dir.clone(), bg_tx.clone(), bg_ctx.clone());
+                    }
+                }
+                tray::TrayBgAction::RefreshIndex => {
+                    if bg_watch_active.load(Ordering::SeqCst) {
+                        bg_flush_now.store(true, Ordering::SeqCst);
+                    } else if !bg_rebuilding.swap(true, Ordering::SeqCst) {
+                        spawn_rebuild(bg_dir.clone(), bg_tx.clone(), bg_ctx.clone());
+                    }
+                }
+                tray::TrayBgAction::AdminRestart => {
+                    #[cfg(windows)]
+                    {
+                        if restart_elevated() {
+                            std::process::exit(0);
+                        } else {
+                            winvis::show();
+                            bg_ctx.request_repaint();
+                        }
+                    }
+                }
+            });
+
         let mut app = ShunSeekApp {
             query: String::new(),
             cat_set: all_categories(),
@@ -2074,15 +2118,17 @@ impl ShunSeekApp {
             status,
             status_alert: false,
             search_focused: false,
-            store: Arc::new(Mutex::new(store)),
+            egui_ctx: cc.egui_ctx.clone(),
+            store: Arc::new(Mutex::new(Arc::new(store))),
             usage: Arc::new(Mutex::new(usage)),
             delta_state: Arc::new(Mutex::new((
                 build_index(Vec::new(), None),
                 Tombstones::default(),
             ))),
             watch_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            flush_now: Arc::new(AtomicBool::new(false)),
-            watch_active: false,
+            flush_now,
+            watch_active,
+            rebuilding: rebuilding.clone(),
             limit_override: None,
             override_query: String::new(),
             search_cancel: Arc::new(AtomicBool::new(true)),
@@ -2093,10 +2139,10 @@ impl ShunSeekApp {
             tray: tray::Tray::new(
                 cc.egui_ctx.clone(),
                 tray::TrayInit {
-                    // 启动时已有一轮重建在跑（上面 spawn_rebuild）
-                    rebuilding: true,
+                    rebuilding: rebuilding.clone(),
                     data_dir: dir.clone(),
                     hotkey_label: settings.hotkey.display(),
+                    on_bg_action: Some(on_bg_action),
                 },
             ),
             visible: !START_HIDDEN.load(Ordering::SeqCst),
@@ -2105,7 +2151,6 @@ impl ShunSeekApp {
             scroll_to_selected: false,
             data_dir: dir.clone(),
             index_tx: index_tx_app,
-            rebuilding: true,
             hover_seen: None,
             hover_target: None,
             hover_since: 0.0,
@@ -2185,10 +2230,12 @@ impl ShunSeekApp {
         let usage = self.usage.clone();
         let delta_state = self.delta_state.clone();
         let tx = self.search_tx.clone();
+        let ctx = self.egui_ctx.clone();
         std::thread::Builder::new()
             .name("shunseek-search".into())
             .spawn(move || {
                 let tx_panic = tx.clone();
+                let ctx_panic = ctx.clone();
                 let body = std::panic::AssertUnwindSafe(|| {
                     std::thread::sleep(Duration::from_millis(30));
                     if cancel.load(Ordering::SeqCst) {
@@ -2197,7 +2244,8 @@ impl ShunSeekApp {
                     let started = Instant::now();
                     let rows: Vec<ResultRow>;
                     {
-                        let store_g = lock_rec(&store);
+                        let store_arc = lock_rec(&store).clone();
+                        let store_g = &*store_arc;
                         let usage_g = lock_rec(&usage);
                         let delta_g = lock_rec(&delta_state);
                         if empty_query {
@@ -2316,16 +2364,16 @@ impl ShunSeekApp {
                         empty_query,
                         error: false,
                     });
+                    ctx.request_repaint();
                 });
                 if std::panic::catch_unwind(body).is_err() {
-                    // panic 兜底：仍发 Done（error），UI 提示已自动恢复；
-                    // 就算锁被毒化，下一次搜索的 lock_rec 也能恢复。
                     let _ = tx_panic.send(SearchMsg::Done {
                         rows: Vec::new(),
                         elapsed_ms: 0.0,
                         empty_query,
                         error: true,
                     });
+                    ctx_panic.request_repaint();
                 }
             })
             .ok();
@@ -2339,6 +2387,7 @@ impl ShunSeekApp {
     fn hide(&mut self, _ctx: &egui::Context) {
         self.visible = false;
         self.on_hidden();
+        clickwatch::disarm();
         winvis::hide();
         #[cfg(not(windows))]
         _ctx.send_viewport_cmd(ViewportCommand::Visible(false));
@@ -2409,6 +2458,10 @@ impl ShunSeekApp {
         }
         self.visible = now_visible;
         self.minimized = st == winvis::VisState::Minimized;
+        #[cfg(windows)]
+        {
+            self.maximized = winvis::is_maximized();
+        }
     }
 
     /// 外部显式呼出（单实例唤醒 / 热键 / 托盘 Toggle·Show·
@@ -2431,7 +2484,7 @@ impl ShunSeekApp {
     fn publish_click_bounds(&self, ctx: &egui::Context) {
         let conv = |v: &egui::ViewportInfo, fallback_ppp: f32| -> Option<[i32; 4]> {
             let r = v.outer_rect?;
-            let ppp = v.native_pixels_per_point.unwrap_or(fallback_ppp);
+            let ppp = fallback_ppp;
             Some([
                 (r.left() * ppp).round() as i32,
                 (r.top() * ppp).round() as i32,
@@ -2439,17 +2492,17 @@ impl ShunSeekApp {
                 (r.bottom() * ppp).round() as i32,
             ])
         };
-        let (main, ppp) = ctx.input(|i| (conv(i.viewport(), i.pixels_per_point), i.pixels_per_point));
+        let (egui_main, ppp) = ctx.input(|i| (conv(i.viewport(), i.pixels_per_point), i.pixels_per_point));
+        let main = winvis::window_rect().or(egui_main);
         let sub = if self.settings_open {
             let settings_id = egui::ViewportId::from_hash_of("shunseek_settings");
             ctx.input_for(settings_id, |i| conv(i.viewport(), ppp))
         } else {
             None
         };
-        // 托盘图标矩形（v0.1.11 第三个豁免区）：现查现发，图标
-        // 位置随任务栏变化，不缓存；查不到 → None 自动失效。
         let tray = self.tray.icon_rect();
-        self.clickwatch.publish(main, sub, tray, self.visible);
+        let armed = winvis::state() == winvis::VisState::Shown;
+        self.clickwatch.publish(main, sub, tray, armed);
     }
 
     /// 主题交叉淡入推进（170ms）：display_pal 从旧板向目标板
@@ -2519,6 +2572,16 @@ impl ShunSeekApp {
             });
         if self.maximized {
             self.pending_drag = None;
+            if primary_pressed && dbl {
+                if let Some(origin) = press_origin {
+                    if screen.contains(origin)
+                        && !self.blockers_prev.iter().any(|r| r.contains(origin))
+                    {
+                        self.maximized = false;
+                        ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                    }
+                }
+            }
             return;
         }
         // 悬停在拉伸带上时给方向光标（无按下才做，纯提示）
@@ -2956,23 +3019,8 @@ impl ShunSeekApp {
         self.pins.iter().any(|p| p.eq_ignore_ascii_case(path))
     }
 
-    /// 由 pins 派生首页展示行：分类优先从当前索引查（一次全表扫描
-    /// 只为命中 pins，pins 数量小）；不在索引里则按磁盘/扩展名推断
-    /// （目标已删也照常显示：名称取路径末段，图标按路径取）。
+    /// 由 pins 派生首页展示行：直接按路径与扩展名推断分类，避免在 UI 线程全表扫描索引。
     fn rebuild_home_items(&mut self) {
-        let mut found: HashMap<String, Category> = HashMap::new();
-        if !self.pins.is_empty() {
-            let wanted: HashSet<String> =
-                self.pins.iter().map(|p| p.to_lowercase()).collect();
-            let store = lock_rec(&self.store);
-            for i in 0..store.count() {
-                let fp = store.full_path(i);
-                let low = fp.to_lowercase();
-                if wanted.contains(&low) {
-                    found.insert(low, store.category(i));
-                }
-            }
-        }
         self.home_items = self
             .pins
             .iter()
@@ -2984,19 +3032,20 @@ impl ShunSeekApp {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(p.as_str())
                     .to_string();
-                let category = found.get(&p.to_lowercase()).copied().unwrap_or_else(|| {
-                    if std::path::Path::new(p).is_dir() {
-                        Category::Folder
+                let is_dir = std::path::Path::new(p).is_dir();
+                let category = if is_dir {
+                    Category::Folder
+                } else {
+                    let lower = name.to_lowercase();
+                    if lower.ends_with(".lnk") {
+                        Category::Shortcut
+                    } else if lower.ends_with(".exe") {
+                        Category::App
                     } else {
                         shunseek_core::classify_by_extension(&name)
                     }
-                });
-                let (type_label, importance) = filetype::describe(
-                    p,
-                    category,
-                    matches!(category, Category::Folder | Category::InstallDir)
-                        || std::path::Path::new(p).is_dir(),
-                );
+                };
+                let (type_label, importance) = filetype::describe(p, category, is_dir);
                 ResultRow {
                     name,
                     path: p.clone(),
@@ -3037,25 +3086,29 @@ impl ShunSeekApp {
     /// 重新建立索引的唯一入口（托盘 / 设置面板共用）：已有重建在跑
     /// 就忽略（并发护栏），进度沿用分级建立的状态栏摘要。
     fn start_rebuild(&mut self) {
-        if self.rebuilding {
+        if self.rebuilding.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.rebuilding = true;
         self.tray.set_rebuild_enabled(false);
-        spawn_rebuild(self.data_dir.clone(), self.index_tx.clone());
+        spawn_rebuild(
+            self.data_dir.clone(),
+            self.index_tx.clone(),
+            self.egui_ctx.clone(),
+        );
     }
 
     fn open_settings(&mut self) {
         self.settings_open = true;
-        // 自启动勾选以注册表实际状态为准，打开时回读一次；
-        // 二次确认状态复位，别让上次点到一半的确认跨次打开残留
         self.settings_autostart = autostart::is_enabled();
         self.usage_confirm = false;
     }
 
     fn close_settings(&mut self) {
         self.settings_open = false;
-        // 焦点还给搜索框（打开设置时被面板拿走）
+        if self.hotkey_capture {
+            self.hotkey_capture = false;
+            self.hotkey.set_paused(false);
+        }
         self.focus_search = true;
     }
 
@@ -3214,33 +3267,50 @@ impl ShunSeekApp {
                 IndexMsg::Rebuilt {
                     store,
                     count,
-                    saved,
                     summary,
                     final_stage,
                     watch,
                 } => {
-                    *lock_rec(&self.store) = store;
+                    let new_arc = Arc::new(store);
+                    {
+                        let mut g = lock_rec(&self.store);
+                        *g = new_arc.clone();
+                    }
                     self.index_count = count;
                     self.index_summary = summary.clone();
-                    // pins 的分类随索引变化（在/不在索引），重建首页项
                     self.rebuild_home_items();
                     if final_stage {
-                        self.rebuilding = false;
+                        self.rebuilding.store(false, Ordering::SeqCst);
                         self.tray.set_rebuild_enabled(true);
                         self.status_alert = count == 0;
-                        // 状态栏只放短格式（原版 "{N0} 项"）；完整来源
-                        // 摘要只在设置窗口「索引」区（index_summary）。
                         self.status = if count == 0 {
                             ALERT_EMPTY_INDEX.to_string()
-                        } else if saved {
-                            format!("{} 项", group_thousands(count))
                         } else {
-                            format!("{} 项 · 缓存写入失败", group_thousands(count))
+                            format!("{} 项", group_thousands(count))
                         };
-                        // v0.1.8 增量监视换代：旧 supervisor 退休，
-                        // 增量快照清零；本轮带监视计划（MFT 模式）
-                        // 就起新一代 supervisor。便携模式 watch 为
-                        // 空 → 无增量，仅手动重建。
+                        // 旧 Mmap 已从 self.store 卸下，在后台线程异步落盘（短暂重试避开搜索线程持有）
+                        let save_dir = self.data_dir.clone();
+                        let save_tx = self.index_tx.clone();
+                        let save_ctx = self.egui_ctx.clone();
+                        std::thread::Builder::new()
+                            .name("shunseek-save-cache".into())
+                            .spawn(move || {
+                                let scope = current_scope();
+                                let ts = now_unix();
+                                let path = save_dir.join("index.bin");
+                                let mut saved = false;
+                                for _ in 0..6 {
+                                    if new_arc.save_with_meta(&path, &scope, ts).is_ok() {
+                                        saved = true;
+                                        break;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(50));
+                                }
+                                let _ = save_tx.send(IndexMsg::CacheSaved(saved));
+                                save_ctx.request_repaint();
+                            })
+                            .ok();
+
                         let gen = self
                             .watch_gen
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3249,7 +3319,7 @@ impl ShunSeekApp {
                             build_index(Vec::new(), None),
                             Tombstones::default(),
                         );
-                        self.watch_active = !watch.is_empty();
+                        self.watch_active.store(!watch.is_empty(), Ordering::SeqCst);
                         #[cfg(windows)]
                         if !watch.is_empty() {
                             spawn_watch_supervisor(
@@ -3260,24 +3330,31 @@ impl ShunSeekApp {
                                 self.watch_gen.clone(),
                                 self.flush_now.clone(),
                                 self.index_tx.clone(),
+                                self.egui_ctx.clone(),
                                 count,
                             );
                         }
                         #[cfg(not(windows))]
                         let _ = gen;
                     } else {
-                        // 阶段性换入：搜索已可对当前索引用，不等最终一级
                         self.status = "正在建立索引…".to_string();
                     }
                     self.schedule_search();
                 }
+                IndexMsg::CacheSaved(saved) => {
+                    if !saved && !self.status_alert && self.index_count > 0 {
+                        self.status = format!("{} 项 · 缓存写入失败", group_thousands(self.index_count));
+                    }
+                }
                 IndexMsg::Delta {
+                    gen,
                     delta_count,
                     total_count,
                     updated_hhmm,
                 } => {
-                    // 页脚增量状态（原版短格式）：「{总数} 项 · 增量
-                    // M · HH:mm 更新」；增量为 0 时只报总数 + 时刻。
+                    if gen != self.watch_gen.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     self.index_count = total_count;
                     self.status = if delta_count > 0 {
                         format!(
@@ -3291,10 +3368,10 @@ impl ShunSeekApp {
                     };
                     self.schedule_search();
                 }
-                IndexMsg::NeedRebuild => {
-                    // 增量层要求全量重建（墓碑超限/目录改名等）；
-                    // start_rebuild 自带并发护栏，重复请求无害。
-                    self.start_rebuild();
+                IndexMsg::NeedRebuild { gen } => {
+                    if gen == self.watch_gen.load(Ordering::SeqCst) {
+                        self.start_rebuild();
+                    }
                 }
             }
         }
@@ -3352,7 +3429,7 @@ fn hover_strength(ui: &egui::Ui, id: impl std::hash::Hash, hovered: bool) -> f32
         0.15,
         egui::emath::easing::cubic_out,
     );
-    if (0.0..1.0).contains(&v) {
+    if v > 0.0 && v < 1.0 {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(16));
     }
@@ -4271,7 +4348,7 @@ impl ShunSeekApp {
             self.search_focused,
             0.18,
         );
-        if (0.0..1.0).contains(&v) {
+        if v > 0.0 && v < 1.0 {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(16));
         }
@@ -4361,7 +4438,7 @@ impl ShunSeekApp {
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(26.0, 26.0), egui::Sense::click());
         self.blockers_cur.push(rect);
-        if open {
+        if expanded {
             self.filter_dot_rect = Some(rect);
         }
         let painter = ui.painter_at(rect);
@@ -4497,21 +4574,23 @@ impl ShunSeekApp {
             pos,
             Vec2::new(width, full_size.y * v),
         );
-        self.filter_panel_rect = Some(vis);
+        if self.expanded_filter == Some(FilterKind::Type) {
+            self.filter_panel_rect = Some(vis);
+        }
         self.blockers_cur.push(vis);
     }
 
-    /// 类型选中集切换（全集模型、永不空选）：单击切换一项；
-    /// 双击 solo（已是 solo 再双击 → 回全集）；取消到只剩最后一项
-    /// 时再点它 → 跳回全集；逐个点满即全集（「全部」自动亮起就是
-    /// cat_set 满员的派生状态，不单独存）。
     fn toggle_cat(&mut self, cat: Category, solo: bool) {
+        let full = self.cat_set.len() >= ALL_CATEGORIES.len();
         if solo {
             if self.cat_set.len() == 1 && self.cat_set.contains(&cat) {
                 self.cat_set = all_categories();
             } else {
                 self.cat_set = HashSet::from([cat]);
             }
+        } else if full {
+            // 从全选态单击某一项：改为独选该项，而不是反向取消它
+            self.cat_set = HashSet::from([cat]);
         } else if self.cat_set.len() == 1 && self.cat_set.contains(&cat) {
             self.cat_set = all_categories();
         } else if !self.cat_set.remove(&cat) {
@@ -4543,7 +4622,7 @@ impl ShunSeekApp {
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(w, 26.0), egui::Sense::click());
         self.blockers_cur.push(rect);
-        if open {
+        if expanded {
             self.filter_dot_rect = Some(rect);
         }
         let painter = ui.painter_at(rect);
@@ -4657,7 +4736,7 @@ impl ShunSeekApp {
                                 scope_toggle_preset(&mut presets, &mut drives, key, true);
                                 changed = true;
                             } else if r.clicked() {
-                                scope_toggle_preset(&mut presets, &mut drives, key, false);
+                                scope_toggle_preset(&mut presets, &mut drives, key, all_now);
                                 changed = true;
                             }
                         }
@@ -4673,7 +4752,7 @@ impl ShunSeekApp {
                                 scope_toggle_drive(&mut presets, &mut drives, d, true);
                                 changed = true;
                             } else if r.clicked() {
-                                scope_toggle_drive(&mut presets, &mut drives, d, false);
+                                scope_toggle_drive(&mut presets, &mut drives, d, all_now);
                                 changed = true;
                             }
                         }
@@ -4701,11 +4780,14 @@ impl ShunSeekApp {
             });
         self.filter_panel_full[1] = area.response.rect.size();
         let vis = egui::Rect::from_min_size(pos, Vec2::new(vis_w, vis_h));
-        self.filter_panel_rect = Some(vis);
+        if self.expanded_filter == Some(FilterKind::Scope) {
+            self.filter_panel_rect = Some(vis);
+        }
         self.blockers_cur.push(vis);
         if add_folder {
             #[cfg(windows)]
             {
+                let _guard = clickwatch::SuspendGuard::new();
                 if let Some(p) = rfd::FileDialog::new().pick_folder() {
                     let s = p.to_string_lossy().into_owned();
                     if !custom.contains(&s) {
@@ -4713,8 +4795,6 @@ impl ShunSeekApp {
                         changed = true;
                     }
                 }
-                // 对话框期间的点击对钩子全是「点外」，回来 drain
-                self.clickwatch.drain();
             }
         }
         if changed {
@@ -4753,7 +4833,7 @@ impl ShunSeekApp {
         if self.rows.is_empty() {
             let pal = self.display_pal;
             // 空状态文案（原版）：索引还在建 / 没有匹配的内容
-            let text = if self.rebuilding && self.index_count == 0 {
+            let text = if self.rebuilding.load(Ordering::SeqCst) && self.index_count == 0 {
                 "索引还在建，等它跑完再搜"
             } else {
                 "没有匹配的内容"
@@ -5038,16 +5118,16 @@ impl ShunSeekApp {
         #[cfg(windows)]
         {
             if pick_file {
+                let _guard = clickwatch::SuspendGuard::new();
                 if let Some(p) = rfd::FileDialog::new().pick_file() {
                     self.add_pin(&p.to_string_lossy().into_owned());
                 }
-                self.clickwatch.drain();
             }
             if pick_folder {
+                let _guard = clickwatch::SuspendGuard::new();
                 if let Some(p) = rfd::FileDialog::new().pick_folder() {
                     self.add_pin(&p.to_string_lossy().into_owned());
                 }
-                self.clickwatch.drain();
             }
         }
         let _ = (pick_file, pick_folder);
@@ -6306,7 +6386,7 @@ fn filter_chip(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> 
         0.15,
         egui::emath::easing::cubic_out,
     );
-    if (0.0..1.0).contains(&v) {
+    if v > 0.0 && v < 1.0 {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(16));
     }
@@ -6501,6 +6581,7 @@ impl ShunSeekApp {
                 );
             } else if ui.button("修改").clicked() {
                 self.hotkey_capture = true;
+                self.hotkey.set_paused(true);
                 self.hotkey_note.clear();
                 self.hotkey_recs.clear();
             }
@@ -6620,13 +6701,14 @@ impl ShunSeekApp {
             .color(pal.path_text),
         );
         ui.horizontal(|ui| {
-            let rebuild_label = if self.rebuilding {
+            let is_rebuilding = self.rebuilding.load(Ordering::SeqCst);
+            let rebuild_label = if is_rebuilding {
                 "正在建立索引…"
             } else {
                 "重新建立索引"
             };
             if ui
-                .add_enabled(!self.rebuilding, egui::Button::new(rebuild_label))
+                .add_enabled(!is_rebuilding, egui::Button::new(rebuild_label))
                 .clicked()
             {
                 self.start_rebuild();
@@ -6636,11 +6718,21 @@ impl ShunSeekApp {
                 opener::open(&dir, "", false);
             }
             if ui.button("清除索引缓存").clicked() {
+                {
+                    let mut g = lock_rec(&self.store);
+                    if g.is_mapped() {
+                        *g = Arc::new(g.to_owned_store());
+                    }
+                }
                 for f in ["index.bin", "index-next.bin", "index.tmp", "index-next.tmp"] {
                     let _ = std::fs::remove_file(self.data_dir.join(f));
                 }
-                self.settings_note =
-                    "索引缓存已清除，下次启动将重新建立（当前索引仍可继续使用）".to_string();
+                if self.data_dir.join("index.bin").exists() {
+                    self.settings_note = "索引缓存文件正被占用，请稍后再试".to_string();
+                } else {
+                    self.settings_note =
+                        "索引缓存已清除，下次启动将重新建立（当前索引仍可继续使用）".to_string();
+                }
             }
         });
 
@@ -6699,6 +6791,7 @@ impl ShunSeekApp {
             {
                 if *key == Key::Escape {
                     self.hotkey_capture = false;
+                    self.hotkey.set_paused(false);
                     self.hotkey_note = "已取消修改".to_string();
                     return;
                 }
@@ -6709,7 +6802,7 @@ impl ShunSeekApp {
                     modifiers.ctrl,
                     modifiers.alt,
                     modifiers.shift,
-                    modifiers.command,
+                    hotkey::win_key_down(),
                     vk,
                 );
                 if !(combo.ctrl || combo.alt || combo.shift || combo.win) {
@@ -6719,6 +6812,7 @@ impl ShunSeekApp {
                 }
                 self.hotkey_capture = false;
                 self.apply_hotkey_check(combo);
+                self.hotkey.set_paused(false);
                 return;
             }
         }
@@ -7014,9 +7108,7 @@ impl eframe::App for ShunSeekApp {
                 }
                 tray::TrayAction::RebuildIndex => self.start_rebuild(),
                 tray::TrayAction::RefreshIndex => {
-                    // 有 USN 监视：请 flush 线程立即合并一次；
-                    // 便携模式没监视 → 等效手动全量重建
-                    if self.watch_active {
+                    if self.watch_active.load(Ordering::SeqCst) {
                         self.flush_now.store(true, Ordering::SeqCst);
                     } else {
                         self.start_rebuild();
@@ -7040,14 +7132,10 @@ impl eframe::App for ShunSeekApp {
                     self.status = about_text();
                 }
                 tray::TrayAction::AdminRestart => {
-                    // 以管理员身份重启（v0.1.9）：runas 拉起同一
-                    // exe（带 --from-restart 让新进程等旧进程释放
-                    // 单实例互斥），成功 → 本进程立即退出；UAC
-                    // 取消 → 保持现状 + 状态栏说明。
                     #[cfg(windows)]
                     {
                         if restart_elevated() {
-                            self.tray.shutdown();
+                            self.tray.shutdown_sync();
                             std::process::exit(0);
                         } else {
                             self.status = "管理员授权未完成，已取消重启".to_string();
@@ -7302,6 +7390,10 @@ fn install_crash_log_hook() {
 /// 首实例 → 建手动重置唤醒事件（句柄存 WAKE_EVENT 给等待线程）
 /// 并返回 true。Mutex 创建失败时保守放行（宁可双开不可锁死）。
 #[cfg(windows)]
+static SINGLE_INSTANCE_MUTEX: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+#[cfg(windows)]
 fn single_instance_acquire() -> bool {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -7309,37 +7401,36 @@ fn single_instance_acquire() -> bool {
     use windows_sys::Win32::System::Threading::{
         CreateEventW, CreateMutexW, OpenEventW, SetEvent, EVENT_MODIFY_STATE,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     let wide = |s: &str| -> Vec<u16> {
         OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
     };
     unsafe {
         let mutex_name = wide("ShunSeekSingleInstanceMutex");
-        let mh = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
+        let mh = CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr());
         if mh == 0 {
             return true;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            // 管理员重启衔接（v0.1.9）：带 --from-restart 时旧
-            // 进程正在退出——等互斥被释放（旧进程死亡后等待
-            // 返回 OBJECT_0 / ABANDONED），等到就顶替为唯一
-            // 实例继续启动；等不到才按重复启动处理（唤醒老
-            // 窗口后自退）。
             let mut replaced = false;
             if std::env::args().any(|a| a == "--from-restart") {
                 use windows_sys::Win32::System::Threading::WaitForSingleObject;
                 let w = WaitForSingleObject(mh, 3000);
-                replaced = w == 0 || w == 0x80; // WAIT_OBJECT_0 / WAIT_ABANDONED
+                replaced = w == 0 || w == 0x80;
             }
             if !replaced {
+                let _ = AllowSetForegroundWindow(u32::MAX);
                 let ev_name = wide("ShunSeekWakeEvent");
                 let eh = OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr());
                 if eh != 0 {
                     SetEvent(eh);
                     CloseHandle(eh);
                 }
+                CloseHandle(mh);
                 return false;
             }
         }
+        SINGLE_INSTANCE_MUTEX.store(mh, Ordering::SeqCst);
         let ev_name = wide("ShunSeekWakeEvent");
         let eh = CreateEventW(std::ptr::null(), 1, 0, ev_name.as_ptr());
         if eh != 0 {
@@ -7349,11 +7440,6 @@ fn single_instance_acquire() -> bool {
     }
 }
 
-/// 以管理员身份重启的拉起动作（v0.1.9，对齐原版
-/// RestartElevated）：ShellExecuteW 动词 runas 起同一 exe，
-/// 透传原参数并加 --from-restart（新进程据此等本进程释放单
-/// 实例互斥，见 single_instance_acquire）。true = 已拉起
-/// （调用方随即退出）；false = UAC 取消或拉起失败。
 #[cfg(windows)]
 fn restart_elevated() -> bool {
     use std::ffi::OsStr;
@@ -7362,7 +7448,17 @@ fn restart_elevated() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--tray" && a != "--silent" && a != "--from-restart")
+        .map(|a| {
+            if a.contains(' ') || a.contains('\t') {
+                format!("\"{}\"", a.replace('"', "\\\""))
+            } else {
+                a
+            }
+        })
+        .collect();
     args.push("--from-restart".to_string());
     let params = args.join(" ");
     let wide = |s: &OsStr| -> Vec<u16> {

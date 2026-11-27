@@ -119,8 +119,8 @@ impl UsnWatcher {
             in_buffer[0..8].copy_from_slice(&next_usn.to_le_bytes());
             in_buffer[8..12].copy_from_slice(&reason_mask.to_le_bytes());
             // ReturnOnlyOnClose = 0（12..16）
-            in_buffer[16..24].copy_from_slice(&1_000_000u64.to_le_bytes()); // Timeout 100ms
-            in_buffer[24..32].copy_from_slice(&1u64.to_le_bytes()); // BytesToWaitFor
+            in_buffer[16..24].copy_from_slice(&0u64.to_le_bytes()); // Timeout = 0 (不阻塞11天)
+            in_buffer[24..32].copy_from_slice(&0u64.to_le_bytes()); // BytesToWaitFor = 0
             in_buffer[32..40].copy_from_slice(&journal_id.to_le_bytes());
             let mut returned: u32 = 0;
             let ok = unsafe {
@@ -139,6 +139,7 @@ impl UsnWatcher {
                 return Err(std::io::Error::last_os_error());
             }
             if returned <= 8 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
             next_usn = i64::from_le_bytes(out_buffer[0..8].try_into().unwrap());
@@ -166,14 +167,15 @@ impl UsnWatcher {
 }
 
 fn classify(reason: u32) -> UsnChangeKind {
-    if reason & USN_REASON_FILE_CREATE != 0 {
-        UsnChangeKind::Created
-    } else if reason & USN_REASON_FILE_DELETE != 0 {
+    // 同一句柄未关闭前 NTFS 会累积 reason 位：先判删除/改名，再判创建
+    if reason & USN_REASON_FILE_DELETE != 0 {
         UsnChangeKind::Deleted
     } else if reason & USN_REASON_RENAME_NEW_NAME != 0 {
         UsnChangeKind::RenamedNewName
     } else if reason & USN_REASON_RENAME_OLD_NAME != 0 {
         UsnChangeKind::RenamedOldName
+    } else if reason & USN_REASON_FILE_CREATE != 0 {
+        UsnChangeKind::Created
     } else {
         UsnChangeKind::Other
     }

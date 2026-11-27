@@ -1,27 +1,9 @@
 //! 全局热键呼出 / 隐藏搜索窗：自定义组合（设置里捕获修改）。
-//! 默认值 v0.1.8 起走候选链解析（Ctrl+Alt+Space → Ctrl+Shift+Q
-//! → Alt+Q，见 resolve_default；Alt+Space 在用户机器上被占用，
-//! 只作为用户手动存入的值存在）。settings.txt 的 hotkey 键存
-//! 规范串（如 "alt+space"、"ctrl+alt+q"），存过的值永远优先。
-//!
-//! Windows：C# 版用 RegisterHotKey + 窗口消息钩子。egui/eframe 没有把
-//! WM_HOTKEY 暴露给应用，这里改用后台线程轮询 GetAsyncKeyState（user32 FFI）：
-//! 每 30ms 查一次修饰键与主键的物理状态，主键由松到按的边沿触发一次。
-//! v0.1.12 起边沿触发时轮询线程**当场**调 winvis::toggle() 按 OS
-//! 状态直接切换主窗口可见性（ShowWindow），再置位共享标志 +
-//! request_repaint 让 UI 随后补呼出副作用——旧设计「置标志 →
-//! repaint 唤醒 UI → UI 再 toggle」在真机上六版全灭（隐藏态下
-//! UI 线程唤醒不可靠，见 winvis 模块头），可见性从此不经 UI。
-//! 组合存共享原子值，设置里改完下一圈轮询即按新值生效。
-//!
-//! 冲突检测（check）：两道——硬编码系统保留名单优先判（Alt+Space
-//! 这类可能注册成功，名单说了算），再用 RegisterHotKey 实测占用
-//!（1409 = 已被其他程序注册）。非 Windows 跳过检测、恒可用。
-//!
-//! 非 Windows：egui 没有跨平台全局热键支持，轮询降级为无全局热键——
-//! 窗口就是普通窗口，托盘 / 任务栏入口照常。
+//! Windows：优先使用专用消息窗口上的原生 `RegisterHotKey`（系统自动
+//! 授予前台窗口切换权且不透传按键）；若注册被其他程序占用，则在同一
+//! 消息循环里用 30ms 定时器降级轮询 `GetAsyncKeyState`（精确匹配修饰键）。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// 一个热键组合：修饰键四件套 + 主键虚拟键码。
@@ -43,9 +25,6 @@ impl HotkeyCombo {
         vk: 0x20,
     };
 
-    /// v0.1.8 默认热键候选链（对齐原版）：Ctrl+Alt+Space 优先
-    ///（Alt+Space 在用户机器上被占用/冲突），依次回退
-    /// Ctrl+Shift+Q → Alt+Q。
     pub const CTRL_ALT_SPACE: HotkeyCombo = HotkeyCombo {
         ctrl: true,
         alt: true,
@@ -78,7 +57,6 @@ impl HotkeyCombo {
         }
     }
 
-    /// 显示名："Alt+Space" / "Ctrl+Alt+Q" / "Win+L"。
     pub fn display(self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.ctrl {
@@ -97,13 +75,10 @@ impl HotkeyCombo {
         parts.join("+")
     }
 
-    /// settings.txt 规范串（显示名小写）："alt+space"。
     pub fn key_str(self) -> String {
         self.display().to_lowercase()
     }
 
-    /// 解析规范串；兼容旧版预设值 alt_space / ctrl_space / alt_q。
-    /// 至少一个修饰键 + 一个主键才合法。
     pub fn parse(s: &str) -> Option<HotkeyCombo> {
         match s.trim() {
             "alt_space" => return Some(HotkeyCombo::ALT_SPACE),
@@ -149,7 +124,6 @@ impl HotkeyCombo {
     }
 }
 
-/// 主键显示名（VK → 人读名）。
 pub fn key_name(vk: u32) -> String {
     match vk {
         0x20 => "Space".to_string(),
@@ -184,20 +158,14 @@ fn vk_from_name(name: &str) -> Option<u32> {
 
 // ---------------------------------------------------------------- 冲突检测
 
-/// 冲突检测三态（外加硬冲突）：见 check()。
 #[derive(Clone, Debug, PartialEq)]
 pub enum HotkeyCheck {
-    /// 可用：可直接设置。
     Available,
-    /// 与系统快捷键共用：可设置，但要把原因提示给用户。
     Shared(String),
-    /// 系统保留硬冲突：不可设置，附原因。
     Conflict(String),
-    /// 已被其他程序注册占用：不可设置。
     Occupied,
 }
 
-/// 系统保留硬冲突名单（命中即不可设置）。只认精确组合。
 fn hard_reserved(combo: HotkeyCombo) -> Option<&'static str> {
     let c = HotkeyCombo::new;
     let reason = match combo {
@@ -216,7 +184,6 @@ fn hard_reserved(combo: HotkeyCombo) -> Option<&'static str> {
     Some(reason)
 }
 
-/// 与系统共用名单：可设置，但要提示。
 fn shared_reserved(combo: HotkeyCombo) -> Option<&'static str> {
     if combo == HotkeyCombo::ALT_SPACE {
         Some("与系统窗口菜单共用：在其他窗口聚焦时按 Alt+Space，可能弹出该窗口的系统菜单")
@@ -227,8 +194,6 @@ fn shared_reserved(combo: HotkeyCombo) -> Option<&'static str> {
     }
 }
 
-/// 冲突检测：名单优先判（硬冲突 → 占用探测 → 共用提示 → 可用）。
-/// 非 Windows 跳过探测，名单之外一律可用。
 pub fn check(combo: HotkeyCombo) -> HotkeyCheck {
     if let Some(reason) = hard_reserved(combo) {
         return HotkeyCheck::Conflict(reason.to_string());
@@ -245,11 +210,6 @@ pub fn check(combo: HotkeyCombo) -> HotkeyCheck {
     HotkeyCheck::Available
 }
 
-/// 解析默认热键（v0.1.8）：候选链 Ctrl+Alt+Space → Ctrl+Shift+Q
-/// → Alt+Q 顺序过 check()，第一个 Available 的胜出；全军覆没时
-/// 退回链首（总比没有热键强，用户可在设置里再改）。仅在
-/// settings.txt 没有 hotkey 键（或解析失败）时调用——用户已存
-/// 的值永远优先，绝不覆盖。
 pub fn resolve_default() -> HotkeyCombo {
     for cand in [
         HotkeyCombo::CTRL_ALT_SPACE,
@@ -263,7 +223,6 @@ pub fn resolve_default() -> HotkeyCombo {
     HotkeyCombo::CTRL_ALT_SPACE
 }
 
-/// 推荐候选（冲突时给出）：每个都要先过 check、只留 Available 的。
 pub const RECOMMEND_CANDIDATES: [HotkeyCombo; 5] = [
     HotkeyCombo {
         ctrl: false,
@@ -311,10 +270,7 @@ mod win_probe {
         MOD_WIN,
     };
 
-    /// 占用探测：拿临时 id 真注册一次。成功 = 没被占（立即注销）；
-    /// 失败且 GetLastError = 1409（ERROR_HOTKEY_ALREADY_REGISTERED）
-    /// = 已被其他程序注册；其他失败原因保守按未占用处理（名单已先判）。
-    pub fn is_occupied(combo: HotkeyCombo) -> bool {
+    pub fn to_mods(combo: HotkeyCombo) -> u32 {
         let mut mods = MOD_NOREPEAT;
         if combo.ctrl {
             mods |= MOD_CONTROL;
@@ -328,6 +284,11 @@ mod win_probe {
         if combo.win {
             mods |= MOD_WIN;
         }
+        mods
+    }
+
+    pub fn is_occupied(combo: HotkeyCombo) -> bool {
+        let mods = to_mods(combo);
         const TEST_ID: i32 = 0x5EED;
         unsafe {
             let ok = RegisterHotKey(0, TEST_ID, mods, combo.vk);
@@ -341,32 +302,54 @@ mod win_probe {
     }
 }
 
-// ---------------------------------------------------------------- 轮询
+/// 当前物理 Win 键（左或右）是否处于按下状态（供设置页快捷键捕获区分 Ctrl 与 Win）。
+pub fn win_key_down() -> bool {
+    platform::win_key_down()
+}
+
+// ---------------------------------------------------------------- 热键监听
 
 pub struct Hotkey {
     fired: Arc<AtomicBool>,
     combo: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
+    hwnd: Arc<AtomicIsize>,
 }
 
 impl Hotkey {
     pub fn start(ctx: egui::Context, combo: HotkeyCombo) -> Hotkey {
         let fired = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(AtomicU64::new(combo.pack()));
-        platform::spawn(ctx, fired.clone(), shared.clone());
+        let paused = Arc::new(AtomicBool::new(false));
+        let hwnd = Arc::new(AtomicIsize::new(0));
+        platform::spawn(
+            ctx,
+            fired.clone(),
+            shared.clone(),
+            paused.clone(),
+            hwnd.clone(),
+        );
         Hotkey {
             fired,
             combo: shared,
+            paused,
+            hwnd,
         }
     }
 
-    /// 设置里换了组合：写共享原子值，轮询线程下一圈就按新值生效。
     pub fn set_combo(&self, combo: HotkeyCombo) {
         self.combo.store(combo.pack(), Ordering::SeqCst);
+        platform::notify_update(&self.hwnd);
     }
 
-    /// 取走一次触发（取后清零）。UI 在每帧 update 开头调用；
-    /// v0.1.12 起这只代表「刚发生过一次热键呼出/隐藏，UI 该补
-    /// 副作用了」——可见性切换已由轮询线程当场完成。
+    /// 暂停/恢复热键监听（设置页按键捕获期间暂停，防止触发当前热键或自身冲突）。
+    pub fn set_paused(&self, paused: bool) {
+        let prev = self.paused.swap(paused, Ordering::SeqCst);
+        if prev != paused {
+            platform::notify_update(&self.hwnd);
+        }
+    }
+
     pub fn take_fired(&self) -> bool {
         self.fired.swap(false, Ordering::SeqCst)
     }
@@ -375,7 +358,18 @@ impl Hotkey {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::time::Duration;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, RegisterHotKey, UnregisterHotKey,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer,
+        PostMessageW, RegisterClassW, SetTimer, TranslateMessage, MSG, WM_HOTKEY, WM_TIMER,
+        WNDCLASSW,
+    };
 
     const VK_CONTROL: i32 = 0x11;
     const VK_MENU: i32 = 0x12; // Alt
@@ -383,40 +377,168 @@ mod platform {
     const VK_LWIN: i32 = 0x5B;
     const VK_RWIN: i32 = 0x5C;
 
-    #[link(name = "user32")]
-    extern "system" {
-        fn GetAsyncKeyState(v_key: i32) -> i16;
+    const WM_SS_HK_UPDATE: u32 = 0x8000 + 0x31;
+    const HOTKEY_ID: i32 = 0x5348;
+    const TIMER_ID: usize = 1;
+
+    struct HkState {
+        ctx: egui::Context,
+        fired: Arc<AtomicBool>,
+        combo: Arc<AtomicU64>,
+        paused: Arc<AtomicBool>,
+        prev_main: AtomicBool,
     }
 
+    static HK_STATE: OnceLock<Arc<HkState>> = OnceLock::new();
+
     fn key_down(vk: i32) -> bool {
-        // 最高位为 1 = 当前正按着
         unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
     }
 
-    pub fn spawn(ctx: egui::Context, fired: Arc<AtomicBool>, combo: Arc<AtomicU64>) {
+    pub fn win_key_down() -> bool {
+        key_down(VK_LWIN) || key_down(VK_RWIN)
+    }
+
+    pub fn notify_update(hwnd: &Arc<AtomicIsize>) {
+        let h = hwnd.load(Ordering::SeqCst);
+        if h != 0 {
+            unsafe {
+                PostMessageW(h as HWND, WM_SS_HK_UPDATE, 0, 0);
+            }
+        }
+    }
+
+    unsafe fn apply_registration(hwnd: HWND, st: &HkState) {
+        let _ = UnregisterHotKey(hwnd, HOTKEY_ID);
+        st.prev_main.store(false, Ordering::SeqCst);
+        if st.paused.load(Ordering::SeqCst) {
+            KillTimer(hwnd, TIMER_ID);
+            return;
+        }
+        let c = HotkeyCombo::unpack(st.combo.load(Ordering::SeqCst));
+        let mods = super::win_probe::to_mods(c);
+        if RegisterHotKey(hwnd, HOTKEY_ID, mods, c.vk) != 0 {
+            KillTimer(hwnd, TIMER_ID);
+        } else {
+            // 被占用的热键降级走 30ms 轮询
+            SetTimer(hwnd, TIMER_ID, 30, None);
+        }
+    }
+
+    unsafe extern "system" fn hk_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_HOTKEY if wparam as i32 == HOTKEY_ID => {
+                if let Some(st) = HK_STATE.get() {
+                    if !st.paused.load(Ordering::SeqCst) {
+                        crate::winvis::toggle();
+                        st.fired.store(true, Ordering::SeqCst);
+                        st.ctx.request_repaint();
+                    }
+                }
+                0
+            }
+            WM_SS_HK_UPDATE => {
+                if let Some(st) = HK_STATE.get() {
+                    apply_registration(hwnd, st);
+                }
+                0
+            }
+            WM_TIMER if wparam == TIMER_ID => {
+                if let Some(st) = HK_STATE.get() {
+                    if st.paused.load(Ordering::SeqCst) {
+                        st.prev_main.store(false, Ordering::SeqCst);
+                        return 0;
+                    }
+                    let c = HotkeyCombo::unpack(st.combo.load(Ordering::SeqCst));
+                    // 严格精确匹配修饰键集合，避免 Alt+Q 被 Ctrl+Alt+Q 误触发
+                    let mods_exact = (key_down(VK_CONTROL) == c.ctrl)
+                        && (key_down(VK_MENU) == c.alt)
+                        && (key_down(VK_SHIFT) == c.shift)
+                        && ((key_down(VK_LWIN) || key_down(VK_RWIN)) == c.win);
+                    let down = key_down(c.vk as i32);
+                    let prev = st.prev_main.swap(down, Ordering::SeqCst);
+                    if down && !prev && mods_exact {
+                        crate::winvis::toggle();
+                        st.fired.store(true, Ordering::SeqCst);
+                        st.ctx.request_repaint();
+                    }
+                }
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    pub fn spawn(
+        ctx: egui::Context,
+        fired: Arc<AtomicBool>,
+        combo: Arc<AtomicU64>,
+        paused: Arc<AtomicBool>,
+        hwnd_out: Arc<AtomicIsize>,
+    ) {
+        let st = Arc::new(HkState {
+            ctx,
+            fired,
+            combo,
+            paused,
+            prev_main: AtomicBool::new(false),
+        });
+        let _ = HK_STATE.set(st);
         std::thread::Builder::new()
             .name("shunseek-hotkey".into())
-            .spawn(move || {
-                let mut prev_main = false;
+            .spawn(move || unsafe {
+                let hmod = GetModuleHandleW(std::ptr::null());
+                let class_name: Vec<u16> = "ShunSeekHotkeyWindow"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let wc = WNDCLASSW {
+                    style: 0,
+                    lpfnWndProc: Some(hk_wndproc),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: hmod,
+                    hIcon: 0,
+                    hCursor: 0,
+                    hbrBackground: 0,
+                    lpszMenuName: std::ptr::null(),
+                    lpszClassName: class_name.as_ptr(),
+                };
+                let _ = RegisterClassW(&wc);
+                let hwnd = CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    class_name.as_ptr(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    -3isize as HWND,
+                    0,
+                    hmod,
+                    std::ptr::null(),
+                );
+                if hwnd == 0 {
+                    return;
+                }
+                hwnd_out.store(hwnd, Ordering::SeqCst);
+                if let Some(st) = HK_STATE.get() {
+                    apply_registration(hwnd, st);
+                }
+                let mut msg: MSG = std::mem::zeroed();
                 loop {
-                    let c = HotkeyCombo::unpack(combo.load(Ordering::Relaxed));
-                    let mods_down = (!c.ctrl || key_down(VK_CONTROL))
-                        && (!c.alt || key_down(VK_MENU))
-                        && (!c.shift || key_down(VK_SHIFT))
-                        && (!c.win || key_down(VK_LWIN) || key_down(VK_RWIN));
-                    let down = key_down(c.vk as i32);
-                    if down && !prev_main && mods_down {
-                        // 当场切换可见性（v0.1.12）：决策现读 OS
-                        // 状态在本线程完成，窗口显/藏与 UI 线程
-                        // 是否醒来无关；fired 标志只剩副作用用途。
-                        crate::winvis::toggle();
-                        fired.store(true, Ordering::SeqCst);
-                        ctx.request_repaint();
+                    let r = GetMessageW(&mut msg, 0, 0, 0);
+                    if r <= 0 {
+                        break;
                     }
-                    prev_main = down;
-                    // 轮询间隔 30ms（v0.1.6 帧率纪律：只在按下边沿
-                    // request_repaint，间隔不小于 30ms，空转不唤醒 UI）
-                    std::thread::sleep(Duration::from_millis(30));
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
                 }
             })
             .ok();
@@ -427,7 +549,18 @@ mod platform {
 mod platform {
     use super::*;
 
-    pub fn spawn(_ctx: egui::Context, _fired: Arc<AtomicBool>, _combo: Arc<AtomicU64>) {
-        // 无全局热键：见模块头注释。
+    pub fn win_key_down() -> bool {
+        false
+    }
+
+    pub fn notify_update(_hwnd: &Arc<AtomicIsize>) {}
+
+    pub fn spawn(
+        _ctx: egui::Context,
+        _fired: Arc<AtomicBool>,
+        _combo: Arc<AtomicU64>,
+        _paused: Arc<AtomicBool>,
+        _hwnd_out: Arc<AtomicIsize>,
+    ) {
     }
 }

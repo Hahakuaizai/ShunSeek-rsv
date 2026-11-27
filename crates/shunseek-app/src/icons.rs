@@ -51,7 +51,11 @@ pub fn key_for(name: &str, path: &str, category: Category) -> String {
     match category {
         Category::Folder | Category::InstallDir => "folder".to_string(),
         Category::App | Category::Shortcut | Category::Executable => {
-            format!("path:{path}")
+            if path.is_empty() {
+                "file".to_string()
+            } else {
+                format!("path:{path}")
+            }
         }
         _ => match name.rfind('.') {
             Some(p) if p > 0 => name[p..].to_lowercase(),
@@ -60,22 +64,20 @@ pub fn key_for(name: &str, path: &str, category: Category) -> String {
     }
 }
 
-/// 后台线程取回的一张图标：(宽, 高, RGBA 字节)。
-type Pixels = (u32, u32, Vec<u8>);
+/// 后台线程取回的一张图标：(宽, 高, RGBA 字节, 是否预乘 alpha)。
+type Pixels = (u32, u32, Vec<u8>, bool);
 
 pub struct IconCache {
     /// key → 纹理；None = 已取过但失败 / 无图标，恒回退色块。
     textures: HashMap<String, Option<egui::TextureHandle>>,
-    /// 已发过请求的 key（防重复发）。非 Windows 下无人用，属预期闲置。
+    /// 正在途中的请求 key（收到结果后移除，避免上限被腰斩）。
     #[allow(dead_code)]
     requested: HashSet<String>,
-    /// 取失败次数（v0.1.9 重试用）：<3 次不焊死空结果，允许下次
-    /// 查询重发；满 3 次才把 None 写进 textures 定格。
+    /// 累计发出的请求次数（供 stats 显示）。
+    requested_total: usize,
     attempts: HashMap<String, u8>,
     tx: Option<Sender<String>>,
     rx: Option<Receiver<(String, Option<Pixels>)>>,
-    /// 可观测性计数（v0.1.6）：收割结果时累计，设置窗口「索引」区展示
-    /// 「图标：已加载 X · 失败 Y」，真机排障时一眼定位取图是否全灭。
     loaded_count: usize,
     failed_count: usize,
 }
@@ -86,6 +88,7 @@ impl IconCache {
         IconCache {
             textures: HashMap::new(),
             requested: HashSet::new(),
+            requested_total: 0,
             attempts: HashMap::new(),
             tx,
             rx,
@@ -94,30 +97,23 @@ impl IconCache {
         }
     }
 
-    /// 计数三元组：(已发出请求数, 已加载成功数, 已知失败数)。
-    /// 设置窗口「索引」区用它显示图标管线健康度。
     pub fn stats(&self) -> (usize, usize, usize) {
-        (self.requested.len(), self.loaded_count, self.failed_count)
+        (self.requested_total, self.loaded_count, self.failed_count)
     }
 
-    /// 查 key 的图标纹理：命中（含已知失败）直接返回；未命中则发请求
-    /// 并返回 None（本帧回退色块）。顺带收割后台线程已取回的结果。
     pub fn texture(&mut self, ctx: &egui::Context, key: &str) -> Option<egui::TextureHandle> {
-        // 收割结果：RGBA → egui 纹理（只能在 UI 线程做，所以在这里建）
         if let Some(rx) = &self.rx {
             let mut arrived: Vec<(String, Option<Pixels>)> = Vec::new();
             while let Ok(item) = rx.try_recv() {
                 arrived.push(item);
             }
             for (k, px) in arrived {
+                self.requested.remove(&k);
                 match &px {
                     Some(_) => self.loaded_count += 1,
                     None => self.failed_count += 1,
                 }
                 if px.is_none() {
-                    // 失败重试（v0.1.9）：满 3 次才定格空结果；
-                    // 未满则撤掉在途标记，下次查询可重发（防
-                    // Shell 忙一瞬导致永久灰块，对齐原版）。
                     let n = {
                         let e = self.attempts.entry(k.clone()).or_insert(0);
                         *e += 1;
@@ -125,16 +121,21 @@ impl IconCache {
                     };
                     if n >= 3 {
                         self.textures.insert(k, None);
-                    } else {
-                        self.requested.remove(&k);
                     }
                     continue;
                 }
-                let handle = px.map(|(w, h, rgba)| {
-                    let img = egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        &rgba,
-                    );
+                let handle = px.map(|(w, h, rgba, premul)| {
+                    let img = if premul {
+                        egui::ColorImage::from_rgba_premultiplied(
+                            [w as usize, h as usize],
+                            &rgba,
+                        )
+                    } else {
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &rgba,
+                        )
+                    };
                     ctx.load_texture(
                         format!("ss-icon-{k}"),
                         img,
@@ -147,13 +148,13 @@ impl IconCache {
         if let Some(h) = self.textures.get(key) {
             return h.clone();
         }
-        // 未命中：发请求（同 key 只发一次；缓存 + 在途都算数，满了停增）
         if self.textures.len() + self.requested.len() < MAX_ICON_KEYS
             && !self.requested.contains(key)
         {
             if let Some(tx) = &self.tx {
                 if tx.send(key.to_string()).is_ok() {
                     self.requested.insert(key.to_string());
+                    self.requested_total += 1;
                 }
             }
         }
@@ -319,7 +320,7 @@ mod win {
                 if hr != 0 || hbm == 0 {
                     return None;
                 }
-                let px = hbitmap_to_rgba(hbm);
+                let px = hbitmap_to_rgba(hbm).map(|(w, h, buf)| (w, h, buf, true));
                 DeleteObject(hbm);
                 px
             })();
@@ -552,7 +553,7 @@ mod win {
         if ok == 0 || info.hIcon == 0 {
             return None;
         }
-        let px = unsafe { hicon_to_rgba(info.hIcon) };
+        let px = unsafe { hicon_to_rgba(info.hIcon) }.map(|(w, h, buf)| (w, h, buf, false));
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon(info.hIcon);
         }
@@ -563,7 +564,7 @@ mod win {
     /// hbitmap_to_rgba；位图句柄用完 DeleteObject。
     unsafe fn hicon_to_rgba(
         hicon: windows_sys::Win32::UI::WindowsAndMessaging::HICON,
-    ) -> Option<Pixels> {
+    ) -> Option<(u32, u32, Vec<u8>)> {
         use windows_sys::Win32::Graphics::Gdi::DeleteObject;
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
 
@@ -590,7 +591,7 @@ mod win {
     /// 调用方）。HICON 路径与 IShellItemImageFactory 路径共用。
     unsafe fn hbitmap_to_rgba(
         hbm: windows_sys::Win32::Graphics::Gdi::HBITMAP,
-    ) -> Option<Pixels> {
+    ) -> Option<(u32, u32, Vec<u8>)> {
         use std::ffi::c_void;
         use windows_sys::Win32::Graphics::Gdi::{
             GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
