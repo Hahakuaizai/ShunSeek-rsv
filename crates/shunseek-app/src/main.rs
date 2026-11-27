@@ -489,15 +489,38 @@ impl Palette {
 // ---------------------------------------------------------------- 设置存储
 
 /// 全部可持久化设置（v0.1.5 统一）：数据目录 settings.txt，key=value 行。
-/// 键：theme / view / hide_on_close / hotkey / result_limit / fold_demoted /
+/// 键：theme / view / close_action / hotkey / result_limit / fold_demoted /
 /// hide_outside（点外自动隐藏，缺省 0 = 关：窗口点外面保持原样）。
 /// 开机自启动不入文件（以注册表实际状态为准，见 autostart.rs）。
 /// load 时 theme/view 在 settings.txt 缺省时回退老版 theme.txt /
 /// view.txt 的值（老用户无感迁移）；save 只写 settings.txt，
 /// 老文件留着不动。
-/// 关窗行为（v0.1.6 用户钉死）：✕ 恒最小化到托盘，无条件，无设置项；
-/// 进程唯一正常退出 = 托盘菜单「退出」。旧 settings.txt 里的
-/// close_action / hide_on_close 键加载时直接忽略（不读不写）。
+/// 关窗行为（v0.1.21 起可配）：close_action = minimize（缺省，✕ 收进
+/// 托盘）/ exit（✕ 直接结束进程）。系统 WM_CLOSE / 任务栏「关闭窗口」
+/// 与自绘 ✕ 走同一判定；托盘菜单「退出」永远退出，不受本项影响。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    MinimizeToTray,
+    Exit,
+}
+
+impl CloseAction {
+    fn key_str(self) -> &'static str {
+        match self {
+            CloseAction::MinimizeToTray => "minimize",
+            CloseAction::Exit => "exit",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "minimize" | "tray" => Some(CloseAction::MinimizeToTray),
+            "exit" | "quit" => Some(CloseAction::Exit),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Settings {
     theme: Theme,
@@ -510,6 +533,8 @@ struct Settings {
     /// 表现为「点别的窗口软件连同任务栏图标一起消失」，对把它
     /// 当常驻小工具用的场景是干扰，故改为用户显式开启。
     hide_outside: bool,
+    /// ✕ 的行为（v0.1.21，键 close_action，缺省最小化到托盘）。
+    close_action: CloseAction,
     /// 搜索范围选中集（scope_* 键）：预设键名 / 盘符 / 自定义完整路径。
     scope_presets: Vec<String>,
     scope_drives: Vec<char>,
@@ -615,9 +640,8 @@ fn load_settings() -> Settings {
     Settings {
         theme,
         view,
-        // close_action / hide_on_close 键：v0.1.6 起忽略（✕ 恒到托盘）
-        // 用户存过的值优先（解析成功就用，绝不覆盖）；没有/解析
-        // 失败才走 v0.1.8 候选链解析默认（Ctrl+Alt+Space 起）。
+        // 唤醒热键：老档里存过的值优先（解析成功就用，绝不覆盖）；
+        // 没有/解析失败才走 v0.1.8 候选链解析默认（Ctrl+Alt+Space 起）。
         hotkey: kv
             .get("hotkey")
             .and_then(|s| hotkey::HotkeyCombo::parse(s))
@@ -629,6 +653,12 @@ fn load_settings() -> Settings {
             .unwrap_or(RESULT_LIMIT),
         fold_demoted: bool_or("fold_demoted", true),
         hide_outside: bool_or("hide_outside", false),
+        // v0.1.21：close_action 重新生效（minimize / exit），
+        // 老档里存过的值能用就用；解析不出按缺省最小化到托盘。
+        close_action: kv
+            .get("close_action")
+            .and_then(|s| CloseAction::parse(s))
+            .unwrap_or(CloseAction::MinimizeToTray),
         scope_presets,
         scope_drives,
         scope_custom,
@@ -2169,6 +2199,8 @@ struct ShunSeekApp {
     result_limit: usize,
     fold_demoted: bool,
     hide_outside: bool,
+    /// ✕ 的行为（v0.1.21）：最小化到托盘 / 退出进程，设置里可选。
+    close_action: CloseAction,
     /// 最近一次换入索引的条数与来源摘要完整版（设置「索引」分区
     /// 只读显示用；状态栏展示的是截断版）。
     index_count: usize,
@@ -2509,6 +2541,7 @@ impl ShunSeekApp {
             result_limit: settings.result_limit,
             fold_demoted: settings.fold_demoted,
             hide_outside: settings.hide_outside,
+            close_action: settings.close_action,
             index_count: initial_index_count,
             index_summary: String::new(),
             store_gen: 0,
@@ -2770,6 +2803,22 @@ impl ShunSeekApp {
     /// 此前六版走 ViewportCommand::Visible 的老路已整段删除。
     /// 非 Windows 无 Win32 可调，同一调用点以 ViewportCommand
     /// 兜底（演示平台机制，不进 Windows 链）。
+    /// ✕ / 系统 WM_CLOSE 的统一入口（v0.1.21）：按设置决定藏到托盘
+    /// 还是退出进程。托盘菜单「退出」不走这里——它无条件退出。
+    fn request_close(&mut self, ctx: &egui::Context) {
+        match self.close_action {
+            CloseAction::MinimizeToTray => self.hide(ctx),
+            CloseAction::Exit => {
+                // 与托盘「退出」同一条链：先撤图标再发 Close，
+                // 看门狗兜底防事件循环卡住。
+                self.tray.shutdown();
+                self.allow_exit = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+                spawn_exit_watchdog();
+            }
+        }
+    }
+
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
         // 设置窗是 immediate viewport，靠主窗每帧 update 驱动；主窗
@@ -3336,7 +3385,7 @@ impl ShunSeekApp {
     /// 连写（如 CD）；scope_custom 一行一个完整路径（可重复多行）。
     fn save_settings(&self) {
         let mut text = format!(
-            "theme={}\nview={}\nhotkey={}\nresult_limit={}\nfold_demoted={}\nhide_outside={}\n",
+            "theme={}\nview={}\nhotkey={}\nresult_limit={}\nfold_demoted={}\nhide_outside={}\nclose_action={}\n",
             match self.theme {
                 Theme::Dark => "dark",
                 Theme::Light => "light",
@@ -3349,6 +3398,7 @@ impl ShunSeekApp {
             self.result_limit,
             self.fold_demoted as u8,
             self.hide_outside as u8,
+            self.close_action.key_str(),
         );
         let mut presets: Vec<&str> = self.scope_presets.iter().map(|s| s.as_str()).collect();
         presets.sort_unstable();
@@ -4660,8 +4710,8 @@ impl ShunSeekApp {
     /// （书眉行区 46→36、搜索框 54→44）：标题区只占 28，省出的
     /// 高度全给内容区。拖动不再由本区控件负责——标题区只登记
     /// Sense::hover，拖动/双击最大化由 handle_window_press 手判
-    /// （标题区不进 blockers、其余按钮全进，见该函数）。✕ = 隐藏
-    /// 到托盘（v0.1.6 用户钉死：无条件，进程只从托盘菜单退出）。
+    /// （标题区不进 blockers、其余按钮全进，见该函数）。✕ 按设置
+    /// 决定收进托盘还是退出（v0.1.21 可配，缺省到托盘）。
     fn draw_header(&mut self, ui: &mut egui::Ui) {
         let pal = self.display_pal;
         let ctx = ui.ctx().clone();
@@ -4707,10 +4757,13 @@ impl ShunSeekApp {
                 let close_resp = header_tool_button(ui, pal, WinGlyph::Close);
                 self.blockers_cur.push(close_resp.rect);
                 if close_resp
-                    .on_hover_text("关闭（最小化到托盘）")
+                    .on_hover_text(match self.close_action {
+                        CloseAction::MinimizeToTray => "关闭（最小化到托盘）",
+                        CloseAction::Exit => "关闭（退出程序）",
+                    })
                     .clicked()
                 {
-                    self.hide(&ctx);
+                    self.request_close(&ctx);
                 }
                 ui.add_space(6.0);
                 let max_glyph = if self.maximized {
@@ -7617,14 +7670,51 @@ impl ShunSeekApp {
             }
         }
         ui.add_space(4.0);
-        // 关窗行为（v0.1.6 用户钉死，不再是设置项）：✕ 恒最小化到
-        // 托盘，进程的唯一正常退出 = 托盘菜单「退出」。只放说明。
+        // 关窗行为（v0.1.21 新增设置项）：点窗口关闭按钮时最小化到托盘
+        // 还是直接退出进程。缺省最小化到托盘（与 v0.1.6 以来的行为一致）。
+        let close_idx = match self.close_action {
+            CloseAction::MinimizeToTray => 0usize,
+            CloseAction::Exit => 1usize,
+        };
+        let mut new_close = None;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("点击窗口关闭按钮时")
+                    .size(13.5)
+                    .color(pal.name_text),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                new_close = ss_segments(
+                    ui,
+                    pal,
+                    "close_action",
+                    &["最小化到托盘", "退出程序"],
+                    close_idx,
+                );
+            });
+        });
+        if let Some(i) = new_close {
+            self.close_action = if i == 0 {
+                CloseAction::MinimizeToTray
+            } else {
+                CloseAction::Exit
+            };
+            self.save_settings();
+        }
+        ui.add_space(2.0);
         ui.label(
-            RichText::new("关闭窗口（✕）将最小化到托盘；退出程序请用托盘菜单的「退出」。")
-                .size(11.0)
-                .color(pal.path_text),
+            RichText::new(match self.close_action {
+                CloseAction::MinimizeToTray => {
+                    "收进托盘，程序继续常驻；完全退出请用托盘菜单的「退出」。"
+                }
+                CloseAction::Exit => {
+                    "直接结束进程并移除托盘图标；下次需重新启动。"
+                }
+            })
+            .size(11.0)
+            .color(pal.path_text),
         );
-        ui.add_space(6.0);
+        ui.add_space(10.0);
         // 唤醒热键：显示当前组合 +「修改」进捕获态；候选立即跑
         // 冲突检测（名单 + RegisterHotKey 探测），通过才保存生效。
         ui.label(RichText::new("唤醒热键").size(12.5).color(pal.name_text));
@@ -8529,13 +8619,18 @@ impl eframe::App for ShunSeekApp {
                 }
             }
         }
-        // ✕ 恒隐藏到托盘（v0.1.6 用户钉死，无条件）：窗口 ✕ 按钮、
-        // 系统 WM_CLOSE、任务栏右键「关闭窗口」都到这里，一律取消
-        // 关闭并隐藏；进程的唯一正常退出 = 托盘菜单「退出」
-        // （allow_exit 只由那条路径置位，它随后自己发 Close）。
+        // ✕ 的行为可配（v0.1.21）：窗口 ✕ 按钮、系统 WM_CLOSE、任务栏
+        // 右键「关闭窗口」都到这里。默认最小化到托盘（CancelClose +
+        // hide）；设成「退出」则与托盘「退出」同路，直接结束进程。
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_exit {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.hide(ctx);
+            if self.close_action == CloseAction::Exit {
+                self.tray.shutdown();
+                self.allow_exit = true;
+                spawn_exit_watchdog();
+            } else {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.hide(ctx);
+            }
         }
 
         // （可见性/最小化影子已在帧首 sync_shadow_from_os 与
