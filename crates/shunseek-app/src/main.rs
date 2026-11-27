@@ -445,27 +445,43 @@ struct Settings {
     /// 搜索范围选中集（scope_* 键）：预设键名 / 盘符 / 自定义完整路径。
     scope_presets: Vec<String>,
     scope_drives: Vec<char>,
+    /// 已添加的自定义文件夹全集（含未选中的）。
     scope_custom: Vec<String>,
+    /// 其中真正参与搜索的那部分（可多选）。
+    scope_custom_sel: Vec<String>,
 }
 
 fn load_settings() -> Settings {
     let dir = data_dir();
     let mut kv: HashMap<String, String> = HashMap::new();
     let mut scope_custom: Vec<String> = Vec::new();
+    let mut scope_custom_sel: Vec<String> = Vec::new();
+    let mut has_custom_sel_key = false;
     if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
         for line in text.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 let (k, v) = (k.trim(), v.trim());
-                // scope_custom 可重复多行（一行一个文件夹），单独收集
+                // scope_custom / scope_custom_sel 可重复多行（一行一个
+                // 文件夹），单独收集。前者是全集，后者是选中集。
                 if k == "scope_custom" {
                     if !v.is_empty() {
                         scope_custom.push(v.to_string());
+                    }
+                } else if k == "scope_custom_sel" {
+                    has_custom_sel_key = true;
+                    if !v.is_empty() {
+                        scope_custom_sel.push(v.to_string());
                     }
                 } else {
                     kv.insert(k.to_string(), v.to_string());
                 }
             }
         }
+    }
+    // 旧档只有 scope_custom（那时全部自定义都参与搜索）：没有
+    // scope_custom_sel 键就把它们全当成选中，保持旧行为。
+    if !has_custom_sel_key {
+        scope_custom_sel = scope_custom.clone();
     }
     // 范围缺省（settings.txt 里没有任何 scope 键）= 全部：
     // 预设全选 + 现存磁盘全选。有键则按存的值（选中集语义见工具栏）。
@@ -548,6 +564,7 @@ fn load_settings() -> Settings {
         scope_presets,
         scope_drives,
         scope_custom,
+        scope_custom_sel,
     }
 }
 
@@ -1780,7 +1797,15 @@ struct ShunSeekApp {
     /// 范围筛选选中集：预设键名 / 盘符 / 自定义文件夹（完整路径）。
     scope_presets: HashSet<String>,
     scope_drives: HashSet<char>,
+    /// 已添加的自定义文件夹全集（面板逐行列出，含未选中的）。
     scope_custom: Vec<String>,
+    /// 其中参与搜索的那几个（可多选；面板上点行名即切换）。
+    scope_custom_sel: HashSet<String>,
+    /// 自定义行「第一次单击」的快照（路径, 点击前是否选中, 预设, 磁盘,
+    /// 选中集）。双击的第二下到达时用它回滚第一下造成的范围变动——
+    /// egui 里双击必然先产生一次 clicked，不回滚就等于「双击顺手改了
+    /// 选中状态」。
+    scope_click_memo: Option<(String, bool, HashSet<String>, HashSet<char>, HashSet<String>)>,
     /// 当前主题（深/浅）；全部绘制取色走 theme.palette()。
     theme: Theme,
     /// 结果展示模式（列表/宫格），view.txt 持久化。
@@ -2127,6 +2152,8 @@ impl ShunSeekApp {
             scope_presets: settings.scope_presets.iter().cloned().collect(),
             scope_drives: settings.scope_drives.iter().copied().collect(),
             scope_custom: settings.scope_custom.clone(),
+            scope_custom_sel: settings.scope_custom_sel.iter().cloned().collect(),
+            scope_click_memo: None,
             theme,
             view_mode,
             grid_cols: 6,
@@ -2988,6 +3015,21 @@ impl ShunSeekApp {
         for c in &self.scope_custom {
             text.push_str(&format!("scope_custom={c}\n"));
         }
+        let mut sel: Vec<String> = self
+            .scope_custom
+            .iter()
+            .filter(|c| self.scope_custom_sel.contains(*c))
+            .cloned()
+            .collect();
+        sel.sort_unstable();
+        // 一个都没选中也要留一个空行：加载层靠「有没有 sel 键」区分
+        // 「旧档（全部自定义都参与）」和「用户显式一个都不选」。
+        if sel.is_empty() && !self.scope_custom.is_empty() {
+            text.push_str("scope_custom_sel=\n");
+        }
+        for c in &sel {
+            text.push_str(&format!("scope_custom_sel={c}\n"));
+        }
         let _ = std::fs::write(self.data_dir.join("settings.txt"), text);
     }
 
@@ -3025,7 +3067,12 @@ impl ShunSeekApp {
         for d in &self.scope_drives {
             roots.push(format!("{d}:\\"));
         }
-        roots.extend(self.scope_custom.iter().cloned());
+        roots.extend(
+            self.scope_custom
+                .iter()
+                .filter(|c| self.scope_custom_sel.contains(*c))
+                .cloned(),
+        );
         if roots.is_empty() {
             None
         } else {
@@ -3050,7 +3097,9 @@ impl ShunSeekApp {
             names.push(format!("{d}:"));
         }
         for c in &self.scope_custom {
-            names.push(dir_last(c));
+            if self.scope_custom_sel.contains(c) {
+                names.push(dir_last(c));
+            }
         }
         match names.len() {
             0 => "全部".to_string(),
@@ -4809,6 +4858,7 @@ impl ShunSeekApp {
         let mut presets = self.scope_presets.clone();
         let mut drives = self.scope_drives.clone();
         let mut custom = self.scope_custom.clone();
+        let mut sel: HashSet<String> = self.scope_custom_sel.clone();
         let mut changed = false;
         let mut add_folder = false;
         let area = egui::Area::new(egui::Id::new("ss_scope_panel"))
@@ -4904,16 +4954,93 @@ impl ShunSeekApp {
                     });
                     ui.add_space(11.0);
                     section_title(ui, pal, "自定义文件夹");
-                    // v0.1.15：胶囊流 → 通栏行（图标 + 名称 + 右侧 ×）。
-                    // 长路径名在胶囊里会把整排挤得大小不一，行式稳定。
+                    ui.label(
+                        RichText::new("点名称选中/取消（可多选），双击在资源管理器打开")
+                            .size(11.0)
+                            .color(pal.path_text),
+                    );
+                    ui.add_space(5.0);
+                    // v0.1.16：自定义文件夹支持多选 —— 每行是独立开关，
+                    // 点名称选中/取消，选中几个就一起搜几个；双击行直接
+                    // 在资源管理器里打开该文件夹。旧版只能选一个、且点了
+                    // 没反馈，用户以为加完就在搜，实际还在全盘。
                     let mut remove: Option<usize> = None;
-                    for (i, path) in custom.iter().enumerate() {
-                        if scope_row(ui, pal, &dir_last(path), path, width - 32.0) {
-                            remove = Some(i);
+                    let mut toggled: Option<String> = None;
+                    let mut open_dir: Option<String> = None;
+                    // 跨帧保留「第一次单击」快照，双击时回滚。
+                    let mut memo = self.scope_click_memo.take();
+                    egui::ScrollArea::vertical()
+                        .id_salt("ss_scope_custom_scroll")
+                        .max_height(196.0)
+                        .auto_shrink([false, true])
+                        .drag_to_scroll(false)
+                        .show(ui, |ui| {
+                            ui.set_width(width - 32.0);
+                            for (i, path) in custom.iter().enumerate() {
+                                let selected = !all_now && sel.contains(path);
+                                let (click, dbl, close) = scope_row(
+                                    ui,
+                                    pal,
+                                    &dir_last(path),
+                                    path,
+                                    width - 32.0,
+                                    selected,
+                                );
+                                if close {
+                                    remove = Some(i);
+                                } else if dbl {
+                                    // 双击：把第一下 click 已经改过的范围
+                                    // 状态原样退回，只保留「打开文件夹」。
+                                    if let Some((mp, _was, p0, d0, s0)) = memo.take() {
+                                        if mp == *path {
+                                            presets = p0;
+                                            drives = d0;
+                                            sel = s0;
+                                            changed = true;
+                                        }
+                                    }
+                                    open_dir = Some(path.clone());
+                                } else if click {
+                                    memo = Some((
+                                        path.clone(),
+                                        sel.contains(path),
+                                        presets.clone(),
+                                        drives.clone(),
+                                        sel.clone(),
+                                    ));
+                                    toggled = Some(path.clone());
+                                }
+                            }
+                        });
+                    self.scope_click_memo = memo;
+                    if let Some(i) = remove {
+                        let p = custom.remove(i);
+                        sel.remove(&p);
+                        changed = true;
+                    }
+                    if let Some(p) = open_dir {
+                        #[cfg(windows)]
+                        {
+                            let _ = std::process::Command::new("explorer")
+                                .arg(&p)
+                                .spawn();
                         }
                     }
-                    if let Some(i) = remove {
-                        custom.remove(i);
+                    if let Some(p) = toggled {
+                        if all_now {
+                            // 从「全部」切到自定义：清掉预设与磁盘，
+                            // 这一行进选中集（其余已选的自定义保留）。
+                            presets.clear();
+                            drives.clear();
+                            sel.insert(p);
+                        } else if !sel.remove(&p) {
+                            sel.insert(p);
+                        }
+                        changed = true;
+                    }
+                    // 一个根都不剩 → 回「全部」，别留空范围当全盘用。
+                    if sel.is_empty() && presets.is_empty() && drives.is_empty() {
+                        scope_select_all(&mut presets, &mut drives);
                         changed = true;
                     }
                     let can_add = cfg!(windows);
@@ -4932,10 +5059,22 @@ impl ShunSeekApp {
             #[cfg(windows)]
             {
                 let _guard = clickwatch::SuspendGuard::new();
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    let s = p.to_string_lossy().into_owned();
-                    if !custom.contains(&s) {
-                        custom.push(s);
+                // v0.1.16：多选对话框，一次可以加好几个文件夹。
+                if let Some(paths) = rfd::FileDialog::new().pick_folders() {
+                    let mut added = false;
+                    for p in paths {
+                        let s = p.to_string_lossy().into_owned();
+                        if !custom.contains(&s) {
+                            custom.push(s.clone());
+                            sel.insert(s);
+                            added = true;
+                        }
+                    }
+                    // 新加的文件夹立刻进入搜索范围：清掉「全部」，
+                    // 否则加完一看还是全盘结果，等于白加。
+                    if added {
+                        presets.clear();
+                        drives.clear();
                         changed = true;
                     }
                 }
@@ -4945,6 +5084,7 @@ impl ShunSeekApp {
             self.scope_presets = presets;
             self.scope_drives = drives;
             self.scope_custom = custom;
+            self.scope_custom_sel = sel;
             self.save_settings();
             self.schedule_search();
         }
@@ -6572,32 +6712,53 @@ fn type_cell(
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// 自定义文件夹行（v0.1.15）：通栏 32 高、圆角 8，左 15px 细线文件夹
-/// 图标 + 名称，右端 ✕ 删除区（hover 转朱砂）。返回是否点了删除。
+/// 自定义文件夹行（v0.1.16）：通栏 34 高、圆角 9，左文件夹图标 +
+/// 名称，右端 ✕ 删除区。点名称 = 切换该行是否参与搜索（可多选），
+/// 双击 = 在资源管理器打开该文件夹。
+/// 返回 (单击, 双击, 点了 ✕)。
 fn scope_row(
     ui: &mut egui::Ui,
     pal: Palette,
     label: &str,
     full_path: &str,
     w: f32,
-) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), egui::Sense::click());
+    selected: bool,
+) -> (bool, bool, bool) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), egui::Sense::click());
     let painter = ui.painter_at(rect);
-    let rr = Rounding::same(8.0);
-    if resp.hovered() {
+    let rr = Rounding::same(9.0);
+    if selected {
+        painter.rect_filled(rect, rr, pal.pill_fill);
+        painter.rect_stroke(rect, rr, Stroke::new(1.0_f32, pal.pill_stroke));
+    } else if resp.hovered() {
         painter.rect_filled(rect, rr, pal.chip_hover_fill);
     }
+    // 选中态左侧再来一根 3px 竖条，和其他"已选中"语言对齐。
+    if selected {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 3.0, rect.center().y - 9.0),
+                Vec2::new(3.0, 18.0),
+            ),
+            Rounding::same(1.5),
+            pal.accent,
+        );
+    }
     let glyph = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 15.0, rect.center().y),
-        Vec2::splat(13.0),
+        egui::pos2(rect.left() + 18.0, rect.center().y),
+        Vec2::splat(14.0),
     );
-    paint_folder_glyph(&painter, glyph, pal.text_mid);
+    paint_folder_glyph(
+        &painter,
+        glyph,
+        if selected { pal.accent } else { pal.text_mid },
+    );
     painter.text(
-        egui::pos2(rect.left() + 28.0, rect.center().y),
+        egui::pos2(rect.left() + 32.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(11.5),
-        pal.text_mid,
+        egui::FontId::proportional(12.0),
+        if selected { pal.accent } else { pal.text_mid },
     );
     let x_rect = egui::Rect::from_min_size(
         egui::pos2(rect.right() - 26.0, rect.center().y - 8.0),
@@ -6623,8 +6784,11 @@ fn scope_row(
         [c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)],
         st,
     );
-    let _ = resp.on_hover_text(full_path.to_string());
-    xr.clicked()
+    // 先取点击态再 on_hover_text：后者按值消费 Response。
+    let row_click = resp.clicked();
+    let row_dbl = resp.double_clicked();
+    let _ = resp.on_hover_text(format!("{full_path}\n单击选中，双击打开"));
+    (row_click, row_dbl, xr.clicked())
 }
 
 /// 通栏虚线按钮（v0.1.15）：32 高，「＋ 添加文件夹」这类动作入口
@@ -7710,6 +7874,29 @@ impl eframe::App for ShunSeekApp {
                 "type" => self.expanded_filter = Some(FilterKind::Type),
                 "scope" => self.expanded_filter = Some(FilterKind::Scope),
                 "settings" => self.open_settings(),
+                // 自检探针：范围切到「仅自定义文件夹」并搜一次，
+                // 用来端到端确认搜索结果确实被范围过滤住。
+                "scope-custom" => {
+                    self.scope_custom = vec!["E:\\project_开\\ShunSeek".to_string()];
+                    self.scope_custom_sel = self.scope_custom.iter().cloned().collect();
+                    self.scope_presets.clear();
+                    self.scope_drives.clear();
+                    self.query = "shun".to_string();
+                    self.schedule_search();
+                }
+                // 自检探针：两个自定义根多选（验证多根并集过滤）。
+                "scope-multi" => {
+                    self.scope_custom = vec![
+                        "E:\\project_开\\ShunSeek".to_string(),
+                        "D:\\Doubao_work".to_string(),
+                    ];
+                    self.scope_custom_sel = self.scope_custom.iter().cloned().collect();
+                    self.scope_presets.clear();
+                    self.scope_drives.clear();
+                    self.query = "shun".to_string();
+                    self.expanded_filter = Some(FilterKind::Scope);
+                    self.schedule_search();
+                }
                 _ => {}
             }
         }
