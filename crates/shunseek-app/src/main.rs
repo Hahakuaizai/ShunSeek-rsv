@@ -421,7 +421,8 @@ impl Palette {
 // ---------------------------------------------------------------- 设置存储
 
 /// 全部可持久化设置（v0.1.5 统一）：数据目录 settings.txt，key=value 行。
-/// 键：theme / view / hide_on_close / hotkey / result_limit / fold_demoted。
+/// 键：theme / view / hide_on_close / hotkey / result_limit / fold_demoted /
+/// hide_outside（点外自动隐藏，缺省 0 = 关：窗口点外面保持原样）。
 /// 开机自启动不入文件（以注册表实际状态为准，见 autostart.rs）。
 /// load 时 theme/view 在 settings.txt 缺省时回退老版 theme.txt /
 /// view.txt 的值（老用户无感迁移）；save 只写 settings.txt，
@@ -436,6 +437,11 @@ struct Settings {
     hotkey: hotkey::HotkeyCombo,
     result_limit: usize,
     fold_demoted: bool,
+    /// 点击主窗/设置窗/托盘图标之外时是否自动隐藏到托盘。
+    /// v0.1.14 起可配置且缺省关闭：原版「点外即藏」在真机上
+    /// 表现为「点别的窗口软件连同任务栏图标一起消失」，对把它
+    /// 当常驻小工具用的场景是干扰，故改为用户显式开启。
+    hide_outside: bool,
     /// 搜索范围选中集（scope_* 键）：预设键名 / 盘符 / 自定义完整路径。
     scope_presets: Vec<String>,
     scope_drives: Vec<char>,
@@ -538,6 +544,7 @@ fn load_settings() -> Settings {
             .filter(|n| [60usize, 100, 200].contains(n))
             .unwrap_or(RESULT_LIMIT),
         fold_demoted: bool_or("fold_demoted", true),
+        hide_outside: bool_or("hide_outside", false),
         scope_presets,
         scope_drives,
         scope_custom,
@@ -1828,6 +1835,15 @@ struct ShunSeekApp {
     /// 同步，只供绘制与点外武装判定读；任何可见性**决策**
     /// 不许读它（决策在发起线程现读 winvis::state()）。
     visible: bool,
+    /// 启动首几帧的可见性自愈计数（v0.1.15）：winit 建窗到首帧
+    /// 渲染之间有一段窗口仍是 SW_HIDE 的竞态，帧首 OS 同步会
+    /// 据此把影子判成「已隐藏」，此后不再自绘——真机表现就是
+    /// 「进程活着、任务管理器有它、界面永远不出来」。前三帧各
+    /// 兜一次 ShowWindow；--tray 静默启动时为 0，不参与。
+    boot_show_frames: u8,
+    /// 内部预览开关（--ui-probe=type|scope|settings）：首帧强制
+    /// 展开某块面板/打开设置，供无鼠标的界面自检使用。
+    probe: Option<String>,
     allow_exit: bool,
     focus_search: bool,
     scroll_to_selected: bool,
@@ -1847,10 +1863,11 @@ struct ShunSeekApp {
     settings_open: bool,
     settings_autostart: bool,
     /// 设置项（与 settings.txt 一一对应，见 Settings）：
-    /// 唤醒热键预设 / 结果上限 / 是否折叠不重要结果。
+    /// 唤醒热键预设 / 结果上限 / 是否折叠不重要结果 / 点外隐藏。
     hotkey_combo: hotkey::HotkeyCombo,
     result_limit: usize,
     fold_demoted: bool,
+    hide_outside: bool,
     /// 最近一次换入索引的条数与来源摘要完整版（设置「索引」分区
     /// 只读显示用；状态栏展示的是截断版）。
     index_count: usize,
@@ -1895,14 +1912,19 @@ struct ShunSeekApp {
     /// 「点别处就消失且唤不回」。
     clickwatch: clickwatch::ClickWatch,
     /// 手判拖动/拉伸的控件矩形集：每帧绘制时把所有交互控件的
-    /// rect 推进 _cur，帧末轮换为 _prev；下一帧按下判定读
-    /// _prev——按下点落在任一控件上 → 绝不 StartDrag，微位移
-    /// 点击永远归控件自己。见 handle_window_press。
+    /// rect 推进 _cur，帧末轮换为 _prev。这套矩形现在的唯一用途
+    /// 是「双击空白区最大化」的排除判定；拖动不再受它限制
+    /// （v0.1.14：任何位置按下都能拖，靠 8px 位移阈值区分
+    /// 点击与拖动）。见 handle_window_press。
+    /// 滚动条带（上一帧 / 本帧）：条上按下拖动是滚内容，
+    /// 不参与窗口拖动（与 blockers 分开存，语义不同）。
+    scroll_prev: Vec<egui::Rect>,
+    scroll_cur: Vec<egui::Rect>,
     blockers_prev: Vec<egui::Rect>,
     blockers_cur: Vec<egui::Rect>,
-    /// 按下后待命的拖动起点：按下点不在控件上时记下，指针
-    /// 位移越过 4px 才真正 StartDrag——留出双击判定窗口，
-    /// 也让静止按下什么都不发生。
+    /// 按下后待命的拖动起点：任意非拉伸带位置按下都记下，
+    /// 指针位移越过 8px 才真正 StartDrag——既留出双击判定窗口，
+    /// 也让静止按下/微小抖动什么都不发生（仍归控件）。
     pending_drag: Option<egui::Pos2>,
     /// 筛选面板展开动画的原始进度 [类型, 范围]（0..1 线性时间，
     /// 渲染时过 cubic_out 缓动）。展开/收起 0.24s；目标由
@@ -2146,6 +2168,14 @@ impl ShunSeekApp {
                 },
             ),
             visible: !START_HIDDEN.load(Ordering::SeqCst),
+            boot_show_frames: if START_HIDDEN.load(Ordering::SeqCst) {
+                0
+            } else {
+                3
+            },
+            probe: std::env::args().find_map(|a| {
+                a.strip_prefix("--ui-probe=").map(|s| s.to_string())
+            }),
             allow_exit: false,
             focus_search: true,
             scroll_to_selected: false,
@@ -2160,6 +2190,7 @@ impl ShunSeekApp {
             hotkey_combo: settings.hotkey,
             result_limit: settings.result_limit,
             fold_demoted: settings.fold_demoted,
+            hide_outside: settings.hide_outside,
             index_count: 0,
             index_summary: String::new(),
             usage_confirm: false,
@@ -2177,6 +2208,8 @@ impl ShunSeekApp {
             home_add_open: false,
             minimized: false,
             clickwatch: clickwatch::ClickWatch::start(cc.egui_ctx.clone()),
+            scroll_prev: Vec::new(),
+            scroll_cur: Vec::new(),
             blockers_prev: Vec::new(),
             blockers_cur: Vec::new(),
             pending_drag: None,
@@ -2384,13 +2417,28 @@ impl ShunSeekApp {
     /// 此前六版走 ViewportCommand::Visible 的老路已整段删除。
     /// 非 Windows 无 Win32 可调，同一调用点以 ViewportCommand
     /// 兜底（演示平台机制，不进 Windows 链）。
-    fn hide(&mut self, _ctx: &egui::Context) {
+    fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
+        // 设置窗是 immediate viewport，靠主窗每帧 update 驱动；主窗
+        // 一旦 SW_HIDE，它就变成点不动、也关不掉的死窗口（v0.1.14
+        // 真机的「设置界面有时关不掉」）。藏主窗时顺手把设置视口
+        // 关掉——直接发 Close 命令，不等下一帧（下一帧可能永远不来）。
+        if self.settings_open {
+            self.settings_open = false;
+            if self.hotkey_capture {
+                self.hotkey_capture = false;
+                self.hotkey.set_paused(false);
+            }
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of("shunseek_settings"),
+                ViewportCommand::Close,
+            );
+        }
         self.on_hidden();
         clickwatch::disarm();
         winvis::hide();
         #[cfg(not(windows))]
-        _ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
     }
 
     /// 隐藏的界面清理（与 hide() 本体拆开：窗口被其他线程直接
@@ -2501,7 +2549,12 @@ impl ShunSeekApp {
             None
         };
         let tray = self.tray.icon_rect();
-        let armed = winvis::state() == winvis::VisState::Shown;
+        // 只有用户显式开启「点外自动隐藏」才武装钩子；关闭时 armed
+        // 恒 false，钩子仍在但不产生任何动作（点别的窗口/桌面/
+        // 任务栏都不再把它藏走）。
+        let armed = self.hide_outside
+            && !self.settings_open
+            && winvis::state() == winvis::VisState::Shown;
         self.clickwatch.publish(main, sub, tray, armed);
     }
 
@@ -2618,11 +2671,20 @@ impl ShunSeekApp {
                         self.pending_drag = None;
                         return;
                     }
-                    // ③ 控件上：什么都不做——点击归控件自己
-                    // ④ 空白区：进入待命，等位移越过阈值
-                    if !blocked {
-                        self.pending_drag = Some(origin);
+                    // ③ 滚动条带上：拖动是滚内容，绝不拖窗
+                    if self.scroll_prev.iter().any(|r| r.contains(origin)) {
+                        self.pending_drag = None;
+                        return;
                     }
+                    // ④ 其余任何位置（含控件上）：一律进入待命拖动。
+                    // 旧版（v0.1.10–v0.1.13）在这里用「按下点是否落在
+                    // 控件矩形内」直接排除——而结果行/卡片/搜索区这些
+                    // rect 都是拉满整行整列的扁平矩形，视觉上的「空白」
+                    // 常常仍落在里面，于是时灵时不灵。改为统一待命，
+                    // 靠下面的 8px 位移阈值区分意图：位移不足 8px
+                    // （大于 egui 的 6px 点击阈值再多给 2px 余量）仍
+                    // 归控件，超过就开始拖窗——纯点击不会被抢。
+                    self.pending_drag = Some(origin);
                 }
             }
         }
@@ -2630,7 +2692,7 @@ impl ShunSeekApp {
             if !primary_down {
                 self.pending_drag = None;
             } else if let Some(p) = latest {
-                if p.distance(origin) >= 4.0 {
+                if p.distance(origin) >= 8.0 {
                     self.pending_drag = None;
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
@@ -2643,10 +2705,12 @@ impl ShunSeekApp {
     /// 在条上按下拖动是滚动操作，绝不能变成窗口拖动。
     fn push_scroll_blocker(&mut self, out: &egui::scroll_area::ScrollAreaOutput<()>) {
         if out.content_size.y > out.inner_rect.height() + 1.0 {
-            self.blockers_cur.push(egui::Rect::from_min_max(
+            let band = egui::Rect::from_min_max(
                 egui::pos2(out.inner_rect.right(), out.inner_rect.top()),
                 egui::pos2(out.inner_rect.right() + 14.0, out.inner_rect.bottom()),
-            ));
+            );
+            self.blockers_cur.push(band);
+            self.scroll_cur.push(band);
         }
     }
 
@@ -2898,7 +2962,7 @@ impl ShunSeekApp {
     /// 连写（如 CD）；scope_custom 一行一个完整路径（可重复多行）。
     fn save_settings(&self) {
         let mut text = format!(
-            "theme={}\nview={}\nhotkey={}\nresult_limit={}\nfold_demoted={}\n",
+            "theme={}\nview={}\nhotkey={}\nresult_limit={}\nfold_demoted={}\nhide_outside={}\n",
             match self.theme {
                 Theme::Dark => "dark",
                 Theme::Light => "light",
@@ -2910,6 +2974,7 @@ impl ShunSeekApp {
             self.hotkey_combo.key_str(),
             self.result_limit,
             self.fold_demoted as u8,
+            self.hide_outside as u8,
         );
         let mut presets: Vec<&str> = self.scope_presets.iter().map(|s| s.as_str()).collect();
         presets.sort_unstable();
@@ -3882,8 +3947,12 @@ fn resize_zone_at(
 ) -> Option<(egui::viewport::ResizeDirection, egui::CursorIcon)> {
     use egui::viewport::ResizeDirection as D;
     use egui::CursorIcon as C;
-    const EDGE: f32 = 8.0;
-    const CORNER: f32 = 12.0;
+    // 拉伸带（v0.1.14 收窄）：旧版直边 8px / 角 12px，而无边框窗口
+    // 的视觉描边正好压在这圈里——用户按「边框」想拖窗口，实际触发
+    // 的是缩放，表现为「拖不动」。直边收到 4px、角 10px，把描边
+    // 内侧让给拖动，缩放仍可从最外沿摸到。
+    const EDGE: f32 = 4.0;
+    const CORNER: f32 = 10.0;
     if !screen.contains(p) {
         return None;
     }
@@ -4435,48 +4504,49 @@ impl ShunSeekApp {
         let expanded = self.expanded_filter == Some(FilterKind::Type);
         let open = expanded || self.filter_anim_t[0] > 0.0;
         let full = self.cat_set.len() >= ALL_CATEGORIES.len();
-        let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(26.0, 26.0), egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
         self.blockers_cur.push(rect);
         if expanded {
             self.filter_dot_rect = Some(rect);
         }
         let painter = ui.painter_at(rect);
-        let dot_center = rect.center();
+        // v0.1.15：26px 圆点 → 30px 圆角方按钮（圆角 9）。常态无底，
+        // hover 才浮出 SurfaceHover，展开时换 SurfaceSel + 发丝描边；
+        // 不再画「灰圆 + 朱砂环」，那圈红环正是最跳的廉价感来源。
+        let rr = Rounding::same(9.0);
+        // 展开态只给一层浅底，不再描边——30px 方框 + 描边 + 细线
+        // 图标三层叠在一起，远看就是一个空方框。
         if open {
-            painter.circle_filled(dot_center, 13.0, pal.bar_fill);
-            if pal.bar_stroke.a() > 0 {
-                painter.circle_stroke(
-                    dot_center,
-                    12.5,
-                    Stroke::new(1.0_f32, pal.bar_stroke),
+            painter.rect_filled(rect, rr, pal.chip_hover_fill);
+        } else if resp.hovered() {
+            painter.rect_filled(rect, rr, pal.surface_hover);
+        }
+        let icon_col = if !full || open {
+            pal.accent
+        } else {
+            pal.text_mid
+        };
+        paint_filter_lines(&painter, rect.center(), 18.0, icon_col);
+        // 单选：右下角一枚 3px 分类色点，保留类型识别又不糊满整块
+        if self.cat_set.len() == 1 && !open {
+            if let Some(c) = self.cat_set.iter().next() {
+                let (r, g, b) = c.tile_color();
+                painter.circle_filled(
+                    egui::pos2(rect.right() - 7.0, rect.bottom() - 7.0),
+                    3.0,
+                    Color32::from_rgb(r, g, b),
                 );
             }
-        } else if self.cat_set.len() == 1 {
-            let (r, g, b) = self.cat_set.iter().next().unwrap().tile_color();
-            painter.circle_filled(dot_center, 13.0, Color32::from_rgb(r, g, b));
-        } else {
-            painter.circle_filled(dot_center, 13.0, pal.esc_fill);
-            if !full {
-                painter.circle_stroke(dot_center, 12.5, Stroke::new(1.6_f32, pal.accent));
-            }
         }
-        // 漏斗图标（单选且收起时圆点是分类色，漏斗画白色）
-        let funnel_color = if self.cat_set.len() == 1 && !open {
-            Color32::WHITE
-        } else {
-            pal.name_text
-        };
-        paint_funnel(&painter, dot_center, 14.0, funnel_color);
         // 多选数量角标
         if !full && self.cat_set.len() > 1 {
-            let badge = egui::pos2(rect.left() + 22.0, rect.top() + 4.0);
-            painter.circle_filled(badge, 7.0, pal.accent);
+            let badge = egui::pos2(rect.right() - 3.0, rect.top() + 3.0);
+            painter.circle_filled(badge, 6.5, pal.accent);
             painter.text(
                 badge,
                 egui::Align2::CENTER_CENTER,
                 self.cat_set.len().to_string(),
-                FontId::proportional(9.5),
+                FontId::proportional(9.0),
                 Color32::WHITE,
             );
         }
@@ -4517,7 +4587,7 @@ impl ShunSeekApp {
         let pal = self.display_pal;
         let v = egui::emath::easing::cubic_out(t);
         let full = self.cat_set.len() >= ALL_CATEGORIES.len();
-        let width = 216.0;
+        let width = 240.0;
         let full_size = self.filter_panel_full[0];
         let screen = ui.ctx().screen_rect();
         let pos = clamp_menu_pos(
@@ -4538,42 +4608,76 @@ impl ShunSeekApp {
                 ui.set_clip_rect(clip);
                 ui.multiply_opacity(0.3 + 0.7 * v);
                 panel_frame(pal).show(ui, |ui| {
-                    ui.set_width(width - 28.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                        for &chip in TYPE_CHIPS {
-                            let (label, selected) = match chip {
-                                None => ("全部".to_string(), full),
-                                Some(c) => (
-                                    c.display_name().to_string(),
-                                    !full && self.cat_set.contains(&c),
-                                ),
-                            };
-                            let r = filter_chip(ui, pal, &label, selected);
-                            if r.double_clicked() {
-                                if let Some(c) = chip {
-                                    self.toggle_cat(c, true);
-                                }
-                            } else if r.clicked() {
-                                match chip {
-                                    None => {
-                                        if !full {
-                                            self.cat_set = all_categories();
-                                            self.schedule_search();
+                    ui.set_width(width - 32.0);
+                    // 头部：标题 + 当前选中摘要（右侧小字）
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("按类型筛选")
+                                .size(12.0)
+                                .color(pal.name_text),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let note = if full {
+                                    "全部".to_string()
+                                } else {
+                                    format!("已选 {} 项", self.cat_set.len())
+                                };
+                                ui.label(
+                                    RichText::new(note)
+                                        .size(10.5)
+                                        .color(pal.path_text),
+                                );
+                            },
+                        );
+                    });
+                    ui.add_space(10.0);
+                    // v0.1.15：胶囊流 → 2 列卡片网格。每格 100×34，
+                    // 左 3px 分类色点 + 左对齐 11.5px 文字；选中 =
+                    // 朱砂淡底 + 左缘 2px 朱砂条 + 朱砂字。14 项正好
+                    // 7 行，两列定宽比原来一排大小不一的胶囊安定得多。
+                    let cell_w = 100.0;
+                    let mut i = 0usize;
+                    while i < TYPE_CHIPS.len() {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                            for k in 0..2 {
+                                if let Some(chip) = TYPE_CHIPS.get(i + k) {
+                                    let (label, dot, selected) = match chip {
+                                        None => ("全部".to_string(), None, full),
+                                        Some(c) => (
+                                            c.display_name().to_string(),
+                                            Some(c.tile_color()),
+                                            !full && self.cat_set.contains(c),
+                                        ),
+                                    };
+                                    let r =
+                                        type_cell(ui, pal, &label, dot, selected, cell_w);
+                                    if r.double_clicked() {
+                                        if let Some(c) = chip {
+                                            self.toggle_cat(*c, true);
+                                        }
+                                    } else if r.clicked() {
+                                        match chip {
+                                            None => {
+                                                if !full {
+                                                    self.cat_set = all_categories();
+                                                    self.schedule_search();
+                                                }
+                                            }
+                                            Some(c) => self.toggle_cat(*c, false),
                                         }
                                     }
-                                    Some(c) => self.toggle_cat(c, false),
                                 }
                             }
-                        }
-                    });
+                        });
+                        i += 2;
+                    }
                 });
             });
         self.filter_panel_full[0] = area.response.rect.size();
-        let vis = egui::Rect::from_min_size(
-            pos,
-            Vec2::new(width, full_size.y * v),
-        );
+        let vis = egui::Rect::from_min_size(pos, Vec2::new(width, full_size.y * v));
         if self.expanded_filter == Some(FilterKind::Type) {
             self.filter_panel_rect = Some(vis);
         }
@@ -4614,44 +4718,41 @@ impl ShunSeekApp {
         let sum_galley =
             ui.fonts(|f| f.layout_no_wrap(summary.clone(), font, pal.esc_text));
         let sum_w = if show_summary {
-            sum_galley.size().x + 16.0
+            sum_galley.size().x + 18.0
         } else {
             0.0
         };
-        let w = 26.0 + if sum_w > 0.0 { 6.0 + sum_w } else { 0.0 };
+        let w = 30.0 + if sum_w > 0.0 { 6.0 + sum_w } else { 0.0 };
         let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(w, 26.0), egui::Sense::click());
+            ui.allocate_exact_size(Vec2::new(w, 30.0), egui::Sense::click());
         self.blockers_cur.push(rect);
         if expanded {
             self.filter_dot_rect = Some(rect);
         }
         let painter = ui.painter_at(rect);
-        let dot_center = egui::pos2(rect.left() + 13.0, rect.center().y);
+        // v0.1.15：与类型按钮同一套「30 方、圆角 9、常态无底」，
+        // 文件夹只画细线、去掉朱砂外圈。
+        let btn = egui::Rect::from_min_size(rect.min, Vec2::splat(30.0));
+        let rr = Rounding::same(9.0);
         if open {
-            painter.rect_filled(rect, Rounding::same(13.0), pal.bar_fill);
-            if pal.bar_stroke.a() > 0 {
-                painter.rect_stroke(
-                    rect,
-                    Rounding::same(13.0),
-                    Stroke::new(1.0_f32, pal.bar_stroke),
-                );
-            }
-        } else {
-            painter.circle_filled(dot_center, 13.0, pal.esc_fill);
-            if !all {
-                painter.circle_stroke(dot_center, 12.5, Stroke::new(1.6_f32, pal.accent));
-            }
+            painter.rect_filled(btn, rr, pal.chip_hover_fill);
+        } else if resp.hovered() {
+            painter.rect_filled(btn, rr, pal.surface_hover);
         }
-        // 文件夹字形（真实比例矢量字形，一眼是「范围/目录」）
-        let tile = egui::Rect::from_center_size(dot_center, Vec2::splat(18.0));
-        paint_folder_glyph(&painter, tile);
+        let icon_col = if all && !open {
+            pal.text_mid
+        } else {
+            pal.accent
+        };
+        let tile = egui::Rect::from_center_size(btn.center(), Vec2::splat(18.0));
+        paint_folder_glyph(&painter, tile, icon_col);
         if show_summary {
             let pill = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + 32.0, rect.center().y - 9.0),
-                Vec2::new(sum_w, 18.0),
+                egui::pos2(rect.left() + 36.0, rect.center().y - 10.0),
+                Vec2::new(sum_w, 20.0),
             );
             if !open {
-                painter.rect_filled(pill, Rounding::same(9.0), pal.esc_fill);
+                painter.rect_filled(pill, Rounding::same(7.0), pal.esc_fill);
             }
             painter.galley(
                 egui::pos2(
@@ -4691,7 +4792,7 @@ impl ShunSeekApp {
         }
         let pal = self.display_pal;
         let v = egui::emath::easing::cubic_out(t);
-        let width = 372.0;
+        let width = 400.0;
         let full_size = self.filter_panel_full[1];
         let screen = ui.ctx().screen_rect();
         let pos = clamp_menu_pos(
@@ -4717,37 +4818,81 @@ impl ShunSeekApp {
                 ui.set_clip_rect(clip);
                 ui.multiply_opacity(0.3 + 0.7 * v);
                 panel_frame(pal).show(ui, |ui| {
-                    ui.set_width(width - 28.0);
+                    ui.set_width(width - 32.0);
                     let all_now = PRESET_KEYS
                         .iter()
                         .all(|(k, _, _)| presets.contains(*k))
                         && existing_drives().iter().all(|d| drives.contains(d));
                     section_title(ui, pal, "预设");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                        if filter_chip(ui, pal, "全部", all_now).clicked() {
+                    // v0.1.15：胶囊流 → 3 列定宽卡片（「全部」+ 4 个
+                    // 预设正好两行）。同类型面板的格子语言，扫读整齐。
+                    let cell_w = (width - 32.0 - 16.0) / 3.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                        if type_cell(ui, pal, "全部", None, all_now, cell_w).clicked() {
                             scope_select_all(&mut presets, &mut drives);
                             changed = true;
                         }
-                        for (key, _, label) in PRESET_KEYS {
-                            let sel = !all_now && presets.contains(key);
-                            let r = filter_chip(ui, pal, label, sel);
+                        for (key, _, label) in PRESET_KEYS.iter().take(2) {
+                            let sel = !all_now && presets.contains(*key);
+                            let r = type_cell(ui, pal, label, None, sel, cell_w);
                             if r.double_clicked() {
-                                scope_toggle_preset(&mut presets, &mut drives, key, true);
+                                scope_toggle_preset(
+                                    &mut presets,
+                                    &mut drives,
+                                    *key,
+                                    true,
+                                );
                                 changed = true;
                             } else if r.clicked() {
-                                scope_toggle_preset(&mut presets, &mut drives, key, all_now);
+                                scope_toggle_preset(
+                                    &mut presets,
+                                    &mut drives,
+                                    *key,
+                                    all_now,
+                                );
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                        for (key, _, label) in PRESET_KEYS.iter().skip(2) {
+                            let sel = !all_now && presets.contains(*key);
+                            let r = type_cell(ui, pal, label, None, sel, cell_w);
+                            if r.double_clicked() {
+                                scope_toggle_preset(
+                                    &mut presets,
+                                    &mut drives,
+                                    *key,
+                                    true,
+                                );
+                                changed = true;
+                            } else if r.clicked() {
+                                scope_toggle_preset(
+                                    &mut presets,
+                                    &mut drives,
+                                    *key,
+                                    all_now,
+                                );
                                 changed = true;
                             }
                         }
                     });
                     ui.add_space(11.0);
                     section_title(ui, pal, "磁盘");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                         for d in existing_drives() {
                             let sel = !all_now && drives.contains(&d);
-                            let r = filter_chip(ui, pal, &format!("{d}:\\"), sel);
+                            let r = type_cell(
+                                ui,
+                                pal,
+                                &format!("{d}:\\"),
+                                Some((112, 121, 132)),
+                                sel,
+                                cell_w,
+                            );
                             if r.double_clicked() {
                                 scope_toggle_drive(&mut presets, &mut drives, d, true);
                                 changed = true;
@@ -4759,23 +4904,22 @@ impl ShunSeekApp {
                     });
                     ui.add_space(11.0);
                     section_title(ui, pal, "自定义文件夹");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                        let mut remove: Option<usize> = None;
-                        for (i, path) in custom.iter().enumerate() {
-                            if custom_chip(ui, pal, &dir_last(path), path) {
-                                remove = Some(i);
-                            }
+                    // v0.1.15：胶囊流 → 通栏行（图标 + 名称 + 右侧 ×）。
+                    // 长路径名在胶囊里会把整排挤得大小不一，行式稳定。
+                    let mut remove: Option<usize> = None;
+                    for (i, path) in custom.iter().enumerate() {
+                        if scope_row(ui, pal, &dir_last(path), path, width - 32.0) {
+                            remove = Some(i);
                         }
-                        if let Some(i) = remove {
-                            custom.remove(i);
-                            changed = true;
-                        }
-                        let can_add = cfg!(windows);
-                        if dashed_chip(ui, pal, "添加文件夹…", can_add) {
-                            add_folder = true;
-                        }
-                    });
+                    }
+                    if let Some(i) = remove {
+                        custom.remove(i);
+                        changed = true;
+                    }
+                    let can_add = cfg!(windows);
+                    if dashed_row(ui, pal, "＋ 添加文件夹", width - 32.0, can_add) {
+                        add_folder = true;
+                    }
                 });
             });
         self.filter_panel_full[1] = area.response.rect.size();
@@ -5214,7 +5358,7 @@ impl ShunSeekApp {
                         egui::Rect::from_center_size(plate.center(), Vec2::splat(26.0));
                     match item.category {
                         Category::Folder | Category::InstallDir => {
-                            paint_folder_glyph(&painter, glyph)
+                            paint_folder_glyph(&painter, glyph, pal.path_text)
                         }
                         Category::Document => {
                             paint_doc_glyph(&painter, glyph, pal.text_mid)
@@ -5545,7 +5689,7 @@ impl ShunSeekApp {
                         icon_rect.center(),
                         Vec2::splat(30.0),
                     );
-                    paint_folder_glyph(&painter, glyph);
+                    paint_folder_glyph(&painter, glyph, pal.path_text);
                 }
                 let galley = ui.fonts(|f| {
                     f.layout(
@@ -5955,10 +6099,11 @@ impl ShunSeekApp {
             11.0,
             pal.text_mid,
         );
+        let footer_label = if self.settings_open { "关闭" } else { "设置" };
         painter.text(
             egui::pos2(set_rect.left() + 25.0, set_rect.center().y),
             Align2::LEFT_CENTER,
-            "设置",
+            footer_label,
             FontId::proportional(10.5),
             pal.text_mid,
         );
@@ -6007,10 +6152,16 @@ impl ShunSeekApp {
         );
         if set_resp
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("设置")
+            .on_hover_text("设置 / 关闭设置")
             .clicked()
         {
-            self.open_settings();
+            // v0.1.15：同一个按钮做开/关切换（用户点名「再点一次要能
+            // 关掉」）。关闭只清标记，设置视口不再被 show，下一帧即消失。
+            if self.settings_open {
+                self.close_settings();
+            } else {
+                self.open_settings();
+            }
         }
     }
 }
@@ -6021,52 +6172,41 @@ impl ShunSeekApp {
 /// 纯图标控件另配 on_hover_text 兜底说明。
 
 /// 漏斗（类型筛选）：上宽下窄 + 下方小竖管，闭合描线。
-fn paint_funnel(painter: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
-    let s = size / 2.0;
-    // 比例复核（v0.1.6）：上口全宽、颈宽 0.28、管直到底——26px
-    // 圆点里一眼是漏斗，不糊成三角块。
-    let pts = [
-        egui::pos2(c.x - s, c.y - s * 0.85),
-        egui::pos2(c.x + s, c.y - s * 0.85),
-        egui::pos2(c.x + s * 0.28, c.y + s * 0.02),
-        egui::pos2(c.x + s * 0.28, c.y + s * 0.85),
-        egui::pos2(c.x - s * 0.28, c.y + s * 0.85),
-        egui::pos2(c.x - s * 0.28, c.y + s * 0.02),
-        egui::pos2(c.x - s, c.y - s * 0.85),
-    ];
-    painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.8_f32, color)));
+/// 筛选图标（v0.1.15 重绘）：三条递减横线（标准 filter 语义），
+/// 线宽 1.6、行距按 size 等比，最下一条最短。比旧漏斗克制得多，
+/// 16px 下也不糊；颜色由调用方给（常态次文字色 / 激活朱砂）。
+fn paint_filter_lines(painter: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
+    let w = size * 0.68;
+    let gap = size * 0.20;
+    let st = Stroke::new(2.0_f32, color);
+    for (i, f) in [1.0f32, 0.68, 0.36].iter().enumerate() {
+        let y = c.y - gap + i as f32 * gap;
+        let hw = w * f / 2.0;
+        painter.line_segment(
+            [egui::pos2(c.x - hw, y), egui::pos2(c.x + hw, y)],
+            st,
+        );
+    }
 }
 
-/// 文件夹字形（v0.1.6 按真实比例重画）：后片带梯形凸耳（左上
-/// 一截 tab + 斜切肩），前片矩形略矮盖住后片下部；填充用收了
-/// 饱和的文件夹黄（#F5C04A 系），描边 1.8px（按 26px 基准等比），
-/// 前片上沿一笔高光。旧版是「黄方块 + 两个白矩形」，在 16px 圆点
-/// 里糊成变形黄块，用户点名重画。范围圆点 / 宫格组格共用。
-fn paint_folder_glyph(painter: &egui::Painter, rect: egui::Rect) {
+/// 文件夹字形（v0.1.15 第四次重绘）：改为**实心**——左上 tab 片
+/// 与主体两枚同色圆角矩形拼成经典文件夹轮廓。前三版都走线框，
+/// 在 18px 按钮里线距太密、最后糊成一枚空方框；实心块在同尺寸下
+/// 轮廓清楚，颜色也能直接承载「已筛选」的朱砂语义。
+fn paint_folder_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let (w, h) = (rect.width(), rect.height());
-    let (x0, y0) = (rect.left(), rect.top());
-    let p = |fx: f32, fy: f32| egui::pos2(x0 + w * fx, y0 + h * fy);
-    let back_fill = Color32::from_rgb(224, 169, 62); // 后片稍深
-    let front_fill = Color32::from_rgb(245, 192, 74); // 前片 #F5C04A
-    let stroke = Stroke::new((1.8 * (w / 26.0)).max(1.2), Color32::from_rgb(166, 116, 32));
-    // 后片：底边齐前片，顶部左侧凸耳 + 右侧斜肩
-    let back = vec![
-        p(0.06, 0.82),
-        p(0.06, 0.18),
-        p(0.40, 0.18),
-        p(0.52, 0.32),
-        p(0.94, 0.32),
-        p(0.94, 0.82),
-    ];
-    painter.add(egui::Shape::convex_polygon(back, back_fill, stroke));
-    // 前片：矩形，顶边比后片主体低一截，盖住后片下部
-    let front = egui::Rect::from_min_max(p(0.02, 0.40), p(0.98, 0.88));
-    painter.rect_filled(front, Rounding::same((w * 0.06).max(1.0)), front_fill);
-    painter.rect_stroke(front, Rounding::same((w * 0.06).max(1.0)), stroke);
-    // 前片上沿高光
-    painter.line_segment(
-        [p(0.06, 0.44), p(0.94, 0.44)],
-        Stroke::new(1.0_f32, Color32::from_white_alpha(110)),
+    let p = |fx: f32, fy: f32| egui::pos2(rect.left() + w * fx, rect.top() + h * fy);
+    // tab 片（左上凸起）
+    painter.rect_filled(
+        egui::Rect::from_min_max(p(0.04, 0.16), p(0.48, 0.40)),
+        Rounding::same((w * 0.05).max(1.5)),
+        color,
+    );
+    // 主体
+    painter.rect_filled(
+        egui::Rect::from_min_max(p(0.04, 0.28), p(0.96, 0.86)),
+        Rounding::same((w * 0.09).max(2.0)),
+        color,
     );
 }
 
@@ -6354,21 +6494,184 @@ fn panel_frame(pal: Palette) -> egui::Frame {
     egui::Frame::none()
         .fill(pal.popup_fill)
         .stroke(Stroke::new(1.0_f32, pal.popup_stroke))
-        .rounding(Rounding::same(12.0))
+        .rounding(Rounding::same(16.0))
         .shadow(egui::epaint::Shadow {
-            offset: Vec2::new(0.0, 5.0),
-            blur: 22.0,
+            offset: Vec2::new(0.0, 6.0),
+            blur: 26.0,
             spread: 0.0,
             color: pal.popup_shadow_color,
         })
-        .inner_margin(egui::Margin::same(14.0))
+        .inner_margin(egui::Margin::same(16.0))
 }
 
-/// 面板分区标题：11px TextLow，与下方 chips 留 6px——层级靠
-/// 字号与灰度拉开（v0.1.10 面板重做口径）。
+/// 面板分区标题（v0.1.14 重排）：朱砂短竖条 + 11.5px 次文字，与
+/// 下方 chips 留 8px。旧版只是一行 11px 灰字，和 chip 堆一起没有
+/// 层级；竖条给分区一个明确起点，扫视时不必逐个读字。
 fn section_title(ui: &mut egui::Ui, pal: Palette, text: &str) {
-    ui.label(RichText::new(text).size(11.0).color(pal.status_text));
-    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 12.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(bar, Rounding::same(1.5), pal.accent);
+        ui.add_space(4.0);
+        ui.label(RichText::new(text).size(11.5).color(pal.text_mid));
+    });
+    ui.add_space(8.0);
+}
+
+/// 类型面板的单格（v0.1.15）：100×34、圆角 8，左 15px 处一枚 3px
+/// 分类色点 + 11.5px 左对齐文字；选中 = 朱砂淡底 + 左缘 2px 朱砂条
+/// + 朱砂字。比等宽胶囊更像「设置里的选项」，扫读时也更容易对齐。
+fn type_cell(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    dot: Option<(u8, u8, u8)>,
+    selected: bool,
+    w: f32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let rr = Rounding::same(9.0);
+    // v0.1.15：每格都带淡底 + 发丝边（选中 = 朱砂淡底 + 朱砂 35%
+    // 边）。没有边界时整块面板只剩几行"色点 + 文字"，读起来像散装
+    // 列表；给每格一圈边界，网格才立起来。
+    if selected {
+        painter.rect_filled(rect, rr, pal.pill_fill);
+        painter.rect_stroke(rect, rr, Stroke::new(1.0_f32, pal.pill_stroke));
+    } else {
+        let bg = if resp.hovered() {
+            pal.surface_sel
+        } else {
+            pal.chip_hover_fill
+        };
+        painter.rect_filled(rect, rr, bg);
+        painter.rect_stroke(rect, rr, Stroke::new(1.0_f32, pal.hairline));
+    }
+    let dot_col = match dot {
+        Some((r, g, b)) => Color32::from_rgb(r, g, b),
+        None => {
+            if selected {
+                pal.accent
+            } else {
+                pal.path_text
+            }
+        }
+    };
+    painter.circle_filled(
+        egui::pos2(rect.left() + 15.0, rect.center().y),
+        3.0,
+        dot_col,
+    );
+    painter.text(
+        egui::pos2(rect.left() + 26.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(11.5),
+        if selected { pal.accent } else { pal.text_mid },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 自定义文件夹行（v0.1.15）：通栏 32 高、圆角 8，左 15px 细线文件夹
+/// 图标 + 名称，右端 ✕ 删除区（hover 转朱砂）。返回是否点了删除。
+fn scope_row(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    full_path: &str,
+    w: f32,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let rr = Rounding::same(8.0);
+    if resp.hovered() {
+        painter.rect_filled(rect, rr, pal.chip_hover_fill);
+    }
+    let glyph = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 15.0, rect.center().y),
+        Vec2::splat(13.0),
+    );
+    paint_folder_glyph(&painter, glyph, pal.text_mid);
+    painter.text(
+        egui::pos2(rect.left() + 28.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(11.5),
+        pal.text_mid,
+    );
+    let x_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 26.0, rect.center().y - 8.0),
+        Vec2::splat(16.0),
+    );
+    let xr = ui.interact(
+        x_rect,
+        ui.id().with(("ss_scope_row_x", full_path)),
+        egui::Sense::click(),
+    );
+    let xc = if xr.hovered() {
+        pal.accent
+    } else {
+        pal.path_text
+    };
+    let st = egui::Stroke::new(1.3_f32, xc);
+    let c = x_rect.center();
+    painter.line_segment(
+        [c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)],
+        st,
+    );
+    painter.line_segment(
+        [c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)],
+        st,
+    );
+    let _ = resp.on_hover_text(full_path.to_string());
+    xr.clicked()
+}
+
+/// 通栏虚线按钮（v0.1.15）：32 高，「＋ 添加文件夹」这类动作入口
+/// 用虚线圈出，和实底卡片区分开，不会误读成已选项。
+fn dashed_row(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    w: f32,
+    enabled: bool,
+) -> bool {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), sense);
+    let painter = ui.painter_at(rect);
+    let rr = Rounding::same(8.0);
+    if enabled && resp.hovered() {
+        painter.rect_filled(rect, rr, pal.chip_hover_fill);
+    }
+    let color = if enabled {
+        pal.edge_strong
+    } else {
+        pal.edge_line
+    };
+    let st = egui::Stroke::new(1.0_f32, color);
+    let quad = [
+        [rect.left_top(), rect.right_top()],
+        [rect.right_top(), rect.right_bottom()],
+        [rect.right_bottom(), rect.left_bottom()],
+        [rect.left_bottom(), rect.left_top()],
+    ];
+    for seg in quad {
+        for s in egui::Shape::dashed_line(&seg[..], st, 4.0, 3.0) {
+            painter.add(s);
+        }
+    }
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(11.5),
+        if enabled { pal.text_mid } else { pal.empty_text },
+    );
+    resp.clicked()
 }
 
 /// 筛选 chip（原版 FilterChip 语言，v0.1.10 面板定稿）：高 30、
@@ -6390,38 +6693,57 @@ fn filter_chip(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> 
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(16));
     }
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, pal.text_mid));
-    let size = Vec2::new(galley.size().x + 24.0, 30.0);
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER));
+    let size = Vec2::new(galley.size().x + 26.0, 30.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter_at(rect);
     let rounding = Rounding::same(15.0);
+    // v0.1.14 换语言：选中 = 朱砂实底 + 白字，未选 = 透明底 + 发丝
+    // 描边（hover 才浮出淡底）。旧版「12% 淡填充 + 35% 描边」在白
+    // 面板上几乎看不出来，整排 chip 一片灰，层级全靠猜。
     if v > 0.01 {
-        let fill = Color32::from_rgba_unmultiplied(
-            pal.pill_fill.r(),
-            pal.pill_fill.g(),
-            pal.pill_fill.b(),
-            (pal.pill_fill.a() as f32 * v) as u8,
+        let acc = pal.accent;
+        let base = if response.hovered() {
+            Color32::from_rgb(
+                (acc.r() as f32 * 0.88) as u8,
+                (acc.g() as f32 * 0.88) as u8,
+                (acc.b() as f32 * 0.88) as u8,
+            )
+        } else {
+            acc
+        };
+        painter.rect_filled(
+            rect,
+            rounding,
+            Color32::from_rgba_unmultiplied(
+                base.r(),
+                base.g(),
+                base.b(),
+                (255.0 * v) as u8,
+            ),
         );
-        painter.rect_filled(rect, rounding, fill);
-        let stroke_c = Color32::from_rgba_unmultiplied(
-            pal.pill_stroke.r(),
-            pal.pill_stroke.g(),
-            pal.pill_stroke.b(),
-            (pal.pill_stroke.a() as f32 * v) as u8,
-        );
-        painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, stroke_c));
     } else {
         if response.hovered() {
             painter.rect_filled(rect, rounding, pal.chip_hover_fill);
         }
-        painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, pal.edge_line));
+        painter.rect_stroke(
+            rect,
+            rounding,
+            Stroke::new(
+                1.0_f32,
+                if response.hovered() {
+                    pal.edge_strong
+                } else {
+                    pal.edge_line
+                },
+            ),
+        );
     }
     let (sr, sg, sb) = pal.chip_text_rgb;
-    let (er, eg, eb) = pal.chip_sel_text_rgb;
     let text_color = Color32::from_rgb(
-        (sr as f32 + (er as f32 - sr as f32) * v) as u8,
-        (sg as f32 + (eg as f32 - sg as f32) * v) as u8,
-        (sb as f32 + (eb as f32 - sb as f32) * v) as u8,
+        (sr as f32 + (255.0 - sr as f32) * v) as u8,
+        (sg as f32 + (255.0 - sg as f32) * v) as u8,
+        (sb as f32 + (255.0 - sb as f32) * v) as u8,
     );
     painter.galley(
         egui::pos2(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0),
@@ -6437,7 +6759,7 @@ fn filter_chip(ui: &mut egui::Ui, pal: Palette, label: &str, selected: bool) -> 
 /// 恒追加），所以没有选中态，× 是它唯一的动作。
 fn custom_chip(ui: &mut egui::Ui, pal: Palette, label: &str, full_path: &str) -> bool {
     let font = FontId::proportional(12.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, pal.text_mid));
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER));
     // 左 12 + 文字 + 6 + ×区 14 + 右 8
     let size = Vec2::new(galley.size().x + 12.0 + 6.0 + 14.0 + 8.0, 30.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -6472,7 +6794,7 @@ fn custom_chip(ui: &mut egui::Ui, pal: Palette, label: &str, full_path: &str) ->
 /// 只画不响应。返回 true = 本帧点击。
 fn dashed_chip(ui: &mut egui::Ui, pal: Palette, label: &str, enabled: bool) -> bool {
     let font = FontId::proportional(12.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, pal.text_mid));
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER));
     let size = Vec2::new(galley.size().x + 24.0, 30.0);
     let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(size, sense);
@@ -6510,8 +6832,9 @@ fn dashed_chip(ui: &mut egui::Ui, pal: Palette, label: &str, enabled: bool) -> b
 }
 
 impl ShunSeekApp {
-    /// 设置窗口（独立 viewport，标题「瞬觅 设置」，约 480×540，
-    /// 不置顶、可关）。入口：状态栏齿轮按钮 + 托盘「设置」项。
+    /// 设置窗口（独立 viewport，标题「瞬觅 设置」，520×660，内容
+    /// 超出走纵向滚动），不置顶、可关。入口：状态栏齿轮按钮 +
+    /// 托盘「设置」项。
     /// 开关类设置全在这里，托盘只放动作，两边不重复。
     fn draw_settings_viewport(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
@@ -6521,8 +6844,8 @@ impl ShunSeekApp {
         let mut close_me = false;
         let builder = egui::ViewportBuilder::default()
             .with_title("瞬觅 设置")
-            .with_inner_size([480.0, 540.0])
-            .with_min_inner_size([380.0, 420.0]);
+            .with_inner_size([520.0, 660.0])
+            .with_min_inner_size([440.0, 520.0]);
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("shunseek_settings"),
             builder,
@@ -6530,7 +6853,14 @@ impl ShunSeekApp {
                 if vctx.input(|i| i.viewport().close_requested()) {
                     close_me = true;
                 }
-                let frame = egui::Frame::central_panel(&vctx.style()).fill(pal.panel_fill);
+                // 保活（v0.1.14）：immediate viewport 完全靠主窗每帧
+                // update 驱动；主窗一旦被 SW_HIDE（点外隐藏/✕），这里
+                // 的点击就全部无响应，表现正是「设置窗有时关不掉」。
+                // 每 300ms 主动要一帧，另在主窗 hide 时显式关掉本视口。
+                vctx.request_repaint_after(std::time::Duration::from_millis(300));
+                let frame = egui::Frame::none()
+                    .fill(pal.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(20.0, 16.0));
                 egui::CentralPanel::default().frame(frame).show(vctx, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
@@ -6546,18 +6876,48 @@ impl ShunSeekApp {
     }
 
     fn settings_sections(&mut self, ui: &mut egui::Ui, vctx: &egui::Context, pal: Palette) {
+        // 页面头（v0.1.14）：标题 + 版本 + 一句定位，替代「一进来就是
+        // 一排原生复选框」的空洞开场。
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("设置").size(20.0).color(pal.name_text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(10.5)
+                        .color(pal.path_text),
+                );
+            });
+        });
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new("索引、外观与数据管理")
+                .size(11.5)
+                .color(pal.path_text),
+        );
         // ---------- 常规 ----------
         settings_heading(ui, pal, "常规");
         // 开机自启动：勾选状态以注册表实际为准（不入 settings.txt）
         let mut auto = self.settings_autostart;
-        if ui
-            .checkbox(&mut auto, RichText::new("开机自启动").color(pal.name_text))
-            .changed()
-        {
+        let auto_before = auto;
+        ss_row_switch(ui, pal, "开机自启动", &mut auto);
+        if auto != auto_before {
             autostart::set_enabled(auto);
             self.settings_autostart = autostart::is_enabled();
         }
-        ui.add_space(6.0);
+        // 点外自动隐藏（v0.1.14 新增，缺省关）：勾上才恢复原版
+        //「点窗口外即收进托盘」的行为，不勾则窗口常驻，点别的窗口
+        // 不会连任务栏图标一起消失。
+        let mut hide_outside = self.hide_outside;
+        let hide_before = hide_outside;
+        ss_row_switch(ui, pal, "点击窗口外自动隐藏", &mut hide_outside);
+        if hide_outside != hide_before {
+            self.hide_outside = hide_outside;
+            self.save_settings();
+            if !hide_outside {
+                clickwatch::disarm();
+            }
+        }
+        ui.add_space(4.0);
         // 关窗行为（v0.1.6 用户钉死，不再是设置项）：✕ 恒最小化到
         // 托盘，进程的唯一正常退出 = 托盘菜单「退出」。只放说明。
         ui.label(
@@ -6568,18 +6928,43 @@ impl ShunSeekApp {
         ui.add_space(6.0);
         // 唤醒热键：显示当前组合 +「修改」进捕获态；候选立即跑
         // 冲突检测（名单 + RegisterHotKey 探测），通过才保存生效。
-        ui.label(RichText::new("唤醒热键").color(pal.name_text));
+        ui.label(RichText::new("唤醒热键").size(12.5).color(pal.name_text));
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(self.hotkey_combo.display())
-                    .size(13.0)
-                    .color(pal.name_text),
+            // 当前组合按「键帽」画：淡底 + 发丝描边 + 圆角 8，
+            // 比一行裸文字更像快捷键，也与主窗 Enter 键帽同语言。
+            let g = ui.fonts(|f| {
+                f.layout_no_wrap(
+                    self.hotkey_combo.display(),
+                    FontId::proportional(13.0),
+                    pal.name_text,
+                )
+            });
+            let (r, _) = ui.allocate_exact_size(
+                Vec2::new(g.size().x + 20.0, 28.0),
+                egui::Sense::hover(),
             );
+            ui.painter()
+                .rect_filled(r, Rounding::same(8.0), pal.surface_sel);
+            ui.painter().rect_stroke(
+                r,
+                Rounding::same(8.0),
+                Stroke::new(1.0_f32, pal.edge_line),
+            );
+            ui.painter().galley(
+                egui::pos2(
+                    r.center().x - g.size().x / 2.0,
+                    r.center().y - g.size().y / 2.0,
+                ),
+                g,
+                pal.name_text,
+            );
+            ui.add_space(6.0);
             if self.hotkey_capture {
                 ui.label(
                     RichText::new("请按下快捷键… Esc 取消").color(pal.highlight),
                 );
-            } else if ui.button("修改").clicked() {
+            } else if ss_button(ui, pal, "修改", false) {
                 self.hotkey_capture = true;
                 self.hotkey.set_paused(true);
                 self.hotkey_note.clear();
@@ -6607,7 +6992,7 @@ impl ShunSeekApp {
         }
         if !self.hotkey_recs.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("推荐：").size(11.5).color(pal.path_text));
+                ui.label(RichText::new("推荐：").size(11.5).color(pal.text_mid));
                 let mut pick: Option<hotkey::HotkeyCombo> = None;
                 for c in &self.hotkey_recs {
                     if filter_chip(ui, pal, &c.display(), false).clicked() {
@@ -6623,60 +7008,55 @@ impl ShunSeekApp {
         // ---------- 外观 ----------
         settings_heading(ui, pal, "外观");
         ui.horizontal(|ui| {
-            ui.label(RichText::new("主题").color(pal.name_text));
-            if ui.selectable_label(self.theme == Theme::Dark, "深色").clicked()
-                && self.theme != Theme::Dark
-            {
-                self.set_theme(vctx, Theme::Dark);
-            }
-            if ui.selectable_label(self.theme == Theme::Light, "浅色").clicked()
-                && self.theme != Theme::Light
-            {
-                self.set_theme(vctx, Theme::Light);
+            ui.label(RichText::new("主题").size(12.5).color(pal.name_text));
+            ui.add_space(10.0);
+            let sel = if self.theme == Theme::Dark { 0 } else { 1 };
+            if let Some(i) = ss_segments(ui, pal, "theme", &["深色", "浅色"], sel) {
+                let t = if i == 0 { Theme::Dark } else { Theme::Light };
+                if t != self.theme {
+                    self.set_theme(vctx, t);
+                }
             }
         });
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             // 与主页面宫格/列表按钮共用同一状态与持久化键，页面按钮
             // 是主控件，这里只是「启动时默认显示」的默认项入口。
-            ui.label(RichText::new("启动时默认显示").color(pal.name_text));
-            if ui
-                .selectable_label(self.view_mode == ViewMode::List, "列表")
-                .clicked()
-                && self.view_mode != ViewMode::List
-            {
-                self.set_view_mode(ViewMode::List);
-            }
-            if ui
-                .selectable_label(self.view_mode == ViewMode::Grid, "宫格")
-                .clicked()
-                && self.view_mode != ViewMode::Grid
-            {
-                self.set_view_mode(ViewMode::Grid);
+            ui.label(RichText::new("启动时默认显示").size(12.5).color(pal.name_text));
+            ui.add_space(10.0);
+            let sel = if self.view_mode == ViewMode::List { 0 } else { 1 };
+            if let Some(i) = ss_segments(ui, pal, "view", &["列表", "宫格"], sel) {
+                let m = if i == 0 { ViewMode::List } else { ViewMode::Grid };
+                if m != self.view_mode {
+                    self.set_view_mode(m);
+                }
             }
         });
 
         // ---------- 搜索 ----------
         settings_heading(ui, pal, "搜索");
         ui.horizontal(|ui| {
-            ui.label(RichText::new("结果上限").color(pal.name_text));
-            for n in [60usize, 100, 200] {
-                if ui.selectable_label(self.result_limit == n, n.to_string()).clicked()
-                    && self.result_limit != n
-                {
+            ui.label(RichText::new("结果上限").size(12.5).color(pal.name_text));
+            ui.add_space(10.0);
+            let sel = match self.result_limit {
+                100 => 1,
+                200 => 2,
+                _ => 0,
+            };
+            if let Some(i) = ss_segments(ui, pal, "limit", &["60", "100", "200"], sel) {
+                let n = [60usize, 100, 200][i];
+                if self.result_limit != n {
                     self.result_limit = n;
                     self.save_settings();
                     self.schedule_search();
                 }
             }
         });
+        ui.add_space(4.0);
         let mut fold = self.fold_demoted;
-        if ui
-            .checkbox(
-                &mut fold,
-                RichText::new("折叠不重要结果").color(pal.name_text),
-            )
-            .changed()
-        {
+        let fold_before = fold;
+        ss_row_switch(ui, pal, "折叠不重要结果", &mut fold);
+        if fold != fold_before {
             self.fold_demoted = fold;
             self.save_settings();
             self.rebuild_display();
@@ -6689,7 +7069,7 @@ impl ShunSeekApp {
         } else {
             format!("共 {} 条 · {}", self.index_count, self.index_summary)
         };
-        ui.label(RichText::new(status).size(11.5).color(pal.path_text));
+        ui.label(RichText::new(status).size(11.5).color(pal.text_mid));
         // 图标管线健康度（v0.1.6 可观测性）：真机排障时看这一行就
         // 知道 Shell 取图是全灭还是个别失败，不用再猜。
         let (icon_req, icon_ok, icon_fail) = self.icons.stats();
@@ -6707,17 +7087,14 @@ impl ShunSeekApp {
             } else {
                 "重新建立索引"
             };
-            if ui
-                .add_enabled(!is_rebuilding, egui::Button::new(rebuild_label))
-                .clicked()
-            {
+            if ss_button(ui, pal, rebuild_label, false) && !is_rebuilding {
                 self.start_rebuild();
             }
-            if ui.button("打开缓存文件夹").clicked() {
+            if ss_button(ui, pal, "打开缓存文件夹", false) {
                 let dir = self.data_dir.to_string_lossy().into_owned();
                 opener::open(&dir, "", false);
             }
-            if ui.button("清除索引缓存").clicked() {
+            if ss_button(ui, pal, "清除索引缓存", true) {
                 {
                     let mut g = lock_rec(&self.store);
                     if g.is_mapped() {
@@ -6980,16 +7357,257 @@ impl ShunSeekApp {
     }
 }
 
-/// 设置窗口的分区标题。
+/// 设置窗口的分区标题（v0.1.14）：朱砂短竖条 + 13px 主文字，
+/// 右侧一条发丝线把剩余宽度填满——把一长条原生控件流切成清晰
+/// 的段，扫视时不必逐个读字。
 fn settings_heading(ui: &mut egui::Ui, pal: Palette, title: &str) {
-    ui.add_space(12.0);
-    ui.label(
-        RichText::new(title)
-            .size(12.5)
-            .color(pal.path_text)
-            .strong(),
+    ui.add_space(22.0);
+    ui.horizontal(|ui| {
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(bar, Rounding::same(1.5), pal.accent);
+        ui.add_space(7.0);
+        ui.label(RichText::new(title).size(14.0).color(pal.name_text));
+        let rest = ui.available_width() - 2.0;
+        if rest > 20.0 {
+            let (line, _) = ui.allocate_exact_size(Vec2::new(rest, 1.0), egui::Sense::hover());
+            ui.painter().rect_filled(line, Rounding::ZERO, pal.hairline);
+        }
+    });
+    ui.add_space(10.0);
+}
+
+/// 自绘开关（v0.1.14）：40×22 胶囊，选中朱砂实底 + 白色圆钮，
+/// 切换 0.14s 插值。替代 egui 默认的小灰方块复选框——后者在
+/// 白底上几乎看不出开/关，也不跟主界面同一套圆角语言。
+fn ss_switch(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    id_key: &str,
+    value: &mut bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), egui::Sense::click());
+    let v = ui.ctx().animate_bool_with_time_and_easing(
+        ui.make_persistent_id(("ss_switch", id_key)),
+        *value,
+        0.14,
+        egui::emath::easing::cubic_out,
     );
-    ui.add_space(4.0);
+    if v > 0.0 && v < 1.0 {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(16));
+    }
+    let painter = ui.painter_at(rect);
+    let track = rect.shrink2(Vec2::new(0.0, 1.0));
+    let rounding = Rounding::same(track.height() / 2.0);
+    let cold = pal.chip_hover_fill;
+    let hot = pal.accent;
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * v) as u8;
+    painter.rect_filled(
+        track,
+        rounding,
+        Color32::from_rgb(
+            mix(cold.r(), hot.r()),
+            mix(cold.g(), hot.g()),
+            mix(cold.b(), hot.b()),
+        ),
+    );
+    painter.rect_stroke(
+        track,
+        rounding,
+        Stroke::new(1.0_f32, pal.edge_line),
+    );
+    let cx = track.left() + track.height() / 2.0 + (track.width() - track.height()) * v;
+    painter.circle_filled(
+        egui::pos2(cx, track.center().y),
+        track.height() / 2.0 - 3.0,
+        Color32::WHITE,
+    );
+    if resp.clicked() {
+        *value = !*value;
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 设置页一行「左侧文字 + 右侧开关」：开关贴右边界，行高 30。
+fn ss_row_switch(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    value: &mut bool,
+) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 36.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 1.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.5),
+        pal.name_text,
+    );
+    let sw = egui::Rect::from_min_size(
+        egui::pos2(
+            ui.max_rect().right() - 40.0,
+            rect.center().y - 11.0,
+        ),
+        Vec2::new(40.0, 22.0),
+    );
+    if ui
+        .interact(
+            sw,
+            ui.make_persistent_id(("ss_switch_hit", label)),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        *value = !*value;
+    }
+    let v = ui.ctx().animate_bool_with_time_and_easing(
+        ui.make_persistent_id(("ss_switch", label)),
+        *value,
+        0.14,
+        egui::emath::easing::cubic_out,
+    );
+    if v > 0.0 && v < 1.0 {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(16));
+    }
+    let painter = ui.painter_at(sw);
+    let rounding = Rounding::same(sw.height() / 2.0);
+    let cold = pal.chip_hover_fill;
+    let hot = pal.accent;
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * v) as u8;
+    painter.rect_filled(
+        sw,
+        rounding,
+        Color32::from_rgb(
+            mix(cold.r(), hot.r()),
+            mix(cold.g(), hot.g()),
+            mix(cold.b(), hot.b()),
+        ),
+    );
+    painter.rect_stroke(sw, rounding, Stroke::new(1.0_f32, pal.edge_line));
+    let cx = sw.left() + sw.height() / 2.0 + (sw.width() - sw.height()) * v;
+    painter.circle_filled(
+        egui::pos2(cx, sw.center().y),
+        sw.height() / 2.0 - 3.0,
+        Color32::WHITE,
+    );
+}
+
+/// 分段选择器（v0.1.14）：整条胶囊容器 + 选中段朱砂实底白字，
+/// 替代 egui::selectable_label 的蓝色方块高亮。
+fn ss_segments(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    id_key: &str,
+    labels: &[&str],
+    selected: usize,
+) -> Option<usize> {
+    let font = FontId::proportional(13.0);
+    let galleys: Vec<_> = labels
+        .iter()
+        // v0.1.15 修「看不清」：layout 时不能写死颜色，否则选中段
+        // 是「灰字压在朱砂底」——galley 里已着色的 run 不会接受
+        // painter.galley 的 fallback 色。用 PLACEHOLDER 让颜色交给
+        // 绘制端决定，选中段才真正是白字。
+        .map(|l| {
+            ui.fonts(|f| {
+                f.layout_no_wrap(l.to_string(), font.clone(), Color32::PLACEHOLDER)
+            })
+        })
+        .collect();
+    let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + 26.0).collect();
+    let w: f32 = widths.iter().sum::<f32>() + 6.0;
+    let h = 32.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let rounding = Rounding::same(h / 2.0);
+    painter.rect_filled(rect, rounding, pal.surface_sel);
+    painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, pal.hairline));
+    let mut clicked = None;
+    let mut x = rect.left() + 3.0;
+    for (i, g) in galleys.iter().enumerate() {
+        let seg = egui::Rect::from_min_size(
+            egui::pos2(x, rect.top() + 3.0),
+            Vec2::new(widths[i], h - 6.0),
+        );
+        let resp = ui.interact(
+            seg,
+            ui.make_persistent_id(("ss_seg", id_key, i)),
+            egui::Sense::click(),
+        );
+        let sr = Rounding::same(seg.height() / 2.0);
+        if i == selected {
+            painter.rect_filled(seg, sr, pal.accent);
+        } else if resp.hovered() {
+            painter.rect_filled(seg, sr, pal.chip_hover_fill);
+        }
+        let col = if i == selected {
+            Color32::WHITE
+        } else {
+            pal.text_mid
+        };
+        painter.galley(
+            egui::pos2(
+                seg.center().x - g.size().x / 2.0,
+                seg.center().y - g.size().y / 2.0,
+            ),
+            g.clone(),
+            col,
+        );
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+        // v0.1.15 修：段位置必须逐段累加，否则所有段叠在同一格，
+        // 后画的选中段把前面几段的文字整个盖住（真机只剩一枚
+        // 孤零零的红胶囊，右边一片空白）。
+        x += widths[i];
+    }
+    clicked
+}
+
+/// 自绘胶囊按钮（v0.1.14）：高 30、全圆角，淡底 + 发丝描边，
+/// hover 浮出 SurfaceHover；danger = 朱砂文字 + 朱砂 35% 描边。
+fn ss_button(ui: &mut egui::Ui, pal: Palette, label: &str, danger: bool) -> bool {
+    let font = FontId::proportional(13.0);
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER));
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x + 30.0, 32.0),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter_at(rect);
+    let rounding = Rounding::same(15.0);
+    if resp.hovered() {
+        painter.rect_filled(
+            rect,
+            rounding,
+            if danger { pal.pill_fill } else { pal.surface_hover },
+        );
+    } else {
+        painter.rect_filled(rect, rounding, pal.surface_sel);
+    }
+    painter.rect_stroke(
+        rect,
+        rounding,
+        Stroke::new(
+            1.0_f32,
+            if danger { pal.pill_stroke } else { pal.edge_line },
+        ),
+    );
+    painter.galley(
+        egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        if danger { pal.accent } else { pal.text_mid },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 /// egui 按键 → Windows 虚拟键码（热键捕获用；经 Debug 名映射，
@@ -7076,6 +7694,24 @@ impl eframe::App for ShunSeekApp {
         // 先建成再隐藏的，ViewportBuilder 没有初始不可见选项）
         if START_HIDDEN.swap(false, Ordering::SeqCst) {
             self.hide(ctx);
+        }
+        // 启动自愈（v0.1.15）：见 boot_show_frames 字段说明。放在
+        // --tray 分支之后，静默启动不会被这里提前弹窗。
+        if self.boot_show_frames > 0 {
+            self.boot_show_frames -= 1;
+            #[cfg(windows)]
+            if matches!(winvis::state(), winvis::VisState::Hidden) {
+                winvis::show();
+                self.visible = true;
+            }
+        }
+        if let Some(p) = self.probe.take() {
+            match p.as_str() {
+                "type" => self.expanded_filter = Some(FilterKind::Type),
+                "scope" => self.expanded_filter = Some(FilterKind::Scope),
+                "settings" => self.open_settings(),
+                _ => {}
+            }
         }
         // 单实例唤醒（v0.1.8 建链、v0.1.12 换执行点）：等待线程
         // 已在事件到达时直接 winvis::show() 把窗口呼出来，这里
@@ -7307,6 +7943,7 @@ impl eframe::App for ShunSeekApp {
         // 控件矩形集轮换：本帧绘制期间推进 blockers_cur 的全部
         // rect 成为下一帧按下判定的 blockers_prev（handle_window_press）
         self.blockers_prev = std::mem::take(&mut self.blockers_cur);
+        self.scroll_prev = std::mem::take(&mut self.scroll_cur);
     }
 }
 
