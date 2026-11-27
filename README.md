@@ -88,10 +88,10 @@ crates/
 
 ```powershell
 cargo build --release -p shunseek-app
-..\build\target\release\shunseek-app.exe
+..\build(rust_version)\target\release\shunseek-app.exe
 ```
 
-编译产物与打包产物统一放在仓库外的 `../build/`（`build/target`、`build/dist`），
+编译产物与打包产物统一放在仓库外的 `../build(rust_version)/`（`target`、`dist`），
 源码目录只留开发文件；`.cargo/config.toml` 已把 `target-dir` 指过去。
 
 首次启动无缓存索引，会先出演示数据/空索引，后台建好真实索引后自动换上；

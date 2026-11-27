@@ -1281,19 +1281,31 @@ fn portable_roots() -> Vec<PathBuf> {
 fn scope_extra_roots() -> Vec<PathBuf> {
     let s = load_settings();
     let base = PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default());
+    // 范围是「全部」时，预设与磁盘都在便携范围里（%USERPROFILE% 等
+    // 全树本来就要走），再整盘加进来会让建索引慢上几倍，没必要。
+    let all = PRESET_KEYS
+        .iter()
+        .all(|(k, _, _)| s.scope_presets.iter().any(|x| x == k))
+        && existing_drives()
+            .iter()
+            .all(|d| s.scope_drives.contains(d));
     let mut out: Vec<PathBuf> = Vec::new();
-    for (key, sub, _) in PRESET_KEYS {
-        if s.scope_presets.iter().any(|k| k == key) {
-            out.push(if sub.is_empty() {
-                base.clone()
-            } else {
-                base.join(sub)
-            });
+    if !all {
+        for (key, sub, _) in PRESET_KEYS {
+            if s.scope_presets.iter().any(|k| k == key) {
+                out.push(if sub.is_empty() {
+                    base.clone()
+                } else {
+                    base.join(sub)
+                });
+            }
+        }
+        for d in &s.scope_drives {
+            out.push(PathBuf::from(format!("{d}:\\")));
         }
     }
-    for d in &s.scope_drives {
-        out.push(PathBuf::from(format!("{d}:\\")));
-    }
+    // 自定义文件夹无论全不全都要扫：用户从「全部」切到「只搜这个」时
+    // 索引里已经现成有它。
     for c in &s.scope_custom {
         out.push(PathBuf::from(c));
     }
@@ -1476,9 +1488,29 @@ fn rebuild_windows(_dir: &PathBuf, tx: &Sender<IndexMsg>, ctx: &egui::Context) {
         }
     } else {
         // ---- 便携模式：便携范围遍历（噪音跳过 + 排除前缀）----
-        // 范围面板勾选的根一并走：否则自定义文件夹永远搜不到。
-        let mut walk_roots = portable_roots();
-        walk_roots.extend(uncovered_roots(scope_extra_roots(), &walk_roots));
+        // 分两段：先只扫「范围根」（范围面板里勾选的预设/磁盘/自定义
+        // 文件夹）并把索引换入一次——用户刚添加的文件夹几秒内就能搜到；
+        // 再走 %USERPROFILE% 全树（慢），完成后整体换入最终版。
+        let base_roots = portable_roots();
+        let extra = uncovered_roots(scope_extra_roots(), &base_roots);
+        if !extra.is_empty() {
+            let v = guarded(|| {
+                walker::walk_with_excludes(&extra, true, &portable_excludes())
+            })
+            .unwrap_or_default();
+            let n = v.len();
+            entries.extend(v);
+            send_index_stage(
+                tx,
+                ctx,
+                &entries,
+                &roots,
+                format!("索引：范围根 {n} · 全量建立中…"),
+                false,
+            );
+        }
+        let mut walk_roots = base_roots;
+        walk_roots.extend(extra);
         let v = guarded(|| {
             walker::walk_with_excludes(&walk_roots, true, &portable_excludes())
         })
@@ -1901,6 +1933,9 @@ struct ShunSeekApp {
     watch_active: Arc<AtomicBool>,
     /// 是否有重建正在跑（共享给托盘菜单置灰与后台回调）。
     rebuilding: Arc<AtomicBool>,
+    /// 重建进行中又被要求重建（例如刚加了自定义文件夹）时的补跑标记：
+    /// 当前这轮跑完立刻再来一轮，避免新根被“已有重建在跑”挡掉。
+    pending_rebuild: bool,
     /// 展开折叠组时的一次性结果上限提升（→300，见 toggle_group）：
     /// Some 时 schedule_search 用它代替 result_limit；查询文本一变
     /// 即失效（override_query 记武装时的查询）。
@@ -2240,6 +2275,7 @@ impl ShunSeekApp {
             flush_now,
             watch_active,
             rebuilding: rebuilding.clone(),
+            pending_rebuild: false,
             limit_override: None,
             override_query: String::new(),
             search_cancel: Arc::new(AtomicBool::new(true)),
@@ -3268,6 +3304,9 @@ impl ShunSeekApp {
     /// 就忽略（并发护栏），进度沿用分级建立的状态栏摘要。
     fn start_rebuild(&mut self) {
         if self.rebuilding.swap(true, Ordering::SeqCst) {
+            // 已有重建在跑：记为补跑，等这轮结束再来一次，别让新加的
+            // 文件夹被“重建已在进行”这个护栏悄悄吞掉。
+            self.pending_rebuild = true;
             return;
         }
         self.tray.set_rebuild_enabled(false);
@@ -3462,6 +3501,11 @@ impl ShunSeekApp {
                     self.rebuild_home_items();
                     if final_stage {
                         self.rebuilding.store(false, Ordering::SeqCst);
+                        // 重建期间又被要求重建（新加范围根）→ 接着补跑一轮
+                        if self.pending_rebuild {
+                            self.pending_rebuild = false;
+                            self.start_rebuild();
+                        }
                         self.tray.set_rebuild_enabled(true);
                         self.status_alert = count == 0;
                         self.status = if count == 0 {
@@ -6814,7 +6858,7 @@ fn scope_row(
     w: f32,
     selected: bool,
 ) -> (bool, bool, bool) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 42.0), egui::Sense::click());
     let painter = ui.painter_at(rect);
     let rr = Rounding::same(9.0);
     if selected {
@@ -6827,8 +6871,8 @@ fn scope_row(
     if selected {
         painter.rect_filled(
             egui::Rect::from_min_size(
-                egui::pos2(rect.left() + 3.0, rect.center().y - 9.0),
-                Vec2::new(3.0, 18.0),
+                egui::pos2(rect.left() + 3.0, rect.center().y - 10.0),
+                Vec2::new(3.0, 20.0),
             ),
             Rounding::same(1.5),
             pal.accent,
@@ -6836,19 +6880,33 @@ fn scope_row(
     }
     let glyph = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 18.0, rect.center().y),
-        Vec2::splat(14.0),
+        Vec2::splat(15.0),
     );
     paint_folder_glyph(
         &painter,
         glyph,
         if selected { pal.accent } else { pal.text_mid },
     );
-    painter.text(
-        egui::pos2(rect.left() + 32.0, rect.center().y),
+    // 两行：名称在上，完整路径在下（v0.1.17）——只写文件夹名时，
+    // 同一个「project_开」到底是 C 盘还是 E 盘看不出来，用户会误判。
+    let text_clip = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right() - 34.0, rect.bottom()),
+    );
+    let tp = painter.with_clip_rect(text_clip);
+    tp.text(
+        egui::pos2(rect.left() + 32.0, rect.top() + 15.0),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(12.0),
         if selected { pal.accent } else { pal.text_mid },
+    );
+    tp.text(
+        egui::pos2(rect.left() + 32.0, rect.top() + 31.0),
+        egui::Align2::LEFT_CENTER,
+        full_path,
+        egui::FontId::proportional(9.5),
+        pal.path_text,
     );
     let x_rect = egui::Rect::from_min_size(
         egui::pos2(rect.right() - 26.0, rect.center().y - 8.0),

@@ -9,7 +9,7 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
-    # 本地 .cargo/config.toml 把 target-dir 指到 ../build/target（仓库外），
+    # 本地 .cargo/config.toml 把 target-dir 指到 ../build(rust_version)/target（仓库外），
     # CI 里没有那个目录、缓存也按仓库内 target 走，这里显式覆盖回来。
     env:
       CARGO_TARGET_DIR: target
