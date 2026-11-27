@@ -67,6 +67,10 @@ pub fn build_index(
         });
     }
 
+    drop(seen_paths);
+    drop(ref_to_index);
+    drop(entries);
+
     let mut builder = Builder::new();
     for p in pending {
         builder.add(&p.name, &p.dir, p.category, p.file_ref);

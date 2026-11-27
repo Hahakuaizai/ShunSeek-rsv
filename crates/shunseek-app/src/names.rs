@@ -16,6 +16,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
+/// 显示名缓存上限（个 path），避免长会话无限增长。
+const MAX_NAME_KEYS: usize = 1024;
+
 pub struct NameService {
     /// path → 显示名；None = 已查过、无替换名（或不适用）。
     cache: HashMap<String, Option<String>>,
@@ -51,13 +54,19 @@ impl NameService {
     pub fn get(&mut self, path: &str, is_dir: bool) -> Option<String> {
         if let Some(rx) = &self.rx {
             while let Ok((p, name)) = rx.try_recv() {
-                self.cache.insert(p, name);
+                self.requested.remove(&p);
+                if self.cache.len() < MAX_NAME_KEYS {
+                    self.cache.insert(p, name);
+                }
             }
         }
         if let Some(hit) = self.cache.get(path) {
             return hit.clone();
         }
-        if Self::qualifies(path, is_dir) && !self.requested.contains(path) {
+        if self.cache.len() + self.requested.len() < MAX_NAME_KEYS
+            && Self::qualifies(path, is_dir)
+            && !self.requested.contains(path)
+        {
             if let Some(tx) = &self.tx {
                 if tx.send((path.to_string(), is_dir)).is_ok() {
                     self.requested.insert(path.to_string());
@@ -65,6 +74,17 @@ impl NameService {
             }
         }
         None
+    }
+
+    /// 隐藏到托盘时清空显示名缓存与在途请求，释放内存。
+    pub fn clear(&mut self) {
+        if let Some(rx) = &self.rx {
+            while rx.try_recv().is_ok() {}
+        }
+        self.cache.clear();
+        self.cache.shrink_to_fit();
+        self.requested.clear();
+        self.requested.shrink_to_fit();
     }
 }
 

@@ -37,9 +37,9 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use shunseek_core::Category;
 
-/// 图标缓存上限（个 key）：v0.1.9 由 256 提到 1024（64px 图源
-/// 一张 16KB，封顶约 16MB），长会话里少出现「超限后新 key 不取图」。
-const MAX_ICON_KEYS: usize = 1024;
+/// 图标缓存上限（个 key）：64px 图源一张约 16KB，256 个封顶约 4MB，
+/// 配合隐藏时清理，有效控制前台与后台内存占用。
+const MAX_ICON_KEYS: usize = 256;
 /// 图标在结果行内的绘制边长（原版行图标 24×24，占位盘 IconPlate 同尺寸）。
 pub const ICON_SIZE: f32 = 24.0;
 
@@ -99,6 +99,19 @@ impl IconCache {
 
     pub fn stats(&self) -> (usize, usize, usize) {
         (self.requested_total, self.loaded_count, self.failed_count)
+    }
+
+    /// 隐藏到托盘时清空图标纹理与请求状态，释放内存。
+    pub fn clear(&mut self) {
+        if let Some(rx) = &self.rx {
+            while rx.try_recv().is_ok() {}
+        }
+        self.textures.clear();
+        self.textures.shrink_to_fit();
+        self.requested.clear();
+        self.requested.shrink_to_fit();
+        self.attempts.clear();
+        self.attempts.shrink_to_fit();
     }
 
     pub fn texture(&mut self, ctx: &egui::Context, key: &str) -> Option<egui::TextureHandle> {

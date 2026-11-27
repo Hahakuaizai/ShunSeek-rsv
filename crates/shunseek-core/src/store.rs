@@ -545,14 +545,28 @@ impl Builder {
         self.name_off.push(self.name_pool.len() as u32);
         pinyin::initials_into(name, &mut self.init_pool);
         self.init_off.push(self.init_pool.len() as u32);
-        pinyin::full_into(name, &mut self.full_pool);
+        // 纯 ASCII 名字在 initials_pool 已完整保留，跳过全拼池写入可显著减小索引体积
+        if !name.is_ascii() {
+            pinyin::full_into(name, &mut self.full_pool);
+        }
         self.full_off.push(self.full_pool.len() as u32);
         self.dir_ids.push(dir_id);
         self.cats.push(category as u8);
         self.refs.push(file_ref);
     }
 
-    pub fn freeze(self) -> IndexStore {
+    pub fn freeze(mut self) -> IndexStore {
+        self.dirs_off.shrink_to_fit();
+        self.dirs_pool.shrink_to_fit();
+        self.name_off.shrink_to_fit();
+        self.name_pool.shrink_to_fit();
+        self.init_off.shrink_to_fit();
+        self.init_pool.shrink_to_fit();
+        self.full_off.shrink_to_fit();
+        self.full_pool.shrink_to_fit();
+        self.dir_ids.shrink_to_fit();
+        self.cats.shrink_to_fit();
+        self.refs.shrink_to_fit();
         let count = self.cats.len() as u32;
         let dir_count = (self.dirs_off.len() - 1) as u32;
         IndexStore {

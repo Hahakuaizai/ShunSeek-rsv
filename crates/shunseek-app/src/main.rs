@@ -68,10 +68,58 @@ mod winvis;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// 隐藏后防抖工作集修剪代数，防止刚隐藏又被呼出时误修剪。
+static HIDE_TRIM_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 紧缩进程堆并请求 Windows 修剪工作集，将已释放的堆内存归还 OS。
+#[cfg(windows)]
+fn trim_working_set() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessHeap() -> isize;
+        fn HeapCompact(hheap: isize, dwflags: u32) -> usize;
+        fn SetProcessWorkingSetSize(
+            hprocess: isize,
+            dwminimumworkingsetsize: usize,
+            dwmaximumworkingsetsize: usize,
+        ) -> i32;
+    }
+    unsafe {
+        let heap = GetProcessHeap();
+        if heap != 0 {
+            HeapCompact(heap, 0);
+        }
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(not(windows))]
+fn trim_working_set() {}
+
+/// 隐藏到托盘后延迟 1.2s 修剪工作集（防抖：期间若再次呼出则跳过）。
+fn schedule_hidden_trim() {
+    let gen = HIDE_TRIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::Builder::new()
+        .name("shunseek-memtrim".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(1200));
+            if HIDE_TRIM_GEN.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            #[cfg(windows)]
+            if winvis::state() != winvis::VisState::Hidden {
+                return;
+            }
+            trim_working_set();
+        })
+        .ok();
+}
 
 use egui::{
     Align, Align2, Color32, FontId, Key, Layout, RichText, Rounding, Stroke,
@@ -701,6 +749,8 @@ fn serif(size: f32) -> FontId {
 }
 
 fn install_cjk_font(ctx: &egui::Context) {
+    // 仅加载一份系统 CJK 字体（Windows 优先微软雅黑），SERIF_FAMILY 直接复用，
+    // 避免再读入 18MB+ 的第二份字体（simsun.ttc）导致双倍字体内存占用。
     let sans_candidates: &[&str] = &[
         // Windows
         r"C:\Windows\Fonts\msyh.ttc", // 微软雅黑
@@ -714,52 +764,32 @@ fn install_cjk_font(ctx: &egui::Context) {
         // macOS
         "/System/Library/Fonts/PingFang.ttc",
     ];
-    // 原版 SerifFont 栈：Noto Serif SC → 华文中宋 → SimSun（宋体）。
-    // 本机一般只有宋体可命中；Noto Serif SC 若装了优先。
-    let serif_candidates: &[&str] = &[
-        r"C:\Windows\Fonts\NotoSerifSC-Regular.otf",
-        r"C:\Windows\Fonts\simsun.ttc", // 宋体
-        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSerifCJK-Regular.ttc",
-        "/System/Library/Fonts/Supplemental/Songti.ttc",
-    ];
-    let load = |paths: &[&str]| paths.iter().find_map(|p| std::fs::read(p).ok());
-    let sans = load(sans_candidates);
-    let serif_bytes = load(serif_candidates);
-    if sans.is_none() && serif_bytes.is_none() {
+    let sans = sans_candidates.iter().find_map(|p| std::fs::read(p).ok());
+    let Some(bytes) = sans else {
         eprintln!("ShunSeek: 未找到系统 CJK 字体，汉字可能显示为缺字框");
         return;
-    }
+    };
     let mut fonts = egui::FontDefinitions::default();
-    if let Some(bytes) = sans {
-        fonts.font_data.insert(
-            "cjk".to_owned(),
-            egui::FontData::from_owned(bytes),
-        );
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            if let Some(list) = fonts.families.get_mut(&family) {
-                list.insert(0, "cjk".to_owned());
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        egui::FontData::from_owned(bytes),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            list.insert(0, "cjk".to_owned());
+        }
+    }
+    let mut serif_list = vec!["cjk".to_owned()];
+    if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional) {
+        for name in prop {
+            if name != "cjk" {
+                serif_list.push(name.clone());
             }
         }
     }
-    // Serif 家族：优先真衬线字体，缺失时回退无衬线 CJK（汉字不缺字，
-    // 只是字形不衬线，属已知近似差距）。
-    let mut serif_list: Vec<String> = Vec::new();
-    if let Some(bytes) = serif_bytes {
-        fonts.font_data.insert(
-            "serif_cjk".to_owned(),
-            egui::FontData::from_owned(bytes),
-        );
-        serif_list.push("serif_cjk".to_owned());
-    }
-    if fonts.font_data.contains_key("cjk") {
-        serif_list.push("cjk".to_owned());
-    }
-    if !serif_list.is_empty() {
-        fonts
-            .families
-            .insert(egui::FontFamily::Name(SERIF_FAMILY.into()), serif_list);
-    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(SERIF_FAMILY.into()), serif_list);
     ctx.set_fonts(fonts);
 }
 // ---------------------------------------------------------------- 数据目录
@@ -890,8 +920,13 @@ enum IndexMsg {
         final_stage: bool,
         watch: Vec<(char, Option<i64>)>,
     },
-    /// 最终缓存落盘结果（在 UI 换入新索引、释放旧 Mmap 后由后台保存回传）。
-    CacheSaved(bool),
+    /// 最终缓存落盘结果（在 UI 换入新索引、释放旧 Mmap 后由后台保存回传，
+    /// 成功时附带重新 mmap 后的存储实例以释放堆内存）。
+    CacheSaved {
+        store_gen: u64,
+        saved: bool,
+        mapped: Option<Arc<IndexStore>>,
+    },
     Delta {
         gen: u64,
         delta_count: usize,
@@ -1057,8 +1092,40 @@ fn send_index_stage_watch(
     final_stage: bool,
     watch: Vec<(char, Option<i64>)>,
 ) {
+    send_index_stage_watch_owned(
+        tx,
+        ctx,
+        entries.to_vec(),
+        roots,
+        summary,
+        final_stage,
+        watch,
+    );
+}
+
+fn send_index_stage_owned(
+    tx: &Sender<IndexMsg>,
+    ctx: &egui::Context,
+    entries: Vec<RawEntry>,
+    roots: &HashMap<char, String>,
+    summary: String,
+    final_stage: bool,
+) {
+    send_index_stage_watch_owned(tx, ctx, entries, roots, summary, final_stage, Vec::new());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_index_stage_watch_owned(
+    tx: &Sender<IndexMsg>,
+    ctx: &egui::Context,
+    entries: Vec<RawEntry>,
+    roots: &HashMap<char, String>,
+    summary: String,
+    final_stage: bool,
+    watch: Vec<(char, Option<i64>)>,
+) {
     let roots = if roots.is_empty() { None } else { Some(roots) };
-    let store = build_index(entries.to_vec(), roots);
+    let store = build_index(entries, roots);
     let count = store.count();
     let _ = tx.send(IndexMsg::Rebuilt {
         store,
@@ -1509,10 +1576,8 @@ fn rebuild_windows(_dir: &PathBuf, tx: &Sender<IndexMsg>, ctx: &egui::Context) {
                 false,
             );
         }
-        let mut walk_roots = base_roots;
-        walk_roots.extend(extra);
         let v = guarded(|| {
-            walker::walk_with_excludes(&walk_roots, true, &portable_excludes())
+            walker::walk_with_excludes(&base_roots, true, &portable_excludes())
         })
         .unwrap_or_default();
         walk_count = v.len();
@@ -1535,11 +1600,11 @@ fn rebuild_windows(_dir: &PathBuf, tx: &Sender<IndexMsg>, ctx: &egui::Context) {
         parts.push(format!("全盘遍历 {full_count}"));
     }
 
-    // ---- 最终一级：换入后由 UI 释放旧 Mmap 再异步写缓存 ----
+    // ---- 最终一级：按值消费 entries（避免深拷贝翻倍峰值），换入后由 UI 异步写缓存并切回 Mmap ----
     if mft_mode && mft_total > 0 {
-        send_index_stage_watch(tx, ctx, &entries, &roots, parts.join(" · "), true, watch_plan);
+        send_index_stage_watch_owned(tx, ctx, entries, &roots, parts.join(" · "), true, watch_plan);
     } else {
-        send_index_stage(tx, ctx, &entries, &roots, parts.join(" · "), true);
+        send_index_stage_owned(tx, ctx, entries, &roots, parts.join(" · "), true);
     }
 }
 
@@ -1591,6 +1656,7 @@ fn spawn_watch_supervisor(
             for (drive, _) in &plan {
                 dir_paths.insert(tag_ref(*drive, 5), format!("{drive}:\\"));
             }
+            dir_paths.shrink_to_fit();
             let (ch_tx, ch_rx) = std::sync::mpsc::channel::<(char, UsnChange)>();
             let mut watchers: Vec<Arc<UsnWatcher>> = Vec::new();
             for (drive, start) in &plan {
@@ -1989,6 +2055,8 @@ struct ShunSeekApp {
     /// 只读显示用；状态栏展示的是截断版）。
     index_count: usize,
     index_summary: String,
+    /// 当前主索引代数，防止旧异步 CacheSaved 覆盖更新后的 store。
+    store_gen: u64,
     /// 「清除使用记录」二次确认状态（点一次变确认、再点才执行）。
     usage_confirm: bool,
     /// 设置窗口内的操作反馈（清缓存 / 清记录后显示在窗口底部）。
@@ -2132,12 +2200,16 @@ impl ShunSeekApp {
             .as_ref()
             .map(|(s, _)| s == &current_scope())
             .unwrap_or(false);
+        let mut cache_fresh = false;
         let (store, status) = if scope_ok {
             match IndexStore::load_mmap(&index_path) {
                 Ok(s) => {
                     let n = s.count();
                     let built = meta.map(|(_, b)| b).unwrap_or(0);
                     let stale = now_unix().saturating_sub(built) > 24 * 3600;
+                    if n > 0 && !stale {
+                        cache_fresh = true;
+                    }
                     let status = if stale {
                         format!(
                             "缓存索引 · {} · {} 条（后台更新中）",
@@ -2161,14 +2233,17 @@ impl ShunSeekApp {
             // scope 判定），直接冷建，后台重建马上跟上。
             (build_index(Vec::new(), None), "正在准备索引…".to_string())
         };
+        let initial_index_count = store.count();
 
         let (search_tx, search_rx) = std::sync::mpsc::channel();
         let (index_tx, index_rx) = std::sync::mpsc::channel();
         let index_tx_app = index_tx.clone();
-        let rebuilding = Arc::new(AtomicBool::new(true));
+        let rebuilding = Arc::new(AtomicBool::new(!cache_fresh));
         let watch_active = Arc::new(AtomicBool::new(false));
         let flush_now = Arc::new(AtomicBool::new(false));
-        spawn_rebuild(dir.clone(), index_tx.clone(), cc.egui_ctx.clone());
+        if !cache_fresh {
+            spawn_rebuild(dir.clone(), index_tx.clone(), cc.egui_ctx.clone());
+        }
 
         // 单实例唤醒等待线程（v0.1.8，Windows）：main 建好的命名
         // 事件句柄在这里等——第二进程 SetEvent 后，本线程**直接**
@@ -2316,8 +2391,9 @@ impl ShunSeekApp {
             result_limit: settings.result_limit,
             fold_demoted: settings.fold_demoted,
             hide_outside: settings.hide_outside,
-            index_count: 0,
+            index_count: initial_index_count,
             index_summary: String::new(),
+            store_gen: 0,
             usage_confirm: false,
             settings_note: String::new(),
             hotkey_capture: false,
@@ -2354,6 +2430,38 @@ impl ShunSeekApp {
         app.pins = load_pins(&dir);
         app.rebuild_home_items();
         app.schedule_search();
+        if cache_fresh {
+            #[cfg(windows)]
+            if is_elevated() {
+                let mut watch_plan: Vec<(char, Option<i64>)> = Vec::new();
+                for drive in 'C'..='Z' {
+                    if std::path::Path::new(&format!("{drive}:\\")).exists()
+                        && drive_fs_name(drive)
+                            .map(|fs| fs.eq_ignore_ascii_case("NTFS"))
+                            .unwrap_or(false)
+                    {
+                        let start = shunseek_core::sources::usn::query_next_usn(drive);
+                        watch_plan.push((drive, start));
+                    }
+                }
+                if !watch_plan.is_empty() {
+                    let gen = app.watch_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    app.watch_active.store(true, Ordering::SeqCst);
+                    spawn_watch_supervisor(
+                        gen,
+                        watch_plan,
+                        app.store.clone(),
+                        app.delta_state.clone(),
+                        app.watch_gen.clone(),
+                        app.flush_now.clone(),
+                        app.index_tx.clone(),
+                        app.egui_ctx.clone(),
+                        initial_index_count,
+                    );
+                }
+            }
+            trim_working_set();
+        }
         app
     }
 
@@ -2578,6 +2686,17 @@ impl ShunSeekApp {
         self.ctx_menu = None;
         self.home_add_open = false;
         self.pending_drag = None;
+        // 隐藏到托盘时释放瞬态缓存（保留 query / pins / home_items，
+        // 再次呼出时由 on_shown 的 schedule_search() 立即恢复结果）。
+        self.rows.clear();
+        self.rows.shrink_to_fit();
+        self.display.clear();
+        self.display.shrink_to_fit();
+        self.meta_cache.clear();
+        self.meta_cache.shrink_to_fit();
+        self.icons.clear();
+        self.names.clear();
+        schedule_hidden_trim();
     }
 
     /// 呼出（UI 线程内的落点）。实际动作收敛到 winvis::show()
@@ -2606,6 +2725,7 @@ impl ShunSeekApp {
     /// 唤醒线程直接 ShowWindow 呼出时，可见性已经落地，UI 在
     /// 随后的帧里只需补这组副作用——见 after_external_summon）。
     fn on_shown(&mut self) {
+        HIDE_TRIM_GEN.fetch_add(1, Ordering::SeqCst);
         // 呼出保留查询词 + 全选（v0.1.9 对齐原版 Show 的
         // SelectAll 口径）：打字即覆盖、按方向键即改词，比旧版
         // 「呼出即清空」更接近原版体感。全选在 draw_search_box
@@ -3492,6 +3612,8 @@ impl ShunSeekApp {
                     watch,
                 } => {
                     let new_arc = Arc::new(store);
+                    self.store_gen = self.store_gen.wrapping_add(1);
+                    let save_gen = self.store_gen;
                     {
                         let mut g = lock_rec(&self.store);
                         *g = new_arc.clone();
@@ -3505,15 +3627,17 @@ impl ShunSeekApp {
                         if self.pending_rebuild {
                             self.pending_rebuild = false;
                             self.start_rebuild();
+                        } else {
+                            self.tray.set_rebuild_enabled(true);
                         }
-                        self.tray.set_rebuild_enabled(true);
                         self.status_alert = count == 0;
                         self.status = if count == 0 {
                             ALERT_EMPTY_INDEX.to_string()
                         } else {
                             format!("{} 项", group_thousands(count))
                         };
-                        // 旧 Mmap 已从 self.store 卸下，在后台线程异步落盘（短暂重试避开搜索线程持有）
+                        // 旧 Mmap 已从 self.store 卸下，在后台线程异步落盘；
+                        // 保存完成后立即切回 Mmap 并通知 UI 释放 Owned 堆内存。
                         let save_dir = self.data_dir.clone();
                         let save_tx = self.index_tx.clone();
                         let save_ctx = self.egui_ctx.clone();
@@ -3531,7 +3655,17 @@ impl ShunSeekApp {
                                     }
                                     std::thread::sleep(Duration::from_millis(50));
                                 }
-                                let _ = save_tx.send(IndexMsg::CacheSaved(saved));
+                                drop(new_arc);
+                                let mapped = if saved {
+                                    IndexStore::load_mmap(&path).ok().map(Arc::new)
+                                } else {
+                                    None
+                                };
+                                let _ = save_tx.send(IndexMsg::CacheSaved {
+                                    store_gen: save_gen,
+                                    saved,
+                                    mapped,
+                                });
                                 save_ctx.request_repaint();
                             })
                             .ok();
@@ -3566,8 +3700,17 @@ impl ShunSeekApp {
                     }
                     self.schedule_search();
                 }
-                IndexMsg::CacheSaved(saved) => {
-                    if !saved && !self.status_alert && self.index_count > 0 {
+                IndexMsg::CacheSaved {
+                    store_gen,
+                    saved,
+                    mapped,
+                } => {
+                    if saved && store_gen == self.store_gen {
+                        if let Some(mmap_store) = mapped {
+                            *lock_rec(&self.store) = mmap_store;
+                            trim_working_set();
+                        }
+                    } else if !saved && !self.status_alert && self.index_count > 0 {
                         self.status = format!("{} 项 · 缓存写入失败", group_thousands(self.index_count));
                     }
                 }
@@ -7579,6 +7722,9 @@ impl ShunSeekApp {
             return;
         }
         if !self.meta_cache.contains_key(&target.path) {
+            if self.meta_cache.len() >= 512 {
+                self.meta_cache.clear();
+            }
             let meta = std::fs::metadata(&target.path).ok().map(|m| FileMeta {
                 is_dir: m.is_dir(),
                 size: m.len(),
