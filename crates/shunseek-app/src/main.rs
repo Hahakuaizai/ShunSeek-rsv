@@ -535,6 +535,10 @@ struct Settings {
     hide_outside: bool,
     /// ✕ 的行为（v0.1.21，键 close_action，缺省最小化到托盘）。
     close_action: CloseAction,
+    /// 打开文件/文件夹后是否自动隐藏到托盘（v0.1.22，键
+    /// hide_after_open，缺省 0 = 不隐藏）：旧版打开即连任务栏图标
+    /// 一起消失，被用户判为 bug，故改成默认保留窗口。
+    hide_after_open: bool,
     /// 搜索范围选中集（scope_* 键）：预设键名 / 盘符 / 自定义完整路径。
     scope_presets: Vec<String>,
     scope_drives: Vec<char>,
@@ -659,6 +663,8 @@ fn load_settings() -> Settings {
             .get("close_action")
             .and_then(|s| CloseAction::parse(s))
             .unwrap_or(CloseAction::MinimizeToTray),
+        // v0.1.22：hide_after_open 缺省关（打开后保留窗口）。
+        hide_after_open: bool_or("hide_after_open", false),
         scope_presets,
         scope_drives,
         scope_custom,
@@ -2201,6 +2207,8 @@ struct ShunSeekApp {
     hide_outside: bool,
     /// ✕ 的行为（v0.1.21）：最小化到托盘 / 退出进程，设置里可选。
     close_action: CloseAction,
+    /// 打开文件后是否自动隐藏（v0.1.22，缺省 false = 保留窗口）。
+    hide_after_open: bool,
     /// 最近一次换入索引的条数与来源摘要完整版（设置「索引」分区
     /// 只读显示用；状态栏展示的是截断版）。
     index_count: usize,
@@ -2542,6 +2550,7 @@ impl ShunSeekApp {
             fold_demoted: settings.fold_demoted,
             hide_outside: settings.hide_outside,
             close_action: settings.close_action,
+            hide_after_open: settings.hide_after_open,
             index_count: initial_index_count,
             index_summary: String::new(),
             store_gen: 0,
@@ -2797,8 +2806,9 @@ impl ShunSeekApp {
             })
             .ok();
     }
-    /// 隐藏到托盘（UI 线程内的落点：✕ 按钮 / Esc 终段 / 打开
-    /// 条目后 / 点外裁决兜底）。v0.1.12 起实际动作收敛到
+    /// 隐藏到托盘（UI 线程内的落点：✕ 按钮 / Esc 终段 / 开启
+    /// 「打开文件后自动隐藏」时的打开动作 / 点外裁决兜底）。v0.1.12
+    /// 起实际动作收敛到
     /// winvis::hide()（ShowWindow SW_HIDE，本线程当场执行）；
     /// 此前六版走 ViewportCommand::Visible 的老路已整段删除。
     /// 非 Windows 无 Win32 可调，同一调用点以 ViewportCommand
@@ -3147,7 +3157,11 @@ impl ShunSeekApp {
             u.record_use(&row.path);
             let _ = u.save();
         }
-        self.hide(ctx);
+        // v0.1.22：默认不再藏窗（打开即消失被用户判为 bug），
+        // 只有显式打开「打开文件后自动隐藏」才回到旧行为。
+        if self.hide_after_open {
+            self.hide(ctx);
+        }
     }
 
     fn open_selected(&mut self, ctx: &egui::Context, locate: bool) {
@@ -3385,7 +3399,7 @@ impl ShunSeekApp {
     /// 连写（如 CD）；scope_custom 一行一个完整路径（可重复多行）。
     fn save_settings(&self) {
         let mut text = format!(
-            "theme={}\nview={}\nhotkey={}\nresult_limit={}\nfold_demoted={}\nhide_outside={}\nclose_action={}\n",
+            "theme={}\nview={}\nhotkey={}\nresult_limit={}\nfold_demoted={}\nhide_outside={}\nclose_action={}\nhide_after_open={}\n",
             match self.theme {
                 Theme::Dark => "dark",
                 Theme::Light => "light",
@@ -3399,6 +3413,7 @@ impl ShunSeekApp {
             self.fold_demoted as u8,
             self.hide_outside as u8,
             self.close_action.key_str(),
+            self.hide_after_open as u8,
         );
         let mut presets: Vec<&str> = self.scope_presets.iter().map(|s| s.as_str()).collect();
         presets.sort_unstable();
@@ -3571,7 +3586,8 @@ impl ShunSeekApp {
             .collect();
     }
 
-    /// 打开一个首页磁贴（与 open_row 同语义：记录使用 + 隐藏）。
+    /// 打开一个首页磁贴（与 open_row 同语义：记录使用 + 按设置决定
+    /// 是否隐藏窗口）。
     fn open_home_item(&mut self, ctx: &egui::Context, idx: usize, locate: bool) {
         let Some(row) = self.home_items.get(idx).cloned() else {
             return;
@@ -3586,7 +3602,11 @@ impl ShunSeekApp {
             u.record_use(&row.path);
             let _ = u.save();
         }
-        self.hide(ctx);
+        // v0.1.22：打开后不再无条件藏进托盘（界面与任务栏图标一起
+        // 消失，用户判为 bug）；默认保持窗口，想回到旧行为勾开关。
+        if self.hide_after_open {
+            self.hide(ctx);
+        }
     }
 
     /// 当前是否首页（空查询）：首页只显 pins，与搜索结果管线分开。
@@ -7710,6 +7730,26 @@ impl ShunSeekApp {
                 CloseAction::Exit => {
                     "直接结束进程并移除托盘图标；下次需重新启动。"
                 }
+            })
+            .size(11.0)
+            .color(pal.path_text),
+        );
+        ui.add_space(10.0);
+        // 打开后行为（v0.1.22）：双击结果 / 首页磁贴打开之后是否把
+        // 窗口藏进托盘。缺省关——旧版打开即连任务栏图标一起消失，
+        // 用户判为 bug。
+        let mut hide_after_open = self.hide_after_open;
+        ss_row_switch(ui, pal, "打开文件后自动隐藏", &mut hide_after_open);
+        if hide_after_open != self.hide_after_open {
+            self.hide_after_open = hide_after_open;
+            self.save_settings();
+        }
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(if self.hide_after_open {
+                "打开后窗口收进托盘，界面与任务栏图标一起消失；按热键再唤出。"
+            } else {
+                "打开后窗口留在原位，方便继续搜索；不想遮挡时可点右上角关闭。"
             })
             .size(11.0)
             .color(pal.path_text),
